@@ -1,0 +1,48 @@
+{
+  "name": "pi-sub",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "description": "A small coordinator for native Pi subprocesses.",
+  "packageManager": "pnpm@11.25.0",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "files": [
+    "index.ts",
+    "src",
+    "instructions",
+    "docs",
+    "NOTICE.md"
+  ],
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "vitest run",
+    "format": "prettier --write index.ts src test",
+    "format:check": "prettier --check index.ts src test"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "^1.5.0",
+    "@earendil-works/pi-ai": "^1.5.0",
+    "@earendil-works/pi-coding-agent": "^1.5.0",
+    "@earendil-works/pi-tui": "^1.5.0",
+    "typebox": "^1.3.7"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-agent-core": "1.5.0",
+    "@earendil-works/pi-ai": "1.5.0",
+    "@earendil-works/pi-coding-agent": "1.5.0",
+    "@earendil-works/pi-tui": "1.5.0",
+    "@types/node": "^22.15.3",
+    "prettier": "^3.9.10",
+    "typebox": "^1.3.7",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.11"
+  }
+}

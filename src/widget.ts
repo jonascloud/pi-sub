@@ -1,0 +1,268 @@
+import type {
+  ExtensionUIContext,
+  Theme,
+} from "@earendil-works/pi-coding-agent";
+import {
+  stripTerminalSequences,
+  truncateToWidth,
+  visibleWidth,
+  type Component,
+  type TUI,
+} from "@earendil-works/pi-tui";
+import type { Coordinator, TaskView } from "./coordinator.ts";
+
+type WidgetTheme = Pick<Theme, "fg" | "bold">;
+const active = (task: TaskView) =>
+  ["starting", "running", "pausing"].includes(task.status);
+const clean = (text: string) =>
+  stripTerminalSequences(text)
+    .replace(/[\r\n\t\x00-\x1f\x7f]+/g, " ")
+    .trim();
+const code = (task: TaskView) => {
+  if (task.status === "error" || task.error) return "err";
+  if (task.status === "running")
+    return clean(task.activity).slice(0, 3) || "thk";
+  return {
+    queued: "que",
+    starting: "thk",
+    ready: "rdy",
+    pausing: "psg",
+    paused: "pse",
+    error: "err",
+    closed: "stp",
+  }[task.status];
+};
+const time = (ms: number) => {
+  const s = Math.floor(Math.max(0, ms) / 1000);
+  return s < 3600
+    ? `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`
+    : `${Math.floor(s / 3600)}:${String(Math.floor(s / 60) % 60).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+};
+const tokenCount = (n: number) =>
+  `${n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 1_000 ? `${(n / 1_000).toFixed(1)}k` : n} token`;
+const pad = (s: string, n: number) =>
+  " ".repeat(Math.max(0, n - visibleWidth(s))) + s;
+
+const collapsed = (t: TaskView) =>
+  t.collected && t.status === "closed" && !t.error;
+const priority = (t: TaskView) =>
+  t.error || t.status === "error"
+    ? 0
+    : t.status === "paused"
+      ? 1
+      : t.status === "pausing"
+        ? 2
+        : 3;
+function select(tasks: readonly TaskView[], height: number) {
+  const rows = tasks.filter((t) => !collapsed(t));
+  const room = Math.max(0, Math.min(12, height) - 1);
+  const capacity = rows.length > room && room > 1 ? room - 1 : room;
+  const selected = new Set(
+    rows
+      .map((task, index) => ({ task, index }))
+      .sort((a, b) => priority(a.task) - priority(b.task) || a.index - b.index)
+      .slice(0, capacity)
+      .map((item) => item.index),
+  );
+  return {
+    shown: rows.filter((_, i) => selected.has(i)),
+    hidden: rows.filter((_, i) => !selected.has(i)),
+    room,
+  };
+}
+function counts(items: readonly TaskView[]): string[] {
+  const statuses: [string, (t: TaskView) => boolean][] = [
+    ["err", (t) => !!t.error || t.status === "error"],
+    ["pse", (t) => !t.error && t.status === "paused"],
+    ["psg", (t) => !t.error && t.status === "pausing"],
+    ["rdy", (t) => !t.error && t.status === "ready"],
+    [
+      "run",
+      (t) => !t.error && (t.status === "running" || t.status === "starting"),
+    ],
+    ["que", (t) => !t.error && t.status === "queued"],
+    ["stp", (t) => !t.error && t.status === "closed" && !collapsed(t)],
+  ];
+  return statuses.flatMap(([label, matches]) => {
+    const n = items.filter(matches).length;
+    return n ? [`${label} ${n}`] : [];
+  });
+}
+
+export function renderWidget(
+  tasks: readonly TaskView[],
+  width: number,
+  height: number,
+  theme: WidgetTheme,
+): string[] {
+  width = Math.max(0, Math.floor(width));
+  height = Math.max(0, Math.min(12, Math.floor(height)));
+  if (!width || !height || !tasks.length) return [];
+  const { shown, hidden, room } = select(tasks, height);
+  const columns = [
+    {
+      min: 6,
+      values: shown.map((t) => (t.level == null ? "" : `lvl ${t.level}`)),
+    },
+    { min: 3, values: shown.map((t) => code(t)) },
+    { min: 6, values: shown.map((t) => `${t.turns}↻`) },
+    { min: 5, values: shown.map((t) => `${t.toolUses}⚒`) },
+    { min: 8, values: shown.map((t) => time(t.elapsedMs)) },
+  ].map((c) => ({
+    ...c,
+    size: Math.max(c.min, ...c.values.map(visibleWidth)),
+  }));
+  const enabled = [true, true, true, true, true];
+  let chrome = true;
+  const used = () =>
+    (chrome ? 5 : 0) +
+    columns.reduce((n, c, i) => n + (enabled[i] ? c.size + 1 : 0), 0);
+  const target =
+    shown.some((t) => t.error || t.response) && width >= 35 ? 23 : 12;
+  for (const i of [4, 3, 2, 0]) if (used() + target > width) enabled[i] = false;
+  if (used() + (target === 23 ? 28 : 12) > width) chrome = false;
+  const lines = shown.map((task, row) => {
+    const status = code(task);
+    if (width <= 3) return truncateToWidth(status, width, "");
+    const prefix = chrome ? (row === 0 ? "  ┌─ " : "  ├─ ") : "";
+    const metadata = columns
+      .map((c, i) => (enabled[i] ? `${pad(c.values[row]!, c.size)} ` : ""))
+      .join("");
+    const remaining = Math.max(0, width - visibleWidth(prefix + metadata));
+    const description = clean(task.description);
+    const detail = clean(task.error || task.response);
+    // Give both identity and useful detail room, but never replace the identity.
+    const detailRoom =
+      detail && remaining >= 23
+        ? Math.min(Math.floor((remaining - 4) / 2), remaining - 15)
+        : 0;
+    const descRoom = detailRoom ? remaining - detailRoom - 3 : remaining;
+    const tail =
+      theme.bold(truncateToWidth(description, descRoom, "…")) +
+      (detailRoom ? ` · ${truncateToWidth(detail, detailRoom, "…")}` : "");
+    return truncateToWidth(prefix + metadata + tail, width);
+  });
+  if (hidden.length && room > shown.length) {
+    const prefix = chrome ? "  ├─ " : "";
+    lines.push(
+      truncateToWidth(
+        theme.fg(
+          "muted",
+          `${prefix}+${hidden.length} ${counts(hidden).join(" · ")}`,
+        ),
+        width,
+      ),
+    );
+  }
+  const done = tasks.filter(collapsed).length;
+  const tokens = tasks.reduce((sum, t) => sum + t.tokens, 0);
+  const rootOnly = room === 0;
+  const parts = rootOnly
+    ? [
+        ...counts(hidden),
+        ...(done ? [`${done} done`] : []),
+        tokenCount(tokens),
+        "pi-sub",
+      ]
+    : ["──┴─ pi-sub", ...(done ? [`${done} done`] : []), tokenCount(tokens)];
+  let root = parts[0] ?? "pi-sub";
+  for (const part of parts.slice(1)) {
+    const next = `${root} · ${part}`;
+    if (visibleWidth(next) <= width) root = next;
+  }
+  lines.push(
+    theme.fg(
+      "accent",
+      truncateToWidth(root, width, width <= 3 ? "" : undefined),
+    ),
+  );
+  return lines;
+}
+
+// Count only components after our identity path; earlier siblings are transcript.
+function available(tui: TUI, component: Component, width: number): number {
+  function following(children: Component[]): number | undefined {
+    for (let i = children.length - 1; i >= 0; i--) {
+      const child = children[i]!;
+      const nested =
+        child === component
+          ? 0
+          : Array.isArray((child as { children?: unknown }).children)
+            ? following(
+                (child as unknown as { children: Component[] }).children,
+              )
+            : undefined;
+      if (nested !== undefined)
+        return (
+          nested +
+          children
+            .slice(i + 1)
+            .reduce((n, sibling) => n + sibling.render(width).length, 0)
+        );
+    }
+    return undefined;
+  }
+  const below = following(tui.children);
+  return Math.max(
+    0,
+    Math.min(12, tui.terminal.rows - (below === undefined ? 6 : below + 1)),
+  );
+}
+
+export function mountWidget(
+  ui: ExtensionUIContext,
+  coordinator: Pick<Coordinator, "list" | "subscribe">,
+): () => void {
+  let disposed = false;
+  let stop = () => {};
+  ui.setWidget(
+    "pi-sub",
+    (tui) => {
+      let timer: ReturnType<typeof setInterval> | undefined;
+      let visible = false;
+      let height = 0;
+      const updateTimer = (tasks: readonly TaskView[]) => {
+        const { shown } = select(tasks, height);
+        const needsTimer = visible && shown.some(active);
+        if (needsTimer && !timer)
+          timer = setInterval(() => tui.requestRender(), 700);
+        if (!needsTimer && timer) {
+          clearInterval(timer);
+          timer = undefined;
+        }
+      };
+      const unsubscribe = coordinator.subscribe(() => {
+        if (disposed) return;
+        updateTimer(coordinator.list());
+        tui.requestRender();
+      });
+      let unmounted = false;
+      const component: Component & { dispose(): void } = {
+        render(width) {
+          height = available(tui, component, width);
+          visible = height > 0 && width > 0;
+          const tasks = coordinator.list();
+          updateTimer(tasks);
+          return renderWidget(tasks, width, height, ui.theme);
+        },
+        invalidate() {},
+        dispose() {
+          if (unmounted) return;
+          unmounted = true;
+          unsubscribe();
+          if (timer) clearInterval(timer);
+          timer = undefined;
+        },
+      };
+      stop = component.dispose;
+      return component;
+    },
+    { placement: "aboveEditor" },
+  );
+  return () => {
+    if (disposed) return;
+    disposed = true;
+    stop();
+    ui.setWidget("pi-sub", undefined);
+  };
+}
