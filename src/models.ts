@@ -3,11 +3,11 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { lock } from "proper-lockfile";
 import { readFileSync, renameSync } from "node:fs";
 import { mkdir, open, unlink } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 
 export type { ThinkingLevel };
-export interface ApprovedModel {
+export interface AvailableModel {
   provider: string;
   model: string;
   thinking: ThinkingLevel[];
@@ -36,7 +36,7 @@ const thinkingLevels = new Set<string>([
 ]);
 
 export const ladderPath = (): string =>
-  join(getAgentDir(), "pi-sub", "models.json");
+  join(getAgentDir(), "pi-sub-config.json");
 
 export function parseReference(
   text: string,
@@ -132,16 +132,6 @@ export async function saveLadder(
 ): Promise<void> {
   const source = formatLadder(ladder);
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-  try {
-    const ignore = await open(join(dirname(path), ".gitignore"), "wx", 0o600);
-    try {
-      await ignore.writeFile("*\n", "utf8");
-    } finally {
-      await ignore.close();
-    }
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-  }
   const release = await lock(path, {
     realpath: false,
     retries: { retries: 12, factor: 1, minTimeout: 100, maxTimeout: 100 },
@@ -155,6 +145,19 @@ export async function saveLadder(
   };
   try {
     verifySource();
+    // Serialize cooperative saves so they cannot append duplicate ignore rules.
+    const ignore = await open(join(dirname(path), ".gitignore"), "a+", 0o600);
+    try {
+      const contents = await ignore.readFile("utf8");
+      const rule = `/${basename(path).replace(/[\\*?\[\]#! ]/g, "\\$&")}`;
+      if (!contents.split(/\r?\n/).includes(rule))
+        await ignore.appendFile(
+          `${contents && !contents.endsWith("\n") ? "\n" : ""}${rule}\n`,
+          "utf8",
+        );
+    } finally {
+      await ignore.close();
+    }
     const file = await open(temp, "wx", 0o600);
     try {
       await file.writeFile(source, "utf8");
@@ -180,7 +183,7 @@ export async function saveLadder(
 export function selectExecution(
   ladder: Ladder,
   level: number,
-  approved: readonly ApprovedModel[],
+  available: readonly AvailableModel[],
 ): Execution {
   if (!Number.isInteger(level) || level < 1 || level > 10)
     throw new Error("Level must be an integer from 1 to 10");
@@ -190,7 +193,7 @@ export function selectExecution(
     if (!entry) continue;
     const reference = parseReference(entry.model);
     if (
-      approved.some(
+      available.some(
         (a) =>
           a.provider === reference.provider &&
           a.model === reference.model &&
@@ -200,18 +203,18 @@ export function selectExecution(
       return { ...reference, cost: entry.cost, power };
   }
   throw new Error(
-    `No approved ladder execution available for level ${level}; run /sub:models`,
+    `No available ladder execution for level ${level}; run /sub:models`,
   );
 }
 
 export function describeLevels(
   ladder: Ladder,
-  approved: readonly ApprovedModel[],
+  available: readonly AvailableModel[],
 ): Array<{ level: number; execution?: Execution; error?: string }> {
   return Array.from({ length: 10 }, (_, i) => {
     const level = i + 1;
     try {
-      return { level, execution: selectExecution(ladder, level, approved) };
+      return { level, execution: selectExecution(ladder, level, available) };
     } catch (error) {
       return {
         level,

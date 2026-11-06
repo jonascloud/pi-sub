@@ -10,9 +10,9 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import {
-  type ApprovedModel,
+  type AvailableModel,
   type Ladder,
   describeLevels,
   formatLadder,
@@ -32,7 +32,7 @@ const ladder: Ladder = {
   "8": { model: "p/main:high", cost: 9 },
   "10": { model: "p/top:max", cost: null },
 };
-const approved: ApprovedModel[] = [
+const available: AvailableModel[] = [
   { provider: "p", model: "cheap", thinking: ["off"] },
   { provider: "p", model: "main", thinking: ["low", "high"] },
   { provider: "p", model: "top", thinking: ["max"] },
@@ -97,6 +97,7 @@ describe("model ladder", () => {
       "1.5",
       "version",
       "approved",
+      "available",
       "candidates",
     ])
       expect(() => validateLadder({ [key]: ladder["6"] }), key).toThrow();
@@ -121,35 +122,37 @@ describe("model ladder", () => {
     ).toBeNull();
   });
 
-  it("uses the first currently approved confirmed rung, never price or outside alternatives", () => {
-    expect(selectExecution(ladder, 3, approved)).toEqual({
+  it("uses the first currently available rung, never price or outside alternatives", () => {
+    expect(selectExecution(ladder, 3, available)).toEqual({
       provider: "p",
       model: "main",
       thinking: "low",
       cost: 0.07134,
       power: 6,
     });
-    expect(selectExecution(ladder, 7, approved).power).toBe(8);
+    expect(selectExecution(ladder, 7, available).power).toBe(8);
     const highOnly = [
       { provider: "p", model: "main", thinking: ["high"] },
-    ] satisfies ApprovedModel[];
+    ] satisfies AvailableModel[];
     expect(selectExecution(ladder, 3, highOnly).power).toBe(8);
-    expect(selectExecution(ladder, 9, approved).cost).toBeNull();
-    expect(() => selectExecution(ladder, 1, [])).toThrow(/No approved/);
-    expect(() => selectExecution(ladder, 7, approved.slice(0, 1))).toThrow();
-    expect(() => selectExecution({}, 1, approved)).toThrow();
+    expect(selectExecution(ladder, 9, available).cost).toBeNull();
+    expect(() => selectExecution(ladder, 1, [])).toThrow(/No available/);
+    expect(() => selectExecution(ladder, 7, available.slice(0, 1))).toThrow();
+    expect(() => selectExecution({}, 1, available)).toThrow();
     expect(() =>
       selectExecution(ladder, 1, [
         { provider: "other", model: "main", thinking: ["low"] },
       ]),
     ).toThrow();
     for (const level of [0, 11, 1.5, NaN, Infinity])
-      expect(() => selectExecution(ladder, level, approved)).toThrow(/integer/);
+      expect(() => selectExecution(ladder, level, available)).toThrow(
+        /integer/,
+      );
     const rows = describeLevels(ladder, highOnly);
     expect(rows).toHaveLength(10);
     expect(rows[0]).toMatchObject({ level: 1, execution: { power: 8 } });
     expect(rows[9]).toMatchObject({ level: 10, error: expect.any(String) });
-    expect(approved).toHaveLength(4);
+    expect(available).toHaveLength(4);
   });
 
   it("formats four sorted single-line rows without runtime metadata", () => {
@@ -163,13 +166,17 @@ describe("model ladder", () => {
     expect(JSON.parse(text)).toEqual(ladder);
     expect(formatLadder({})).toBe("{}\n");
     expect(text).not.toMatch(
-      /version|approved|selected|candidates|ranking|benchmark|auth/,
+      /version|approved|available|selected|candidates|ranking|benchmark|auth/,
     );
   });
 
   it("uses only the profile, with no project fallback or automatic migration", async () => {
     const original = process.cwd();
     const path = ladderPath();
+    expect(path).toBe(join(dir, "profile", "pi-sub-config.json"));
+    const legacy = join(dir, "profile", "pi-sub", "models.json");
+    await mkdir(dirname(legacy), { recursive: true });
+    await writeFile(legacy, formatLadder(ladder));
     const project = join(dir, "project");
     await mkdir(join(project, ".pi", "pi-sub"), { recursive: true });
     await writeFile(
@@ -182,8 +189,9 @@ describe("model ladder", () => {
       expect(readLadderSource(path)).toBeUndefined();
       expect(() => loadLadder(path)).toThrow(/\/sub:models/);
       expect(readLadderSource(path)).toBeUndefined();
+      expect(await readFile(legacy, "utf8")).toBe(formatLadder(ladder));
       vi.stubEnv("PI_CODING_AGENT_DIR", join(dir, "other"));
-      expect(ladderPath()).toBe(join(dir, "other", "pi-sub", "models.json"));
+      expect(ladderPath()).toBe(join(dir, "other", "pi-sub-config.json"));
       expect(() => loadLadder(ladderPath())).toThrow();
     } finally {
       process.chdir(original);
@@ -198,11 +206,25 @@ describe("model ladder", () => {
     expect((await stat(dirname(path))).mode & 0o777).toBe(0o700);
     const ignore = join(dirname(path), ".gitignore");
     expect((await stat(ignore)).mode & 0o777).toBe(0o600);
-    expect(await readFile(ignore, "utf8")).toBe("*\n");
-    await writeFile(ignore, "custom\n");
+    expect(await readFile(ignore, "utf8")).toBe("/pi-sub-config.json\n");
+    execFileSync("git", ["init", "-q", dirname(path)]);
+    const ignored = execFileSync("git", ["check-ignore", "--stdin"], {
+      cwd: dirname(path),
+      input:
+        "pi-sub-config.json\nsettings.json\nauth.json\nnested/pi-sub-config.json\n",
+      encoding: "utf8",
+    });
+    expect(ignored).toBe("pi-sub-config.json\n");
+    await writeFile(ignore, "custom\n# keep this");
     await saveLadder(path, {}, readLadderSource(path));
     expect(loadLadder(path)).toEqual({});
-    expect(await readFile(ignore, "utf8")).toBe("custom\n");
+    expect(await readFile(ignore, "utf8")).toBe(
+      "custom\n# keep this\n/pi-sub-config.json\n",
+    );
+    await saveLadder(path, ladder, readLadderSource(path));
+    expect(await readFile(ignore, "utf8")).toBe(
+      "custom\n# keep this\n/pi-sub-config.json\n",
+    );
   });
 
   it("rejects stale tokens, manual edits and deletion without merging", async () => {
@@ -212,6 +234,9 @@ describe("model ladder", () => {
       saveLadder(path, {}, undefined),
     ]);
     expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+    expect(await readFile(join(dirname(path), ".gitignore"), "utf8")).toBe(
+      "/pi-sub-config.json\n",
+    );
     const token = readLadderSource(path)!;
     await writeFile(path, token + " ");
     await expect(saveLadder(path, {}, token)).rejects.toThrow(/changed/);
@@ -253,7 +278,7 @@ describe("model ladder", () => {
     expect(readLadderSource(path)).toBe(token);
     expect((await readdir(dirname(path))).sort()).toEqual([
       ".gitignore",
-      "models.json",
+      "pi-sub-config.json",
     ]);
     let observed: Ladder | undefined;
     await saveLadder(path, {}, token, () => {
@@ -311,7 +336,7 @@ describe("model ladder", () => {
       expect(loadLadder(path)).toEqual({});
       expect((await readdir(dirname(path))).sort()).toEqual([
         ".gitignore",
-        "models.json",
+        "pi-sub-config.json",
       ]);
     } finally {
       child.kill();

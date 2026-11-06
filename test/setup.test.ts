@@ -5,15 +5,15 @@ import { tmpdir } from "node:os";
 import type { Model } from "@earendil-works/pi-ai";
 import { lock } from "proper-lockfile";
 import { Coordinator } from "../src/coordinator.ts";
-import { ladderPath, type ApprovedModel, type Ladder } from "../src/models.ts";
-import { ModelSetup, approvedModels, workerDirectory } from "../src/setup.ts";
+import { ladderPath, type AvailableModel, type Ladder } from "../src/models.ts";
+import { ModelSetup, availableModels, workerDirectory } from "../src/setup.ts";
 import type {
   Worker,
   WorkerOptions,
   WorkerEvent,
   WorkerReport,
 } from "../src/worker.ts";
-const approved: ApprovedModel[] = [
+const available: AvailableModel[] = [
   { provider: "test", model: "fake", thinking: ["off"] },
 ];
 const execution: WorkerOptions = {
@@ -93,7 +93,12 @@ afterEach(async () => {
 async function begin(
   options: {
     baseline?: string;
-    approved?: () => ApprovedModel[];
+    available?: () => AvailableModel[];
+    choose?: (
+      models: AvailableModel[],
+      current: Ladder | undefined,
+      signal: AbortSignal,
+    ) => Promise<AvailableModel[] | undefined>;
     prepare?: () => Promise<boolean>;
   } = {},
 ) {
@@ -116,7 +121,8 @@ async function begin(
   const onChange = vi.fn();
   const setup = new ModelSetup({
     coordinator,
-    approved: options.approved ?? (() => approved),
+    available: options.available ?? (() => available),
+    choose: options.choose ?? (async (models) => models),
     prepare: options.prepare ?? (async () => true),
     onReport,
     onSaved,
@@ -154,7 +160,7 @@ it("returns before research ends and writes only after explicit revision-bound a
   await f.open();
   expect(f.setup.view?.phase).toBe("working");
   await expect(f.setup.accept(f.setup.view!.revision)).rejects.toThrow();
-  expect(f.worker.prompts[0]).toContain("Approved variants (research only):");
+  expect(f.worker.prompts[0]).toContain("Selected variants (research only):");
   await review(f, ladder, "accept");
   await expect(readFile(ladderPath())).rejects.toMatchObject({
     code: "ENOENT",
@@ -167,6 +173,116 @@ it("returns before research ends and writes only after explicit revision-bound a
   expect(f.setup.active).toBe(false);
   expect(f.coordinator.inspect(id)).toMatchObject({ outcome: "reply" });
 });
+it("reserves and cancels the human model choice without starting research or saving", async () => {
+  const choice = Promise.withResolvers<AvailableModel[] | undefined>();
+  let signal: AbortSignal | undefined;
+  const f = await begin({
+    baseline: JSON.stringify(ladder),
+    choose: async (_models, _current, abort) => {
+      signal = abort;
+      return choice.promise;
+    },
+  });
+  const opening = f.open();
+  await tick();
+  expect(f.setup.view?.phase).toBe("choosing");
+  expect(f.coordinator.list()).toEqual([]);
+  await f.setup.cancel();
+  expect(signal?.aborted).toBe(true);
+  choice.resolve(available);
+  await opening;
+  expect(f.workers).toHaveLength(0);
+  expect(await readFile(ladderPath(), "utf8")).toBe(JSON.stringify(ladder));
+});
+
+it("an interruption epoch invalidates a late choice even after admission reopens", async () => {
+  const choice = Promise.withResolvers<AvailableModel[] | undefined>();
+  const f = await begin({ choose: () => choice.promise });
+  const opening = f.open();
+  await tick();
+  await f.coordinator.interrupt();
+  await f.coordinator.prompt();
+  choice.resolve(available);
+  await opening;
+  expect(f.workers).toHaveLength(0);
+  expect(f.setup.active).toBe(false);
+});
+
+it("interrupting startup after the dialog cannot enqueue a late research task", async () => {
+  const f = await begin({ baseline: "{}" });
+  f.onChange.mockImplementation((view) => {
+    if (view?.phase === "working" && !view.id) void f.coordinator.interrupt();
+  });
+  await f.open();
+  expect(f.workers).toHaveLength(0);
+  expect(f.coordinator.list()).toEqual([]);
+  expect(f.setup.active).toBe(false);
+  expect(await readFile(ladderPath(), "utf8")).toBe("{}");
+});
+
+it("only selected candidates may receive new or retained available assignments", async () => {
+  const other: AvailableModel = {
+    provider: "test",
+    model: "other",
+    thinking: ["off"],
+  };
+  const old = { model: "test/other:off", cost: 0.2 };
+  const f = await begin({
+    baseline: JSON.stringify({ "9": old }),
+    available: () => [...available, other],
+    choose: async () => available,
+  });
+  await f.open();
+  expect(f.worker.prompts[0]).not.toContain('"model":"other"'); // Only the current ladder contains its full reference.
+  f.worker.finish(proposal({ ...ladder, "9": old }));
+  await tick();
+  expect(f.setup.active).toBe(false);
+  expect(f.onReport.mock.calls.at(-1)![0].content).toContain("selection");
+});
+
+it("rejects a chosen physical model that disappears or was not offered", async () => {
+  for (const novel of [false, true]) {
+    let current = available;
+    const f = await begin({
+      available: () => current,
+      choose: async (models) => {
+        if (novel)
+          return [
+            { provider: "not-offered", model: "other", thinking: ["off"] },
+          ];
+        current = [];
+        return models;
+      },
+    });
+    await f.open();
+    expect(f.workers).toHaveLength(0);
+    expect(f.setup.active).toBe(false);
+    expect(f.onReport.mock.calls.at(-1)![0].content).toContain("available");
+  }
+});
+
+it("does not expand selected thinking authority when native support changes during the dialog", async () => {
+  let current = available;
+  const f = await begin({
+    available: () => current,
+    choose: async (offered) => {
+      current = [{ ...available[0]!, thinking: ["off", "high"] }];
+      return offered;
+    },
+  });
+  await f.open();
+  const selected = JSON.parse(
+    f.worker.prompts[0]!.split(
+      "Selected variants (research only):\n",
+    )[1]!.split("\n\nCurrent ladder:")[0]!,
+  );
+  expect(selected[0].thinking).toEqual(["off"]);
+  f.worker.finish(proposal({ "6": { model: "test/fake:high", cost: 0.1 } }));
+  await tick();
+  expect(f.setup.active).toBe(false);
+  expect(f.onReport.mock.calls.at(-1)![0].content).toContain("selection");
+});
+
 it("report consumers cannot mutate the internal draft after it was shown", async () => {
   const f = await begin();
   await f.open();
@@ -230,12 +346,12 @@ it("reflects pause and resumes without completing the workflow", async () => {
   expect(f.setup.view?.paused).toBe(false);
   await review(f);
 });
-it.each(["cancel", "interrupt", "approval", "external"] as const)(
+it.each(["cancel", "interrupt", "availability", "external"] as const)(
   "blocks publication under the global lock: %s",
   async (action) => {
-    let current = approved;
+    let current = available;
     const baseline = JSON.stringify({});
-    const f = await begin({ baseline, approved: () => current });
+    const f = await begin({ baseline, available: () => current });
     await f.open();
     await review(f);
     const release = await lock(ladderPath(), { realpath: false });
@@ -248,7 +364,7 @@ it.each(["cancel", "interrupt", "approval", "external"] as const)(
       await f.coordinator.interrupt();
       await f.coordinator.prompt();
     }
-    if (action === "approval") current = [];
+    if (action === "availability") current = [];
     if (action === "external") await writeFile(ladderPath(), "{\n}\n");
     await release();
     await expect(saving).rejects.toThrow();
@@ -258,7 +374,25 @@ it.each(["cancel", "interrupt", "approval", "external"] as const)(
     expect(f.onSaved).not.toHaveBeenCalled();
   },
 );
-it("retains foreign baseline rows but does not grant authority to move them", async () => {
+it("checks cancellation after a reentrant availability callback in the final publication hook", async () => {
+  let attack = false,
+    calls = 0;
+  const f = await begin({
+    baseline: "{}",
+    available: () => {
+      if (attack && ++calls === 2) void f.setup.cancel();
+      return available;
+    },
+  });
+  await f.open();
+  await review(f);
+  attack = true;
+  await expect(f.setup.accept(f.setup.view!.revision)).rejects.toThrow();
+  expect(await readFile(ladderPath(), "utf8")).toBe("{}");
+  expect(f.onSaved).not.toHaveBeenCalled();
+});
+
+it("retains unavailable baseline rows but does not grant authority to move them", async () => {
   const foreign = { model: "foreign/model:off", cost: 2 };
   const f = await begin({ baseline: JSON.stringify({ "9": foreign }) });
   await f.open();
@@ -268,23 +402,26 @@ it("retains foreign baseline rows but does not grant authority to move them", as
   f.worker.finish(proposal({ "8": foreign }));
   await tick();
   expect(f.setup.active).toBe(false);
-  expect(f.onReport.mock.calls.at(-1)![0].content).toContain("approval");
+  expect(f.onReport.mock.calls.at(-1)![0].content).toContain("selection");
 });
-it("checks current approval only for changed rows at acceptance", async () => {
-  let current = approved;
+it("rechecks selected unchanged entries when availability disappears before acceptance", async () => {
+  let current = available;
   const f = await begin({
     baseline: JSON.stringify(ladder),
-    approved: () => current,
+    available: () => current,
   });
   await f.open();
   await review(f);
   current = [];
-  await f.setup.accept(f.setup.view!.revision);
-  expect(f.onSaved).toHaveBeenCalledOnce();
+  await expect(f.setup.accept(f.setup.view!.revision)).rejects.toThrow(
+    "available",
+  );
+  expect(f.onSaved).not.toHaveBeenCalled();
+  expect(await readFile(ladderPath(), "utf8")).toBe(JSON.stringify(ladder));
 });
 it.each([
   "garbage",
-  JSON.stringify({ ladder, comparison: "ok", approved }),
+  JSON.stringify({ ladder, comparison: "ok", available }),
   JSON.stringify({ ladder, comparison: "" }),
 ])("closes invalid research without writing: %s", async (response) => {
   const f = await begin({ baseline: "{}" });
@@ -370,7 +507,7 @@ it("accepts exactly one JSON fence without extracting surrounding prose", async 
   }
 });
 
-it("uses native model scope and limits an unscoped session to its current model", () => {
+it("uses all native availability regardless of parent scope or thinking pins", () => {
   const model = {
     id: "fake",
     provider: "test",
@@ -388,9 +525,21 @@ it("uses native model scope and limits an unscoped session to its current model"
     scopedModels: [],
     modelRegistry: { getAvailable: () => [model, another] },
   };
-  expect(approvedModels(ctx as never)).toEqual(approved);
+  const expected = [
+    { provider: "test", model: "another", thinking: ["off"] },
+    ...available,
+  ];
+  expect(availableModels(ctx as never)).toEqual(expected);
   expect(
-    approvedModels({ ...ctx, scopedModels: [{ model: another }] } as never)[0]!
-      .model,
-  ).toBe("another");
+    availableModels({
+      ...ctx,
+      scopedModels: [{ model, thinkingLevel: "high" }],
+    } as never),
+  ).toEqual(expected);
+  expect(
+    availableModels({
+      ...ctx,
+      modelRegistry: { getAvailable: () => [another] },
+    } as never),
+  ).toEqual([expected[0]]);
 });

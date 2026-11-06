@@ -23,12 +23,13 @@ import {
   selectExecution,
 } from "./src/models.ts";
 import {
-  approvedModels,
+  availableModels,
   ModelSetup,
   workerDirectory,
   type SetupView,
 } from "./src/setup.ts";
 import { renderModelSelection } from "./src/model-view.ts";
+import { chooseModels } from "./src/model-picker.ts";
 import { taskToolRenderers } from "./src/tool-view.ts";
 import { mountWidget, availableWidgetHeight } from "./src/widget.ts";
 import {
@@ -101,6 +102,7 @@ export default function piSub(pi: ExtensionAPI): void {
   const interrupt = () => {
     if (lifetime.signal.aborted) return Promise.resolve();
     runInterrupted = true;
+    if (selection?.view?.phase === "choosing") void selection.cancel();
     const pending = manager()
       .interrupt()
       .catch((error) =>
@@ -136,21 +138,7 @@ export default function piSub(pi: ExtensionAPI): void {
   const authorizeTask = (task: TaskView, ctx: ExtensionContext) => {
     const execution = task.execution;
     if (
-      task.level === undefined &&
-      ctx.model?.provider === execution.provider &&
-      ctx.model.id === execution.model &&
-      (ctx.thinkingLevel ?? "off") === execution.thinking &&
-      ctx.modelRegistry
-        .getAvailable()
-        .some(
-          (model) =>
-            model.provider === execution.provider &&
-            model.id === execution.model,
-        )
-    )
-      return;
-    if (
-      !approvedModels(ctx).some(
+      !availableModels(ctx).some(
         (model) =>
           model.provider === execution.provider &&
           model.model === execution.model &&
@@ -158,7 +146,7 @@ export default function piSub(pi: ExtensionAPI): void {
       )
     ) {
       throw new Error(
-        "The retained execution is no longer approved or available. Stop this subagent instead.",
+        "The retained execution is no longer available. Stop this subagent instead.",
       );
     }
     if (task.level !== undefined) {
@@ -243,7 +231,20 @@ export default function piSub(pi: ExtensionAPI): void {
   const modelSelection = () =>
     (selection ??= new ModelSetup({
       coordinator: manager(),
-      approved: () => (context ? approvedModels(context) : []),
+      available: () => (context ? availableModels(context) : []),
+      choose: (available, current, signal) => {
+        if (!context) throw new Error("No active parent context");
+        return chooseModels(
+          context.ui,
+          available,
+          current,
+          signal,
+          context.model && {
+            provider: context.model.provider,
+            model: context.model.id,
+          },
+        );
+      },
       prepare: preparePrompt,
       signal: lifetime.signal,
       onChange: refreshSelection,
@@ -368,7 +369,7 @@ export default function piSub(pi: ExtensionAPI): void {
     runInterrupted = false;
     let table: string;
     try {
-      const approved = approvedModels(ctx);
+      const available = availableModels(ctx);
       const ladder = loadLadder(ladderPath());
       const self = Object.entries(ladder)
         .filter(([, entry]) => {
@@ -383,7 +384,7 @@ export default function piSub(pi: ExtensionAPI): void {
       table =
         `Your configured strength: ${self.length ? Math.max(...self) + "/10" : "unknown"}.\n` +
         "Ladder · reference USD/AA task, not actual price or quota:\n" +
-        routingSummary(ladder, approved);
+        routingSummary(ladder, available);
     } catch (error) {
       table = reason(error);
     }
@@ -408,7 +409,7 @@ export default function piSub(pi: ExtensionAPI): void {
 
   pi.registerCommand("sub:models", {
     description:
-      "Review the global model ladder. Refine by prompt, then accept or cancel explicitly.",
+      "Choose available models, review the global ladder, then explicitly accept or cancel.",
     getArgumentCompletions: (prefix) =>
       ["cancel"]
         .filter((action) => action.startsWith(prefix))
@@ -533,14 +534,13 @@ export default function piSub(pi: ExtensionAPI): void {
         try {
           checkContext(ctx);
           signal?.throwIfAborted();
-          const approved = approvedModels(ctx);
+          const sessionDir = await workerDirectory(ctx.cwd);
+          signal?.throwIfAborted();
           const execution = selectExecution(
             loadLadder(ladderPath()),
             args.level,
-            approved,
+            availableModels(ctx),
           );
-          const sessionDir = await workerDirectory(ctx.cwd);
-          signal?.throwIfAborted();
           const id = manager().start({
             prompt: args.prompt,
             description: args.description || args.prompt.slice(0, 80),

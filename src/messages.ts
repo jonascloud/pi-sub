@@ -10,7 +10,7 @@ import {
 import type { TaskView, TaskResult } from "./coordinator.ts";
 import {
   describeLevels,
-  type ApprovedModel,
+  type AvailableModel,
   type Ladder,
   type Execution,
 } from "./models.ts";
@@ -22,10 +22,10 @@ Use reports internally; surface only material results, blockers or user decision
 
 export function routingSummary(
   ladder: Ladder,
-  approved: readonly ApprovedModel[],
+  available: readonly AvailableModel[],
 ): string {
   const groups: { from: number; to: number; execution?: Execution }[] = [];
-  for (const row of describeLevels(ladder, approved)) {
+  for (const row of describeLevels(ladder, available)) {
     const last = groups.at(-1);
     if (
       last &&

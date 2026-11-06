@@ -28,15 +28,17 @@ export function renderModelSelection(
       ? "saved-at-start ladder"
       : "no saved ladder at start";
   const phase =
-    view.phase === "review"
-      ? `DRAFT ${view.revision} — not saved`
-      : view.phase === "saving"
-        ? `Saving draft ${view.revision}`
-        : view.paused
-          ? `Paused · ${saved}`
-          : view.id
-            ? `Researching · ${saved}`
-            : "Preparing";
+    view.phase === "choosing"
+      ? "Choose models"
+      : view.phase === "review"
+        ? `DRAFT ${view.revision} — not saved`
+        : view.phase === "saving"
+          ? `Saving draft ${view.revision}`
+          : view.paused
+            ? `Paused · ${saved}`
+            : view.id
+              ? `Researching · ${saved}`
+              : "Preparing";
   const lines = [`Model ladder · ${phase} · AA reference USD/task`];
   const warnings: string[] = [];
   const content: string[] = [];
@@ -44,7 +46,10 @@ export function renderModelSelection(
     warnings.push(
       `Saved file needs repair (at start): ${clean(view.currentError)}`,
     );
-  const draft = view.phase === "working" ? undefined : view.draft;
+  const draft =
+    view.phase === "working" || view.phase === "choosing"
+      ? undefined
+      : view.draft;
   const ladder = draft ?? view.current ?? {};
   const levels = [
     ...new Set([

@@ -196,9 +196,39 @@ test.each(["interactive", "rpc"])(
   },
 );
 
+test("new tasks select from fresh configuration after asynchronous directory preparation", async () => {
+  const { ctx, tools } = setup();
+  vi.spyOn(modelSetup, "availableModels").mockReturnValue([
+    { provider: "test", model: "fake", thinking: ["off"] },
+    { provider: "test", model: "other", thinking: ["off"] },
+  ]);
+  const load = vi
+    .spyOn(models, "loadLadder")
+    .mockReturnValue({ "6": { model: "test/fake:off", cost: 0.1 } });
+  const directory = Promise.withResolvers<string>();
+  vi.spyOn(modelSetup, "workerDirectory").mockReturnValue(directory.promise);
+  const pending = tools
+    .get("sub_task")!
+    .execute(
+      "call",
+      { level: 3, prompt: "brief" },
+      new AbortController().signal,
+      () => {},
+      ctx,
+    );
+  load.mockReturnValue({ "6": { model: "test/other:off", cost: 0.1 } });
+  directory.resolve("/tmp/sessions");
+  await pending;
+  expect(fake.start).toHaveBeenCalledWith(
+    expect.objectContaining({
+      worker: expect.objectContaining({ model: "other" }),
+    }),
+  );
+});
+
 test("cancellation during runtime directory preparation never admits an orphan task", async () => {
   const { ctx, tools } = setup();
-  vi.spyOn(modelSetup, "approvedModels").mockReturnValue([
+  vi.spyOn(modelSetup, "availableModels").mockReturnValue([
     { provider: "test", model: "fake", thinking: ["off"] },
   ]);
   vi.spyOn(models, "loadLadder").mockReturnValue({
@@ -299,7 +329,7 @@ test("one stable guidance section is replaced, not appended as repeated chat ins
     model: { provider: "test", id: "fake" },
     thinkingLevel: "off",
   });
-  vi.spyOn(modelSetup, "approvedModels").mockReturnValue([
+  vi.spyOn(modelSetup, "availableModels").mockReturnValue([
     { provider: "test", model: "fake", thinking: ["off"] },
   ]);
   vi.spyOn(models, "loadLadder").mockReturnValue({

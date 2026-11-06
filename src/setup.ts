@@ -10,40 +10,24 @@ import {
   formatLadder,
   readLadderSource,
   saveLadder,
-  type ApprovedModel,
+  type AvailableModel,
   type Ladder,
 } from "./models.ts";
 import type { WorkerOptions } from "./worker.ts";
 
-/** Native Pi scoping is authoritative. Without a scope, use only the current model. */
-export function approvedModels(
-  ctx: Pick<ExtensionContext, "model" | "modelRegistry" | "scopedModels">,
-): ApprovedModel[] {
-  const available = new Set(
-    ctx.modelRegistry
-      .getAvailable()
-      .map((model) => `${model.provider}/${model.id}`),
-  );
-  const scoped = ctx.scopedModels.length
-    ? ctx.scopedModels
-    : ctx.model
-      ? [{ model: ctx.model, thinkingLevel: undefined }]
-      : [];
-  const models = new Map<string, ApprovedModel>();
-  for (const entry of scoped) {
-    const key = `${entry.model.provider}/${entry.model.id}`;
-    if (!available.has(key)) continue;
-    const supported = getSupportedThinkingLevels(entry.model);
-    const thinking = entry.thinkingLevel
-      ? supported.filter((level) => level === entry.thinkingLevel)
-      : supported;
-    if (!thinking.length) continue;
-    const previous = models.get(key);
-    models.set(key, {
-      provider: entry.model.provider,
-      model: entry.model.id,
-      thinking: [...new Set([...(previous?.thinking ?? []), ...thinking])],
-    });
+/** Native availability is a hard limit; the confirmed ladder, not parent scope, authorizes delegation. */
+export function availableModels(
+  ctx: Pick<ExtensionContext, "modelRegistry">,
+): AvailableModel[] {
+  const models = new Map<string, AvailableModel>();
+  for (const model of ctx.modelRegistry.getAvailable()) {
+    const thinking = getSupportedThinkingLevels(model);
+    if (thinking.length)
+      models.set(`${model.provider}/${model.id}`, {
+        provider: model.provider,
+        model: model.id,
+        thinking,
+      });
   }
   return [...models.values()].sort((a, b) =>
     `${a.provider}/${a.model}`.localeCompare(`${b.provider}/${b.model}`),
@@ -51,7 +35,7 @@ export function approvedModels(
 }
 
 export interface SetupView {
-  phase: "working" | "review" | "saving";
+  phase: "choosing" | "working" | "review" | "saving";
   revision: number;
   id?: string;
   current?: Ladder;
@@ -62,7 +46,12 @@ export interface SetupView {
 }
 export interface SetupOptions {
   coordinator: Coordinator;
-  approved: () => ApprovedModel[];
+  available: () => AvailableModel[];
+  choose: (
+    available: AvailableModel[],
+    current: Ladder | undefined,
+    signal: AbortSignal,
+  ) => Promise<AvailableModel[] | undefined>;
   prepare: () => Promise<boolean>;
   signal?: AbortSignal;
   onChange: (view: SetupView | undefined) => void;
@@ -73,7 +62,9 @@ type Session = {
   path: string;
   source?: string;
   current?: Ladder;
-  approved: ApprovedModel[];
+  available: AvailableModel[];
+  selected: AvailableModel[];
+  choice?: AbortController;
   id?: string;
   revision: number;
   response?: string;
@@ -95,7 +86,11 @@ export class ModelSetup {
   constructor(private readonly options: SetupOptions) {
     this.unsubscribe = options.coordinator.subscribe(() => {
       const s = this.session;
-      if (!s?.id || !this.state) return;
+      if (!s || !this.state) return;
+      if (!s.id) {
+        if (s.choice && options.coordinator.interrupted) this.close(s);
+        return;
+      }
       try {
         const paused = options.coordinator.get(s.id).status === "paused";
         if (paused !== this.state.paused) {
@@ -129,6 +124,7 @@ export class ModelSetup {
       throw new Error("Model setup is no longer current");
   }
   private close(s: Session) {
+    s.choice?.abort();
     s.observer?.abort();
     if (this.session !== s) return;
     this.session = undefined;
@@ -165,11 +161,12 @@ export class ModelSetup {
       throw new Error("Model setup disposed or aborted");
     const s: Session = {
       path: ladderPath(),
-      approved: [],
+      available: [],
+      selected: [],
       revision: ++this.revision,
     };
     this.session = s; // Reserve before prepare or any other asynchronous operation.
-    this.state = { phase: "working", revision: s.revision, paused: false };
+    this.state = { phase: "choosing", revision: s.revision, paused: false };
     this.emit();
     try {
       if (!(await this.options.prepare())) {
@@ -186,9 +183,62 @@ export class ModelSetup {
           currentError = reason(error);
         }
       }
-      s.approved = structuredClone(this.options.approved());
-      if (!s.approved.length)
-        throw new Error("No approved models are available");
+      s.available = structuredClone(this.options.available());
+      this.valid(s);
+      if (!s.available.length)
+        throw new Error("No native models are currently available");
+      s.choice = new AbortController();
+      this.state = { ...this.state!, current: s.current, currentError };
+      this.emit();
+      this.valid(s);
+      const epoch = this.options.coordinator.interruptEpoch;
+      const chosen = await this.options.choose(
+        structuredClone(s.available),
+        s.current && structuredClone(s.current),
+        s.choice.signal,
+      );
+      this.valid(s);
+      if (
+        this.options.coordinator.interrupted ||
+        this.options.coordinator.interruptEpoch !== epoch
+      ) {
+        this.close(s);
+        return;
+      }
+      if (chosen === undefined) {
+        this.close(s);
+        return;
+      }
+      if (!chosen.length)
+        throw new Error("Select at least one available model");
+      const current = this.options.available();
+      this.valid(s);
+      s.selected = chosen.map((choice) => {
+        const found = current.find(
+          (model) =>
+            model.provider === choice.provider && model.model === choice.model,
+        );
+        const offered = s.available.find(
+          (model) =>
+            model.provider === choice.provider && model.model === choice.model,
+        );
+        if (!found || !offered)
+          throw new Error(
+            `Selected model is no longer available: ${choice.provider}/${choice.model}`,
+          );
+        const thinking = found.thinking.filter((level) =>
+          offered.thinking.includes(level),
+        );
+        if (!thinking.length)
+          throw new Error(
+            `Selected model has no offered thinking level available: ${choice.provider}/${choice.model}`,
+          );
+        return { ...found, thinking };
+      });
+      s.choice = undefined;
+      this.state = { ...this.state!, phase: "working" };
+      this.emit();
+      this.valid(s);
       const instructions = await readFile(
         new URL("../instructions/model-capabilities.md", import.meta.url),
         "utf8",
@@ -196,11 +246,18 @@ export class ModelSetup {
       const sessionDir =
         worker.sessionDir ?? (await workerDirectory(worker.cwd));
       this.valid(s);
+      if (
+        this.options.coordinator.interrupted ||
+        this.options.coordinator.interruptEpoch !== epoch
+      ) {
+        this.close(s);
+        return;
+      }
       s.id = this.options.coordinator.start({
         description: "Review model ladder",
         level: undefined,
         worker: { ...worker, sessionDir },
-        prompt: `${instructions}\n\nApproved variants (research only):\n${JSON.stringify(s.approved)}\n\nCurrent ladder:\n${JSON.stringify(s.current ?? null)}\n${currentError ? `Current ladder is malformed; propose an explicit repair. ${currentError}\n` : ""}`,
+        prompt: `${instructions}\n\nSelected variants (research only):\n${JSON.stringify(s.selected)}\n\nCurrent ladder:\n${JSON.stringify(s.current ?? null)}\n${currentError ? `Current ladder is malformed; propose an explicit repair. ${currentError}\n` : ""}`,
       });
       this.state = {
         phase: "working",
@@ -216,21 +273,31 @@ export class ModelSetup {
       await this.fail(s, error);
     }
   }
-  private authorize(ladder: Ladder, s: Session, approved: ApprovedModel[]) {
+  private authorize(ladder: Ladder, s: Session, available: AvailableModel[]) {
+    const contains = (
+      models: AvailableModel[],
+      ref: ReturnType<typeof parseReference>,
+    ) =>
+      models.some(
+        (model) =>
+          model.provider === ref.provider &&
+          model.model === ref.model &&
+          model.thinking.includes(ref.thinking),
+      );
     for (const [level, row] of Object.entries(ladder)) {
-      const old = s.current?.[level];
-      if (old?.model === row.model && old.cost === row.cost) continue;
       const ref = parseReference(row.model);
-      if (
-        !approved.some(
-          (a) =>
-            a.provider === ref.provider &&
-            a.model === ref.model &&
-            a.thinking.includes(ref.thinking),
-        )
-      )
+      const old = s.current?.[level];
+      const unchanged = old?.model === row.model && old.cost === row.cost;
+      const selected = contains(s.selected, ref);
+      // An already confirmed unavailable entry may remain unchanged, not silently regraded.
+      if (unchanged && !contains(s.available, ref)) continue;
+      if (!selected)
         throw new Error(
-          `Model approval does not authorize rung ${level}: ${row.model}`,
+          `Model selection does not authorize rung ${level}: ${row.model}`,
+        );
+      if (!contains(available, ref))
+        throw new Error(
+          `Model is no longer available at rung ${level}: ${row.model}`,
         );
     }
   }
@@ -271,7 +338,7 @@ export class ModelSetup {
         )
           throw new Error("Expected exactly ladder and a nonempty comparison");
         const draft = validateLadder(raw.ladder);
-        this.authorize(draft, s, s.approved);
+        this.authorize(draft, s, this.options.available());
         s.response = task.response;
         this.state = {
           ...this.state!,
@@ -308,7 +375,7 @@ export class ModelSetup {
   }
   async revise(text: string): Promise<void> {
     const s = this.session;
-    if (!s?.id) throw new Error("Model setup is not ready for refinement");
+    if (!s?.id) throw new Error("Choose models in the dialog before refining");
     this.valid(s);
     if (this.state?.phase === "saving")
       throw new Error("Model setup is busy saving");
@@ -347,6 +414,7 @@ export class ModelSetup {
     const epoch = this.options.coordinator.interruptEpoch;
     const response = s.response;
     const verify = () => {
+      const available = this.options.available();
       this.valid(s);
       if (
         s.id !== id ||
@@ -367,7 +435,7 @@ export class ModelSetup {
         task.response !== response
       )
         throw new Error("Research is no longer ready");
-      this.authorize(draft, s, this.options.approved());
+      this.authorize(draft, s, available);
     };
     this.state = { ...this.state, phase: "saving" };
     this.emit();

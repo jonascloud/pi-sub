@@ -22,7 +22,7 @@ function reply(context) {
     (message) =>
       message.role === "user" &&
       JSON.stringify(message.content).includes(
-        "Approved variants (research only):",
+        "Selected variants (research only):",
       ),
   );
   if (
@@ -48,7 +48,7 @@ function reply(context) {
             .join("");
     const approved = JSON.parse(
       content
-        .split("Approved variants (research only):\n")[1]
+        .split("Selected variants (research only):\n")[1]
         .split("\n\nCurrent ladder:")[0],
     );
     const model = approved[0],
@@ -149,21 +149,22 @@ function reply(context) {
 }
 
 export default function (pi) {
-  pi.registerProvider("worker-test", {
+  const definition = {
     baseUrl: "http://localhost",
     apiKey: "test",
     api: "worker-test-api",
     models: [
-      {
-        id: "fake",
-        name: "Fake",
-        reasoning: true,
-        input: ["text"],
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: 100000,
-        maxTokens: 10000,
-      },
-    ],
+      "fake",
+      ...(process.env.WORKER_TEST_TWO_MODELS ? ["other"] : []),
+    ].map((id) => ({
+      id,
+      name: "Fake",
+      reasoning: true,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 100000,
+      maxTokens: 10000,
+    })),
     streamSimple(model, context, options) {
       const stream = createAssistantMessageEventStream();
       const message = {
@@ -199,7 +200,7 @@ export default function (pi) {
         !context.messages.some(
           (message) =>
             message.role === "user" &&
-            JSON.stringify(message.content).includes("Approved variants"),
+            JSON.stringify(message.content).includes("Selected variants"),
         );
       if (slow && process.env.WORKER_TEST_CHILD_MARKER)
         writeFileSync(process.env.WORKER_TEST_CHILD_MARKER, "running");
@@ -288,6 +289,15 @@ export default function (pi) {
       }
       return stream;
     },
+  };
+  pi.registerProvider("worker-test", definition);
+  pi.registerCommand("test-remove-setup-model", {
+    description: "Synthetic availability change",
+    handler: async () =>
+      pi.registerProvider("worker-test", {
+        ...definition,
+        models: definition.models.filter((model) => model.id !== "fake"),
+      }),
   });
   if (process.env.WORKER_TEST_END_DIALOG) {
     pi.on("agent_end", async (_event, ctx) => {

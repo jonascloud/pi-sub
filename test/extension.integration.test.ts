@@ -4,7 +4,6 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
   RpcClient,
-  getPackageDir,
   type JsonAgentSessionEvent,
 } from "@earendil-works/pi-coding-agent";
 
@@ -37,6 +36,7 @@ async function host(
     join(agentDir, "settings.json"),
     JSON.stringify({
       extensions: [resolve("test/fixtures/provider.js"), resolve("index.ts")],
+      enabledModels: ["worker-test/fake"],
       retry: {
         enabled: true,
         maxRetries: 2,
@@ -47,7 +47,7 @@ async function host(
   );
   const marker = join(cwd, "child-started");
   const client = new RpcClient({
-    cliPath: join(getPackageDir(), "dist/cli.js"),
+    cliPath: resolve("test/fixtures/rpc-model-picker.js"),
     cwd,
     provider: "worker-test",
     model: "fake",
@@ -77,17 +77,17 @@ async function host(
       expect(await client.prompt("/sub:models")).toBe("handled");
       await proposal(client, "6");
       await expect(
-        readFile(join(agentDir, "pi-sub/models.json")),
+        readFile(join(agentDir, "pi-sub-config.json")),
       ).rejects.toMatchObject({ code: "ENOENT" });
       if (accept) expect(await client.prompt("accept")).toBe("handled");
     }
-    if (!research || accept)
+    if ((research && accept) || (!research && profile))
       await eventually(async () => {
         const ladder = JSON.parse(
-          await readFile(join(agentDir, "pi-sub/models.json"), "utf8"),
+          await readFile(join(agentDir, "pi-sub-config.json"), "utf8"),
         );
         expect(ladder["6"]).toEqual({
-          model: "worker-test/fake:off",
+          model: `${env.WORKER_TEST_PICK_MODEL ?? "worker-test/fake"}:off`,
           cost: 0.1,
         });
         expect(Object.keys(ladder)).toEqual(["6"]);
@@ -211,6 +211,108 @@ test("bootstraps, delegates, accepts and reports original child usage once", asy
   }
 }, 60000);
 
+test("the human-selected ladder delegates outside the main session's model scope", async () => {
+  const { client, agentDir, dispose } = await host({
+    WORKER_TEST_TWO_MODELS: "1",
+    WORKER_TEST_PICK_MODEL: "worker-test/other",
+  });
+  try {
+    expect((await client.getState()).model?.id).toBe("fake");
+    expect(
+      JSON.parse(await readFile(join(agentDir, "settings.json"), "utf8"))
+        .enabledModels,
+    ).toEqual(["worker-test/fake"]);
+    await client.promptAndWait("integration:delegate", undefined, 20000);
+    expect(await latestResult(client)).toMatchObject({
+      outcome: "reply",
+      execution: { provider: "worker-test", model: "other", thinking: "off" },
+    });
+  } finally {
+    await dispose();
+  }
+}, 30000);
+
+test("research refinements recheck availability through the common admission guard", async () => {
+  const { client, agentDir, dispose } = await host(
+    { WORKER_TEST_TWO_MODELS: "1" },
+    undefined,
+    true,
+    false,
+  );
+  try {
+    const ready = await proposal(client, "6");
+    const before = await readFile(ready.task.sessionFile, "utf8");
+    await client.setModel("worker-test", "other");
+    expect(await client.prompt("/test-remove-setup-model")).toBe("handled");
+    expect(
+      (await client.getAvailableModels()).some((model) => model.id === "fake"),
+    ).toBe(false);
+    expect(await client.prompt("integration:refine-proposal")).toBe("handled");
+    await eventually(async () =>
+      expect(JSON.stringify(await client.getMessages())).toContain(
+        "retained execution is no longer available",
+      ),
+    );
+    expect(await readFile(ready.task.sessionFile, "utf8")).toBe(before);
+    await expect(
+      readFile(join(agentDir, "pi-sub-config.json")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+  } finally {
+    await dispose();
+  }
+}, 20000);
+
+test("cancelling the candidate dialog never creates a task or configuration", async () => {
+  const { client, agentDir, dispose } = await host(
+    { WORKER_TEST_PICKER_CANCEL: "1" },
+    undefined,
+    false,
+  );
+  try {
+    expect(await client.prompt("/sub:models")).toBe("handled");
+    expect((await client.getSessionStats()).assistantMessages).toBe(0);
+    await expect(
+      readFile(join(agentDir, "pi-sub-config.json")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+    expect(
+      (await client.getMessages()).some(
+        (message) =>
+          message.role === "custom" &&
+          message.customType === "pi-sub:models" &&
+          !!message.details,
+      ),
+    ).toBe(false);
+  } finally {
+    await dispose();
+  }
+}, 20000);
+
+test("real input cannot accept the candidate stage and cancel dismisses its pending dialog", async () => {
+  const { client, agentDir, dispose } = await host(
+    { WORKER_TEST_PICKER_HOLD: "1" },
+    undefined,
+    false,
+  );
+  const dialog = nextEvent(client, (event) => {
+    const ui = event as unknown as { type: string; method?: string };
+    return ui.type === "extension_ui_request" && ui.method === "select";
+  });
+  try {
+    const opening = client.prompt("/sub:models");
+    await dialog.promise;
+    expect(await client.prompt("accept")).toBe("handled");
+    expect((await client.getSessionStats()).assistantMessages).toBe(0);
+    await expect(
+      readFile(join(agentDir, "pi-sub-config.json")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await client.prompt("cancel")).toBe("handled");
+    expect(await opening).toBe("handled");
+  } finally {
+    dialog.dispose();
+    await dispose();
+  }
+}, 20000);
+
 test("proposal and prompt refinements remain drafts until explicit acceptance", async () => {
   const { client, agentDir, dispose } = await host({}, undefined, true, false);
   try {
@@ -222,7 +324,7 @@ test("proposal and prompt refinements remain drafts until explicit acceptance", 
     expect(revised.task.id).toBe(first.task.id);
     expect(revised.task.sessionFile).toBe(first.task.sessionFile);
     expect((await client.getSessionStats()).assistantMessages).toBe(0);
-    const path = join(agentDir, "pi-sub/models.json");
+    const path = join(agentDir, "pi-sub-config.json");
     await expect(readFile(path)).rejects.toMatchObject({ code: "ENOENT" });
     expect(await client.prompt("accept")).toBe("handled");
     await eventually(async () =>
@@ -243,7 +345,7 @@ test("proposal and prompt refinements remain drafts until explicit acceptance", 
 test("cancelling a revised proposal preserves the saved ladder and exits refinement mode", async () => {
   const { client, agentDir, dispose } = await host();
   try {
-    const path = join(agentDir, "pi-sub/models.json"),
+    const path = join(agentDir, "pi-sub-config.json"),
       before = await readFile(path, "utf8");
     expect(await client.prompt("/sub:models")).toBe("handled");
     await client.prompt("integration:refine-proposal");
@@ -280,11 +382,11 @@ test("extension-generated slash commands cannot impersonate user acceptance", as
     expect(await client.prompt("/extension-accept")).toBe("handled");
     await refused.promise;
     await expect(
-      readFile(join(agentDir, "pi-sub/models.json")),
+      readFile(join(agentDir, "pi-sub-config.json")),
     ).rejects.toMatchObject({ code: "ENOENT" });
     expect(await client.prompt("accept")).toBe("handled");
     expect(
-      JSON.parse(await readFile(join(agentDir, "pi-sub/models.json"), "utf8")),
+      JSON.parse(await readFile(join(agentDir, "pi-sub-config.json"), "utf8")),
     ).toHaveProperty("6");
   } finally {
     refused.dispose();
@@ -295,7 +397,7 @@ test("extension-generated slash commands cannot impersonate user acceptance", as
 test("acceptance never clobbers a config edited while its proposal was open", async () => {
   const { client, agentDir, dispose } = await host({}, undefined, true, false);
   try {
-    const path = join(agentDir, "pi-sub/models.json"),
+    const path = join(agentDir, "pi-sub-config.json"),
       manual = JSON.stringify({
         "9": { model: "worker-test/fake:off", cost: 9 },
       });
@@ -328,8 +430,13 @@ test("two working directories share the confirmed ladder and never load a local 
     expect(
       await readFile(join(second.cwd, ".pi/pi-sub/.gitignore"), "utf8"),
     ).toBe("*\n");
-    const global = join(first.agentDir, "pi-sub/models.json");
+    const global = join(first.agentDir, "pi-sub-config.json");
     await writeFile(local, await readFile(global));
+    await mkdir(join(first.agentDir, "pi-sub"), { recursive: true });
+    await writeFile(
+      join(first.agentDir, "pi-sub/models.json"),
+      await readFile(global),
+    );
     await rm(global);
     await second.client.promptAndWait(
       "integration:probe-global",
@@ -438,7 +545,7 @@ test("a manual ladder edit cannot resume a retained execution below its minimum 
     await client.promptAndWait("integration:pause", undefined, 20000);
     await eventually(() => readFile(marker));
     expect(await client.prompt("/sub:pause")).toBe("handled");
-    const path = join(agentDir, "pi-sub/models.json");
+    const path = join(agentDir, "pi-sub-config.json");
     const ladder = JSON.parse(await readFile(path, "utf8"));
     await writeFile(path, JSON.stringify({ "2": ladder["6"] }));
     await client.promptAndWait("integration:continue", undefined, 20000);
