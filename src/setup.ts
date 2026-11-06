@@ -117,7 +117,7 @@ export async function setupModels(
         );
     };
     verify();
-    // Capture the final response and original usage, then close its process before activation.
+    // Accept the captured response and original usage before activating the proposal.
     await options.coordinator.collect(id);
     verify();
     const path = catalogPath(options.cwd);

@@ -1,216 +1,249 @@
 import { afterEach, expect, test } from "vitest";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { createWorker, type Worker, type WorkerEvent } from "../src/worker.ts";
+import { fileURLToPath } from "node:url";
+import {
+  createWorker,
+  type Worker,
+  type WorkerOptions,
+} from "../src/worker.ts";
 
 const dirs: string[] = [];
 const workers: Worker[] = [];
 afterEach(async () => {
-  await Promise.all(workers.splice(0).map((w) => w.close()));
+  await Promise.all(workers.splice(0).map((worker) => worker.stop()));
   await Promise.all(
-    dirs.splice(0).map((d) => rm(d, { recursive: true, force: true })),
+    dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })),
   );
 });
-async function setup(
-  thinking: "off" | "high" = "off",
-  env: Record<string, string> = {},
-) {
-  const dir = await mkdtemp(join(tmpdir(), "worker-test-"));
+async function setup(env: Record<string, string> = {}) {
+  const dir = await mkdtemp(join(tmpdir(), "worker-native-"));
   dirs.push(dir);
-  const worker = createWorker({
+  const session = join(dir, "sessions", "task.jsonl");
+  const options: WorkerOptions = {
     cwd: dir,
     provider: "worker-test",
     model: "fake",
-    thinking,
-    name: "test",
-    sessionDir: join(dir, "sessions"),
-    env: { PI_CODING_AGENT_DIR: join(dir, "agent"), ...env },
-    args: [
-      "--no-extensions",
-      "--extension",
-      resolve("test/fixtures/provider.js"),
-    ],
-  });
-  workers.push(worker);
-  return worker;
-}
-function settled(worker: Worker) {
-  return new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      off();
-      reject(new Error("settled timeout"));
-    }, 10000);
-    const off = worker.onEvent((event: WorkerEvent) => {
-      if (event.type === "worker_error" || event.type === "agent_settled") {
-        clearTimeout(timer);
-        off();
-        if (event.type === "worker_error") reject(new Error(event.error));
-        else resolve();
-      }
-    });
-  });
-}
-test("real CLI: handshake, events, native usage and continuing after abort", async () => {
-  const worker = await setup();
-  await worker.start();
-  const events: string[] = [];
-  worker.onEvent((e) => events.push(e.type));
-  const done = settled(worker);
-  await expect(worker.send("hello")).resolves.toBe("started");
-  expect(events).toContain("agent_start");
-  await done;
-  const report = await worker.report();
-  expect(report.text).toBe("fake response");
-  expect(report.sessionFile).toBeTruthy();
-  expect(report.usage).toEqual({
-    input: 10,
-    output: 3,
-    cacheRead: 2,
-    cacheWrite: 1,
-    cacheWrite1h: 1,
-    reasoning: 2,
-    totalTokens: 16,
-    cost: {
-      input: 1,
-      output: 2,
-      cacheRead: 3,
-      cacheWrite: 4,
-      total: 10,
-      totalFromProvider: true,
-    },
-  });
-  expect(events).toContain("message_update");
-  await expect(worker.send("slow")).resolves.toBe("started");
-  await expect(worker.report()).rejects.toThrow("worker is active");
-  await expect(worker.send("steer")).resolves.toBe("queued");
-  const cleared = await worker.pause();
-  expect(cleared.steering).toContain("steer");
-  const continued = settled(worker);
-  await expect(worker.send("again")).resolves.toBe("started");
-  await continued;
-  const finalReport = await worker.report();
-  expect(finalReport.text).toBe("fake response");
-  // The aborted response also reports usage; each native entry is counted once.
-  expect(finalReport.usage).toMatchObject({
-    input: 30,
-    reasoning: 6,
-    cacheWrite1h: 3,
-    cost: { total: 30, totalFromProvider: true },
-  });
-  await Promise.all([worker.close(), worker.close()]);
-  expect(await worker.report()).toEqual(finalReport);
-}, 30000);
-test("handled input rejects and unsupported dialog fails the worker", async () => {
-  const worker = await setup();
-  await worker.start();
-  await expect(worker.send("/handled")).rejects.toThrow("handled");
-  await expect(worker.send("/dialog")).rejects.toThrow(
-    "Unsupported extension UI dialog",
-  );
-  await expect(worker.report()).rejects.toThrow(
-    "Unsupported extension UI dialog",
-  );
-}, 30000);
-test("unexpected child exit while active emits worker_error and closes", async () => {
-  const worker = await setup("off", { WORKER_TEST_CRASH: "1" });
-  await worker.start();
-  const failed = new Promise<string>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      off();
-      reject(new Error("heartbeat timeout"));
-    }, 6000);
-    const off = worker.onEvent((event) => {
-      if (event.type === "worker_error") {
-        clearTimeout(timer);
-        off();
-        resolve(event.error);
-      }
-    });
-  });
-  await worker.send("crash");
-  expect(await failed).toMatch(/exited|stdin/i);
-  expect(await worker.report()).toMatchObject({ text: "", usage: undefined });
-  await Promise.all([worker.close(), worker.close()]);
-}, 15000);
-test("startup dialog fails without waiting for a UI response", async () => {
-  const worker = await setup("off", { WORKER_TEST_STARTUP_DIALOG: "1" });
-  await expect(worker.start()).rejects.toThrow(
-    "Unsupported extension UI dialog",
-  );
-}, 15000);
-test("startup rejects model fallback", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "worker-test-"));
-  dirs.push(dir);
-  const worker = createWorker({
-    cwd: dir,
-    provider: "missing-provider",
-    model: "missing-model",
     thinking: "off",
     name: "test",
-    env: { PI_CODING_AGENT_DIR: join(dir, "agent") },
-    args: ["--no-extensions"],
+    env: { PI_CODING_AGENT_DIR: join(dir, "agent"), ...env },
+    args: ["--no-extensions", "-e", resolve("test/fixtures/provider.js")],
+  };
+  const make = (overrides: Partial<WorkerOptions> = {}) => {
+    const worker = createWorker({ ...options, ...overrides }, session);
+    workers.push(worker);
+    return worker;
+  };
+  return { make, session, dir, options };
+}
+function nextEvent(worker: Worker, type: string) {
+  return new Promise<void>((resolve) => {
+    const off = worker.onEvent((event) => {
+      if (event.type === type) {
+        off();
+        resolve();
+      }
+    });
   });
-  workers.push(worker);
-  await expect(worker.start()).rejects.toThrow();
+}
+
+test("native CLI: a new process continues the same saved question/answer context", async () => {
+  const { make, session, dir, options } = await setup();
+  // Public context hook observes what the native CLI actually restores, rather
+  // than inferring continuity just from the presence of a session file.
+  const observer = join(dir, "observe.ts");
+  const log = join(dir, "context.json");
+  await writeFile(
+    observer,
+    `import {writeFileSync} from 'node:fs'; export default pi => { pi.on('context', event => {writeFileSync(${JSON.stringify(log)}, JSON.stringify(event.messages));}); };`,
+  );
+  const first = make();
+  const events: string[] = [];
+  first.onEvent((event) => events.push(event.type));
+  const report = await first.run("What is your response?");
+  expect(report).toMatchObject({
+    text: "fake response",
+    sessionFile: session,
+    inputPersisted: true,
+    interrupted: false,
+    usage: {
+      input: 10,
+      reasoning: 2,
+      cacheWrite1h: 1,
+      cost: { total: 10, totalFromProvider: true },
+    },
+  });
+  expect(report.error).toBeUndefined();
+  expect(events).toContain("message_update");
+  const second = make({ args: [...options.args!, "-e", observer] });
+  const continued = await second.run("Explain your previous answer.");
+  expect(continued).toMatchObject({
+    text: "fake response",
+    sessionFile: session,
+    inputPersisted: true,
+    usage: {
+      input: 20,
+      reasoning: 4,
+      cacheWrite1h: 2,
+      cost: { total: 20, totalFromProvider: true },
+    },
+  });
+  expect(continued.error).toBeUndefined();
+  const messages = JSON.parse(await readFile(log, "utf8"));
+  expect(messages.map((message: { role: string }) => message.role)).toEqual(
+    expect.arrayContaining(["user", "assistant", "user"]),
+  );
+  expect(JSON.stringify(messages)).toContain("What is your response?");
+  expect(JSON.stringify(messages)).toContain("fake response");
 }, 30000);
 
-test("recovers persisted response and usage after unsupported UI", async () => {
-  const worker = await setup("off", { WORKER_TEST_END_DIALOG: "1" });
-  await worker.start();
-  const failed = settled(worker);
-  await worker.send("hello");
-  await expect(failed).rejects.toThrow("Unsupported extension UI dialog");
-  const report = await worker.report();
-  expect(report.text).toBe("fake response");
-  expect(report.sessionFile).toMatch(/\.jsonl$/);
-  expect(report.usage).toMatchObject({
-    input: 10,
-    reasoning: 2,
-    cacheWrite1h: 1,
-    cost: { total: 10, totalFromProvider: true },
+test("native JSON can exit zero on provider error; report still fails", async () => {
+  const { make } = await setup({ WORKER_TEST_INTEGRATION: "1" });
+  expect(await make().run("integration:child-error")).toMatchObject({
+    error: "fatal synthetic failure",
+    inputPersisted: true,
+    interrupted: false,
   });
 }, 15000);
 
-test("publishes cleared queue even when abort crashes", async () => {
-  const worker = await setup("off", { WORKER_TEST_ABORT_CRASH: "1" });
-  await worker.start();
-  const events: WorkerEvent[] = [];
-  worker.onEvent((event) => events.push(event));
-  await worker.send("slow");
-  await worker.send("queued");
-  await expect(worker.pause()).rejects.toThrow();
-  expect(events).toContainEqual({
-    type: "worker_queue_cleared",
-    steering: ["queued"],
-    followUp: [],
+test("thinking clamp is rejected before any provider call", async () => {
+  const { make, dir } = await setup({ WORKER_TEST_SLOW_CHILD: "1" });
+  const marker = join(dir, "called");
+  const guard = make({
+    thinking: "xhigh",
+    env: {
+      PI_CODING_AGENT_DIR: join(dir, "agent"),
+      WORKER_TEST_SLOW_CHILD: "1",
+      WORKER_TEST_CHILD_MARKER: marker,
+    },
   });
+  const report = await guard.run("must never reach provider");
+  expect(report.error).toMatch(/model mismatch/);
+  expect(report.text).toBe("");
+  // Native Pi may append the user while unwinding an aborted preparation.
+  // The important safety property is that no provider call occurred.
+  await expect(readFile(marker)).rejects.toMatchObject({ code: "ENOENT" });
 }, 15000);
 
-test("recovers persisted usage when an idle exit is first discovered during report", async () => {
-  const worker = await setup();
-  await worker.start();
-  const done = settled(worker);
-  await worker.send("first");
-  await done;
-  await expect(worker.send("/crash")).rejects.toThrow();
-  expect(await worker.report()).toMatchObject({
+test("native stop drains close and a different process can continue", async () => {
+  const { make, options } = await setup({ WORKER_TEST_SLOW_CHILD: "1" });
+  const first = make();
+  const started = nextEvent(first, "message_start");
+  const running = first.run("slow first request");
+  await started;
+  await Promise.all([first.stop(), first.stop()]);
+  expect(await running).toMatchObject({
+    interrupted: true,
+    inputPersisted: true,
+  });
+  const report = await make({
+    env: { PI_CODING_AGENT_DIR: options.env!.PI_CODING_AGENT_DIR! },
+  }).run("continue after interruption");
+  expect(report).toMatchObject({
     text: "fake response",
+    interrupted: false,
+    inputPersisted: true,
+  });
+  expect(report.error).toBeUndefined();
+}, 20000);
+
+test("native headless dialogs return denial defaults without approval", async () => {
+  const { make, dir, options } = await setup();
+  const extension = join(dir, "dialog.ts");
+  const result = join(dir, "dialog-result.json");
+  await writeFile(
+    extension,
+    `import {writeFileSync} from 'node:fs'; export default pi => { pi.on('session_start',async(_,ctx)=>{const approved=await ctx.ui.confirm('danger','approve?'); const other=[await ctx.ui.select('select',['yes']),await ctx.ui.input('input'),await ctx.ui.editor('editor')]; writeFileSync(${JSON.stringify(result)},JSON.stringify({approved,other,hasUI:ctx.hasUI}));});};`,
+  );
+  const report = await make({ args: [...options.args!, "-e", extension] }).run(
+    "hello",
+  );
+  expect(report.error).toBeUndefined();
+  expect(JSON.parse(await readFile(result, "utf8"))).toEqual({
+    approved: false,
+    other: [null, null, null],
+    hasUI: false,
+  });
+}, 15000);
+
+test("native tool permission denial prevents the protected side effect", async () => {
+  const { make, dir, options } = await setup();
+  const extension = join(dir, "permission.ts");
+  const marker = join(dir, "protected-side-effect");
+  const approval = join(dir, "approval.json");
+  await writeFile(
+    extension,
+    `
+import { createAssistantMessageEventStream } from ${JSON.stringify(fileURLToPath(import.meta.resolve("@earendil-works/pi-ai/utils/event-stream")))};
+import { writeFileSync } from 'node:fs';
+import { Type } from 'typebox';
+export default pi => {
+  pi.registerTool({name:'protected_action',label:'Protected action',description:'Test permission boundary',parameters:Type.Object({}),
+    async execute(_id,_args,_signal,_update,ctx) {
+      const approved=await ctx.ui.confirm('Permission','Allow protected action?');
+      writeFileSync(${JSON.stringify(approval)},JSON.stringify({approved}));
+      if(approved) writeFileSync(${JSON.stringify(marker)},'must not happen');
+      return {content:[{type:'text',text:approved?'approved':'denied'}],details:{approved}};
+    }
+  });
+  pi.registerProvider('permission-test',{
+    baseUrl:'http://localhost',apiKey:'test',api:'permission-test-api',
+    models:[{id:'fake',name:'Fake permission test',reasoning:false,input:['text'],cost:{input:0,output:0,cacheRead:0,cacheWrite:0},contextWindow:100000,maxTokens:1000}],
+    streamSimple(model,context) {
+      const stream=createAssistantMessageEventStream();
+      const done=context.messages.some(message=>message.role==='toolResult');
+      const message={role:'assistant',api:model.api,provider:model.provider,model:model.id,timestamp:Date.now(),
+        content:done?[{type:'text',text:'Permission denied'}]:[{type:'toolCall',id:'protected-call',name:'protected_action',arguments:{}}],
+        stopReason:done?'stop':'toolUse',
+        usage:{input:1,output:1,cacheRead:0,cacheWrite:0,totalTokens:2,cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0}}};
+      queueMicrotask(()=>{stream.push({type:'done',reason:message.stopReason,message});stream.end();});
+      return stream;
+    }
+  });
+};
+`,
+  );
+  const worker = make({
+    provider: "permission-test",
+    args: [...options.args!, "-e", extension],
+  });
+  const events: string[] = [];
+  worker.onEvent((event) => {
+    if (event.type === "tool_execution_start") events.push(event.toolName);
+  });
+  const report = await worker.run("Try the protected action.");
+  expect(report.error).toBeUndefined();
+  expect(report.text).toBe("Permission denied");
+  expect(events).toContain("protected_action");
+  expect(JSON.parse(await readFile(approval, "utf8"))).toEqual({
+    approved: false,
+  });
+  await expect(readFile(marker)).rejects.toMatchObject({ code: "ENOENT" });
+}, 15000);
+
+test("dialog-only input without a new assistant response is an error", async () => {
+  const { make } = await setup();
+  expect((await make().run("first")).error).toBeUndefined();
+  expect(await make().run("/dialog")).toMatchObject({
+    text: "",
+    inputPersisted: false,
+    interrupted: false,
+    error: expect.stringContaining("No new assistant response"),
+  });
+}, 15000);
+
+test("native crash after restoration cannot return the old answer", async () => {
+  const { make, options } = await setup();
+  expect((await make().run("first")).text).toBe("fake response");
+  const report = await make({
+    env: { ...options.env, WORKER_TEST_CRASH_AFTER_RESPONSE: "1" },
+  }).run("second");
+  expect(report).toMatchObject({
+    text: "",
+    interrupted: false,
+    inputPersisted: true,
     usage: { input: 10, cost: { total: 10 } },
   });
-}, 15000);
-
-test("recovers earlier response when the next active run crashes", async () => {
-  const worker = await setup("off", { WORKER_TEST_CRASH_AFTER_RESPONSE: "1" });
-  await worker.start();
-  const done = settled(worker);
-  await worker.send("first");
-  await done;
-  const failed = settled(worker);
-  await worker.send("second");
-  await expect(failed).rejects.toThrow();
-  expect(await worker.report()).toMatchObject({
-    text: "fake response",
-    usage: { input: 10, cost: { total: 10, totalFromProvider: true } },
-  });
-}, 15000);
+  expect(report.error).toMatch(/42/);
+}, 20000);

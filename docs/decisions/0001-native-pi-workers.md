@@ -1,15 +1,17 @@
-# 0001 — Coordinate native Pi workers
+# 0001 — Coordinate native Pi executions
 
 Status: Accepted
 
 ## Decision
 
-Build a small coordinator around native Pi RPC subprocesses, using the exported `RpcClient`. Pi owns sessions, conversation history, tools, compaction and retries. The coordinator owns level-based execution selection, child lifecycle, concurrency and compact progress presentation.
+Build a small coordinator around the native single-shot CLI: `pi --mode json --print --session <file>`. Send the instruction over stdin. Pi owns sessions, conversation history, tools, compaction, retries and restoration. The coordinator owns minimum-strength selection, task admission, process ownership and compact presentation.
 
-All work is asynchronous. Waiting observes an existing task; it is not a separate foreground execution mode. Use Pi's events and inspection methods for execution boundaries rather than rebuilding an agent loop. Untagged events are hints; combine settlement observations with fresh native state checks as described in [the lifecycle decision](0002-process-lifetime-and-interruption.md).
+All work is asynchronous. Waiting observes an existing task, not a separate foreground runner. Native JSON events show progress; actual process closure with drained output ends an execution. This replaces the original persistent RPC-worker approach: untagged settlement events and state snapshots could not prove the absence of native deferred work.
 
 ## Rationale and consequences
 
-The process boundary replaces our in-process framework, not merely its executor. Do not port custom session construction, provider replay, prompt/context reconstruction, role presets, turn loops and hard turn budgets, workspace-provider and service/event platforms, retention services or a custom transcript viewer.
+The process boundary replaces our in-process framework, not merely its executor. Do not introduce session construction, provider replay, transcript reconstruction, role presets, turn loops, budgets or a service/event platform.
 
-Children use native Pi configuration. Parent-only runtime registrations are not automatically inherited. Process separation is not a filesystem sandbox. Reuse routing evidence and useful presentation code selectively, preserving applicable attribution; do not inherit the old API or tests as requirements.
+Each continuation pays process startup and reloads native resources. In-memory extension state does not survive. An explicitly loaded native extension verifies the assigned session, provider, model and thinking before requests, including native thinking clamps. It uses public hooks and abort, not SDK patches or private fields.
+
+Children use native Pi configuration; parent-only runtime registrations are not inherited. Process separation is not a filesystem sandbox. Task/session lifetime is defined in [0002](0002-process-lifetime-and-interruption.md).

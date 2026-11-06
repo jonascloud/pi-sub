@@ -6,7 +6,7 @@ Status: Accepted
 
 Provide one extension command for initial setup and later refreshes. Ship the assessment instructions and reference-scale rules, not a preselected runtime model catalog. Ordinary delegation requires a successfully generated catalog; without one, explain how to run setup rather than guessing a model or level.
 
-The command starts a dedicated RPC subagent with the current parent model and thinking setting. This explicit setup path does not require the level routing it is creating. Give it a snapshot of the operator-approved models and their supported thinking variants; it must not expand approval.
+The command starts a dedicated native-session subagent with the current parent model and thinking setting. This explicit setup path does not require the level routing it is creating. Give it a snapshot of the operator-approved models and their supported thinking variants; it must not expand approval.
 
 First gather comparable evidence for every candidate, then assess capability and propose an active subset according to the shared instructions. Keep sourced measurements, capability judgments and selection rationale distinct. Retain sources, acquisition dates and missing-data explanations. Research existing evidence; do not run paid model benchmarks implicitly. Missing evidence excludes a candidate rather than becoming an invented value.
 

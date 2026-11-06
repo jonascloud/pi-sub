@@ -98,6 +98,7 @@ function setup(mode = "rpc") {
 const failure: TaskResult = {
   id: "failed",
   description: "test task",
+  sessionFile: "native.jsonl",
   execution: { provider: "test", model: "fake", thinking: "off" },
   turns: 0,
   toolUses: 0,

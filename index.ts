@@ -65,7 +65,7 @@ export default function piSub(pi: ExtensionAPI): void {
             customType: "pi-sub:response",
             display: true,
             content: truncateHead(
-              `Subagent ${task.id} (${task.description}) has a response:\n${text}\n\nThis may be a question, not a final result. Use sub_message to answer or sub_result with finish:true to accept and close it.`,
+              `Subagent ${task.id} (${task.description}) has a response:\n${text}\n\nThis may be a question, not a final result. Use sub_message to answer or sub_result with finish:true to accept and remove the task.`,
               { maxBytes: 8000, maxLines: 100 },
             ).content,
           },
@@ -264,7 +264,7 @@ export default function piSub(pi: ExtensionAPI): void {
     } catch (error) {
       table = reason(error);
     }
-    event.systemPromptOptions.sections.pi_sub = `Subagents are independent native Pi processes. Start bounded tasks with sub_task at the minimum sufficient level; count briefing, research, verification and integration overhead. All tasks are asynchronous. Ordinary replies can be questions: inspect before accepting a final result. Use sub_message for answers/corrections, sub_control for pause/continue/stop, and sub_result finish:true only to accept a final response and close its process. Parent interruption pauses children; a new user prompt does not resume them. No child UI dialogs, custom roles or conversation inheritance.\nReference cost is weighted USD per AA Intelligence Index v5.0.1 task including thinking and cache, not a task-cost forecast or subscription price. The 1× baseline is fixed independently of approvals.\nFinal errors are automatically closed, delivered and removed before the next real user prompt, without a cleanup tool call.\nOpen subagents: ${JSON.stringify(
+    event.systemPromptOptions.sections.pi_sub = `A subagent is a task with a native Pi session. Each execution uses a fresh short-lived Pi process; ready and paused tasks hold no process. Start bounded tasks with sub_task at the minimum sufficient level; count briefing, research, verification and integration overhead. All tasks are asynchronous. Ordinary replies can be questions: inspect before accepting a final result. Use sub_message for answers/corrections, sub_control for pause/continue/stop, and sub_result finish:true only to accept a final response and remove the task. Redirecting active work interrupts its process, waits for exit and starts a new process on the same session with the correction. Parent interruption pauses children; a new user prompt does not resume them. No child UI dialogs, custom roles or conversation inheritance.\nReference cost is weighted USD per AA Intelligence Index v5.0.1 task including thinking and cache, not a task-cost forecast or subscription price. The 1× baseline is fixed independently of approvals.\nFinal errors are automatically closed, delivered and removed before the next real user prompt, without a cleanup tool call.\nOpen subagents: ${JSON.stringify(
       manager()
         .list()
         .map((task) => ({
@@ -405,7 +405,7 @@ export default function piSub(pi: ExtensionAPI): void {
       exposure: "model-only",
       executionMode: "sequential",
       description:
-        "Start an asynchronous task in a native Pi process. Requires a capability catalog from /sub:models; level is a minimum, never an inferred default.",
+        "Start an asynchronous task with its own native Pi session. Executions use short-lived processes. Requires a capability catalog from /sub:models; level is a minimum, never an inferred default.",
       parameters: Type.Object(
         {
           level: Type.Number({ minimum: 1, maximum: 10, multipleOf: 1 }),
@@ -450,7 +450,7 @@ export default function piSub(pi: ExtensionAPI): void {
       exposure: "model-only",
       executionMode: "sequential",
       description:
-        "Answer or redirect an existing task. Running work is steered; paused work resumes with the correction; ready replies are not automatically final results.",
+        "Answer or redirect a task in its native session. Active execution is interrupted and fully terminated before a fresh process receives the correction. Paused work resumes only explicitly; ordinary replies are not automatically final results.",
       parameters: Type.Object(
         { id: Type.String(), message: Type.String({ minLength: 1 }) },
         { additionalProperties: false },
@@ -475,7 +475,7 @@ export default function piSub(pi: ExtensionAPI): void {
       exposure: "model-only",
       executionMode: "sequential",
       description:
-        "Read a task response without closing it. Optional wait observes only; timeout or wait interruption does not itself stop the child. finish:true accepts a final response, closes its process and removes the live task. Final errors are automatically collected before the next user prompt. Large output is truncated; the native session file retains it.",
+        "Inspect a task without removing it. Optional wait observes execution completion, not semantic task completion. Timeout never stops work. finish:true accepts a final response and removes the task; its process has already exited. Final errors are collected automatically before the next user prompt. Full history remains in the native session.",
       parameters: Type.Object(
         {
           id: Type.String(),

@@ -11,7 +11,12 @@ import {
   type Catalog,
 } from "../src/models.ts";
 import { approvedModels, setupModels } from "../src/setup.ts";
-import type { Worker, WorkerEvent, WorkerOptions } from "../src/worker.ts";
+import type {
+  Worker,
+  WorkerEvent,
+  WorkerOptions,
+  WorkerReport,
+} from "../src/worker.ts";
 
 const approved: ApprovedModel[] = [
   { provider: "test", model: "fake", thinking: ["off"] },
@@ -45,40 +50,43 @@ const catalog = (): Catalog => ({
 });
 class FakeWorker implements Worker {
   listener: (event: WorkerEvent) => void = () => {};
-  text = "";
   prompts: string[] = [];
   closes = 0;
-  async start() {}
-  async send(message: string) {
-    this.prompts.push(message);
-    this.listener({ type: "agent_start" } as WorkerEvent);
-    return "started" as const;
+  private finished = false;
+  private result = Promise.withResolvers<WorkerReport>();
+  constructor(readonly sessionFile: string) {}
+  async run(text: string) {
+    this.prompts.push(text);
+    this.listener({ type: "agent_start" });
+    return this.result.promise;
   }
-  async pause() {
-    return { steering: [], followUp: [] };
-  }
-  async report() {
-    return { text: this.text };
-  }
-  async close() {
+  async stop() {
+    if (this.finished) return;
+    this.finished = true;
     this.closes++;
+    this.result.resolve({
+      text: "",
+      sessionFile: this.sessionFile,
+      interrupted: true,
+      inputPersisted: true,
+    });
   }
   onEvent(listener: (event: WorkerEvent) => void) {
     this.listener = listener;
-    return () => {};
+    return () => {
+      this.listener = () => {};
+    };
   }
   finish(text: string) {
-    this.text = text;
-    this.listener({
-      type: "message_end",
-      message: {
-        role: "assistant",
-        content: [{ type: "text", text }],
-        stopReason: "stop",
-      },
-    } as WorkerEvent);
-    this.listener({ type: "agent_settled", aborted: false });
-    this.listener({ type: "worker_state", idle: true });
+    if (this.finished) throw new Error("Execution already ended");
+    this.finished = true;
+    this.closes++;
+    this.result.resolve({
+      text,
+      sessionFile: this.sessionFile,
+      interrupted: false,
+      inputPersisted: true,
+    });
   }
 }
 const fixtures: { cwd: string; coordinator: Coordinator }[] = [];
@@ -90,8 +98,14 @@ afterEach(async () => {
 });
 async function begin(current = () => approved, signal?: AbortSignal) {
   const cwd = await mkdtemp(join(tmpdir(), "pi-sub-setup-"));
-  const worker = new FakeWorker();
-  const coordinator = new Coordinator({ createWorker: () => worker });
+  const workers: FakeWorker[] = [];
+  const coordinator = new Coordinator({
+    createWorker: (_options, file) => {
+      const worker = new FakeWorker(file);
+      workers.push(worker);
+      return worker;
+    },
+  });
   fixtures.push({ cwd, coordinator });
   const started = Promise.withResolvers<string>();
   const result = setupModels({
@@ -106,7 +120,16 @@ async function begin(current = () => approved, signal?: AbortSignal) {
   void result.catch(() => {});
   const id = await started.promise;
   await new Promise((resolve) => setTimeout(resolve, 0));
-  return { cwd, worker, coordinator, id, result };
+  return {
+    cwd,
+    get worker() {
+      return workers.at(-1)!;
+    },
+    workers,
+    coordinator,
+    id,
+    result,
+  };
 }
 
 describe("model setup", () => {
@@ -153,10 +176,10 @@ describe("model setup", () => {
     let current = approved;
     const fixture = await begin(() => current);
     await saveCatalog(catalogPath(fixture.cwd), catalog());
-    fixture.worker.report = async () => {
-      current = [];
-      return { text: fixture.worker.text };
-    };
+    fixture.coordinator.subscribe(() => {
+      if (!fixture.coordinator.list().some((task) => task.id === fixture.id))
+        current = [];
+    });
     fixture.worker.finish(
       JSON.stringify({ ...catalog(), generatedAt: "2026-11-05T01:00:00Z" }),
     );
@@ -176,8 +199,11 @@ describe("model setup", () => {
       .catch(() => {});
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(completed).toBe(false);
-    expect(fixture.worker.closes).toBe(0);
+    const previous = fixture.worker;
+    expect(previous.closes).toBe(1);
     await fixture.coordinator.continue(fixture.id);
+    expect(fixture.worker).not.toBe(previous);
+    expect(fixture.worker.sessionFile).toBe(previous.sessionFile);
     fixture.worker.finish(JSON.stringify(catalog()));
     await expect(fixture.result).resolves.toHaveProperty("catalog");
   });

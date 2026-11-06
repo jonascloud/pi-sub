@@ -4,14 +4,14 @@ Status: Accepted
 
 ## Decision
 
-Use ordinary child messages for progress, questions and answers. The parent decides whether a response requires further instruction or is the final result to accept. Pi becoming idle is not proof that the task is complete. Reading a question must not close the subagent.
+Use ordinary child replies for questions and answers. Execution completion is not semantic task completion. The parent decides whether to give another instruction or accept the result; reading a question must not remove its task. Do not introduce an ask-parent framework or classify question text mechanically.
 
-Do not initially introduce a dedicated ask-parent framework or machine classification of question text. Control-tool names and schemas remain unspecified.
+The coordinator renders its own status widget from native events. Child widgets, status, titles and editor changes are not forwarded.
 
-The coordinator renders its own status widget from child events. Child widget, status and title requests need no replies and are not forwarded into the parent's UI. Interactive child-extension dialogs (`confirm`, `select`, `input`, `editor`) are unsupported. If encountered, stop the affected task and report the unsupported interaction rather than silently approving or hanging. Never substitute a model's approval for human authorization.
+Native JSON/print execution has no interactive UI. Its public defaults return `false` for `confirm` and `undefined` for `select`, `input` and `editor`. Extensions must honor denial/cancellation and `ctx.hasUI`. Never approve automatically, forward approval to an LLM or patch SDK UI objects. A command that only opens a dialog and produces no new assistant response fails as an execution.
 
 ## Rationale and consequences
 
-The existing `RpcClient` already provides process control, prompts, steering, interruption, events, session inspection and usage access. Start with that client, not a new transport implementation. Its public API lacks a dialog-response writer and an exit callback; these are explicit limitations to validate, not reasons to rebuild the framework preemptively.
+Print mode does not wrap its no-op UI with observable dialog events. Unlike the earlier RPC bridge, the coordinator cannot diagnose every UI attempt. It uses native safe defaults rather than claiming universal interception.
 
-No child-dialog bridge is needed for our status widget or ordinary task communication. Extensions requiring interactive authorization are outside the initial compatibility boundary.
+Permission extensions must support headless denial. If they require human authorization, configure that separately; an ordinary parent/child text exchange cannot grant it. This is not a security sandbox against misbehaving trusted extensions.

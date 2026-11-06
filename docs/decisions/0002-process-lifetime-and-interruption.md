@@ -1,41 +1,43 @@
-# 0002 — Input-driven task ownership
+# 0002 — Tasks own sessions; executions own processes
 
 Status: Accepted
 
 ## Decision
 
-A subagent is one native Pi process serving one task. Keep its process and session while working, paused or awaiting an answer. Do not pool workers or reuse completed subagents for unrelated work. Saved sessions are artifacts, not automatic job recovery.
-
-A live task has four states: `queued`, `active`, `paused`, `ready`. A ready outcome is a reply, error or deliberate stop. Retries and automatic compaction remain native execution, not new task states. Starting, sending, pausing and closing are serialized operations, not parallel lifecycle flags.
+A subagent is an assignment with one native Pi session. Each execution is a fresh short-lived process. At most one execution owns that session at a time. Ready and paused tasks retain data, not workers or concurrency slots. Do not pool processes or reuse task sessions for unrelated work. Saved journals are artifacts, not automatic job recovery.
 
 ```text
-queued -- admission --> active -- reply --> ready(reply)
-   |                      |                    |
-   | interrupt            | interrupt          +-- answer --> active
-   v                      v                    +-- accept --> removed
+queued -- admission --> active -- reply + process close --> ready(reply)
+   |                      |                                   |
+   | interrupt            | interrupt + process close         +-- answer --> queued
+   v                      v                                   +-- accept --> removed
  paused <-----------------+
-   +-- explicit continue --> queued / active
+   +-- explicit continue --> queued
 
-final failure --> ready(error) -- user prompt cleanup --> removed
+failure + process close --> ready(error) -- user prompt cleanup --> removed
 ```
+
+Reply/error/stopped are outcomes, not additional states. Retries and automatic compaction remain native execution. Pausing and closing describe an operation on the exact owned execution.
+
+Active redirection retains the correction, interrupts the old process, waits for closure and final capture, then queues a new process on the same session. It never injects input into a busy native session. An interrupt between these steps prevents restart and retains the correction. Instructions without specific persistence evidence are retained after interruption or failure; transformed inputs may be conservatively replayed.
 
 The controller accepts two user inputs:
 
-- **Interrupt:** block admission first, pause queued tasks, clear child queued inputs before aborting and preserve their text. Abort the parent through its native context. Confirm child quiescence rather than claiming an instantaneous freeze. A later child reply must not restart an interrupted parent.
-- **Prompt:** before forwarding real interactive/RPC input, capture and close remaining failed workers, deliver failure reports and undelivered inputs, then remove failed tasks without an LLM cleanup call. A later interrupt invalidates this handoff. Reopen admission for new work, but keep existing paused children paused. Explicit operator start/continue commands use the same preparation.
+- **Interrupt:** block admission first, pause queued tasks, then terminate active processes. Request native SIGTERM shutdown, escalate to SIGKILL on a bounded deadline and await closure including output drainage. Failed termination retains ownership and its slot for retry. Later replies cannot restart an interrupted parent.
+- **Prompt:** before forwarding real interactive/RPC input, finish failed-execution cleanup, deliver failure reports and pending instructions, then remove failed tasks without an LLM cleanup call. An intervening interrupt invalidates this handoff. Reopen admission but leave paused tasks paused. Explicit operator start/continue commands use the same preparation.
 
-Fatal workers may close before the next prompt. The coordinator owns release and does not wait for the parent model. Failed closure retains ownership and the process slot; a subsequent cleanup can retry it.
+Normal replies await an explicit parent decision, not an idle process. Accepting or stopping removes the live task and leaves a small idempotent result receipt without workers, promises or listeners. Failures release execution resources independently of model decisions and disappear after user-prompt delivery.
 
-Accepting a final reply or stopping a task captures its result, original usage and session path, closes the process and removes the live entry. A small result receipt permits idempotent retrieval without retaining a worker, promises or listeners. Statistics and pending usage delivery are independent of live task retention. Read final saved native entries after closure to include late persisted usage. Parent shutdown closes owned workers immediately without waiting for result collection.
+After every execution, read final saved native entries, including late shutdown usage. Replace the task's cumulative usage snapshot; never add successive snapshots of the same journal. Transfer that original usage once on acceptance, stop or automatic failure collection. Metrics and pending delivery outlive task removal. Shutdown terminates owned executions without model-managed collection.
 
 ## Native boundaries
 
-Untagged `agent_start`/`agent_settled` events can overlap awaited extension handlers. Native events trigger bounded state verification; every input receives a fresh post-acknowledgement check. Readiness additionally requires a settlement observation and no unresolved input/control operation. Do not correlate a new input with an arbitrary earlier start event or rebuild native turn execution.
+Process closure is decisive for execution lifetime, not success or semantic task completion. A zero exit code can accompany a native provider error. Require new native response evidence and inspect exit/error information; do not return a restored old answer as new output.
 
-Pi 1.5 RPC state does not expose settlement-hook activity or deferred prompts. Strict quiescence with overlapping asynchronous input/settlement hooks or autonomously prompting extensions is not guaranteed and is outside the supported initial configuration. A stronger guarantee requires a native SDK contract, not guessed run identities.
+Continuation restores saved native history and issues another request. It does not resume an interrupted request, retain extension memory, roll back side effects or guarantee exactly-once actions. Corrupt journals fail explicitly rather than silently becoming new sessions.
 
-Bare RPC `abort` has no extension event when the parent is idle. The reliable idle RPC global interrupt is the operator command `/sub:pause`; active runs additionally use abort signals and `agent_settled.aborted`. Compaction has its own public signal. No SDK patch or parent RPC transport interception is introduced.
+Bare RPC `abort` has no extension event when the parent is idle. The reliable idle global interrupt remains `/sub:pause`; active parent runs additionally use abort signals and `agent_settled.aborted`. Compaction has its own public signal. No parent RPC transport interception or SDK patch is introduced.
 
-## Rationale and consequences
+## Rationale
 
-Ownership, result transfer and release are explicit without a retention service or a model-managed cleanup protocol. The widget shows live tasks only: consumed failures disappear, while cumulative metrics and original usage survive removal. Pausing never rolls back external side effects; continuation is another input in the retained native session.
+Physical process ownership removes child idle inference, heartbeat polling and input/settlement handshakes. The coordinator manages bounded executions and result transfer, not native conversation internals or a second agent engine.

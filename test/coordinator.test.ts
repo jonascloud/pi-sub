@@ -1,7 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Usage } from "@earendil-works/pi-ai";
-import { Coordinator } from "../src/coordinator.ts";
-import type { Worker, WorkerEvent, WorkerOptions } from "../src/worker.ts";
+import { Coordinator, type TaskView } from "../src/coordinator.ts";
+import type {
+  Worker,
+  WorkerEvent,
+  WorkerOptions,
+  WorkerReport,
+} from "../src/worker.ts";
 
 const options: WorkerOptions = {
   cwd: "/",
@@ -11,50 +16,33 @@ const options: WorkerOptions = {
   name: "test",
 };
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
-const usage: Usage = {
-  input: 1,
-  output: 2,
-  cacheRead: 3,
-  cacheWrite: 4,
-  reasoning: 2,
-  cacheWrite1h: 1,
-  totalTokens: 10,
+const usage = (tokens: number): Usage => ({
+  input: tokens,
+  output: 0,
+  cacheRead: 0,
+  cacheWrite: 0,
+  totalTokens: tokens,
   cost: {
-    input: 1,
-    output: 2,
-    cacheRead: 3,
-    cacheWrite: 4,
-    total: 10,
-    totalFromProvider: true,
+    input: tokens,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    total: tokens,
   },
-};
+});
+
+/** A run report is available only after physical close, including on stop. */
 class Fake implements Worker {
-  listener: (event: WorkerEvent) => void = () => {};
-  active = false;
-  text = "";
-  billed?: Usage;
-  start = vi.fn(async () => {});
-  send = vi.fn(async (_text: string): Promise<"started" | "queued"> => {
-    this.emit({ type: "agent_start" });
-    return "started";
-  });
-  pause = vi.fn(async () => {
-    const cleared = {
-      steering: ["cleared steering"],
-      followUp: ["cleared follow-up"],
-    };
-    this.emit({ type: "worker_queue_cleared", ...cleared });
-    if (this.active) this.assistant("", "aborted");
-    this.emit({ type: "agent_settled", aborted: true });
-    return cleared;
-  });
-  report = vi.fn(async () => {
-    if (this.active) throw new Error("Cannot report while worker is active");
-    return { text: this.text, usage: this.billed, sessionFile: "native.jsonl" };
-  });
-  close = vi.fn(async () => {
-    this.active = false;
-  });
+  private report = Promise.withResolvers<WorkerReport>();
+  private closed = Promise.withResolvers<void>();
+  private listener: (event: WorkerEvent) => void = () => {};
+  private finished = false;
+  constructor(
+    readonly sessionFile: string,
+    private sessions: Map<string, Usage>,
+  ) {}
+  run = vi.fn((_input: string) => this.report.promise);
+  stop = vi.fn(() => this.closed.promise);
   onEvent(listener: (event: WorkerEvent) => void) {
     this.listener = listener;
     return () => {
@@ -62,419 +50,308 @@ class Fake implements Worker {
     };
   }
   emit(event: WorkerEvent) {
-    if (event.type === "agent_start") this.active = true;
-    if (event.type === "agent_settled") this.active = false;
     this.listener(event);
-    if (event.type === "agent_settled")
-      this.listener({ type: "worker_state", idle: !this.active });
   }
-  assistant(text: string, stopReason: "stop" | "error" | "aborted" = "stop") {
-    this.text = text;
-    this.billed = usage;
-    this.emit({
-      type: "message_end",
-      message: {
-        role: "assistant",
-        api: "openai-responses",
-        provider: "p",
-        model: "m",
-        timestamp: 0,
-        content: [{ type: "text", text }],
-        usage,
-        stopReason,
-        ...(stopReason === "error" ? { errorMessage: "retryable" } : {}),
-      },
+  close(report: Partial<WorkerReport> = {}) {
+    if (this.finished) throw new Error("Process already closed");
+    this.finished = true;
+    if (report.usage)
+      this.sessions.set(this.sessionFile, structuredClone(report.usage));
+    this.closed.resolve();
+    this.report.resolve({
+      text: "answer",
+      sessionFile: this.sessionFile,
+      usage: this.sessions.get(this.sessionFile),
+      interrupted: false,
+      inputPersisted: true,
+      ...report,
     });
   }
-  finish(text = "answer") {
-    this.assistant(text);
-    this.emit({ type: "agent_settled", aborted: false });
+  reject(error: Error) {
+    this.report.reject(error);
   }
-  fatal(error = "terminated") {
-    this.active = false;
-    this.billed = usage;
-    this.text = "partial answer";
-    this.emit({ type: "worker_error", error });
+  physicalClose() {
+    this.closed.resolve();
   }
 }
-function setup(maxWorkers = 1) {
+function setup(maxWorkers = 1, beforeStart?: (task: TaskView) => void) {
   const workers: Fake[] = [];
+  const sessions = new Map<string, Usage>();
   const onReady = vi.fn();
+  const factory = vi.fn((_options: WorkerOptions, sessionFile: string) => {
+    const worker = new Fake(sessionFile, sessions);
+    workers.push(worker);
+    return worker;
+  });
   const c = new Coordinator({
     maxWorkers,
+    createWorker: factory,
     onReady,
-    createWorker: () => {
-      const worker = new Fake();
-      workers.push(worker);
-      return worker;
-    },
+    beforeStart,
   });
-  const start = (prompt = "task") =>
+  const start = (prompt = "brief") =>
     c.start({ prompt, description: prompt, level: 3, worker: options });
-  return { c, workers, start, onReady };
+  return { c, workers, start, factory, onReady };
 }
 
-describe("native task ownership", () => {
-  it("admits FIFO only when resident workers are released and combines queued corrections", async () => {
-    const { c, workers, start } = setup();
+describe("one session, fresh execution processes", () => {
+  it("does not complete or admit on native settlement; closed ready tasks free capacity", async () => {
+    const { c, workers, start, onReady } = setup();
     const a = start("a"),
-      b = start("b"),
-      d = start("d");
+      b = start("b");
+    workers[0]!.emit({ type: "agent_settled", aborted: false });
     await tick();
-    workers[0]!.finish();
-    await tick();
+    expect(c.get(a).status).toBe("active");
     expect(workers).toHaveLength(1);
-    expect(c.get(a)).toMatchObject({ status: "ready", outcome: "reply" });
-    await c.message(b, "correction");
-    await c.collect(a);
-    await tick();
-    expect(c.list().map((task) => task.id)).toEqual([d, b]);
-    expect(workers[1]!.send).toHaveBeenCalledWith("b\n\ncorrection");
-    expect(c.summary()).toMatchObject({ completed: 1, tokens: 10 });
-    await c.dispose();
-  });
-  it("retains a question until accepted and stores only an idempotent result receipt afterward", async () => {
-    const { c, workers, start } = setup();
-    const id = start();
-    await tick();
-    workers[0]!.finish("Which schema?");
-    await c.wait(id);
-    expect(workers[0]!.close).not.toHaveBeenCalled();
-    await c.message(id, "Production schema");
-    expect(c.get(id).status).toBe("active");
-    workers[0]!.finish("Final result");
-    const result = await c.collect(id);
-    expect(result).toMatchObject({
-      outcome: "reply",
-      response: "Final result",
-    });
-    expect(result).not.toHaveProperty("status");
-    expect(result).not.toHaveProperty("operation");
-    expect(c.list()).toEqual([]);
-    expect(() => c.get(id)).toThrow("Unknown live task");
-    expect(await c.collect(id)).toEqual(result);
-    expect(c.inspect(id)).toEqual(result);
-    expect(c.drainUsage()).toEqual(usage);
-    expect(c.drainUsage()).toBeUndefined();
-    expect(workers[0]!.close).toHaveBeenCalledOnce();
-    await c.dispose();
-  });
-  it("uses native settlement, not intermediate request failures, for finality", async () => {
-    const { c, workers, start } = setup();
-    const id = start();
-    await tick();
-    workers[0]!.assistant("", "error");
-    expect(c.get(id)).toMatchObject({ status: "active" });
-    expect(c.get(id).error).toBeUndefined();
-    workers[0]!.finish("Recovered");
-    expect(c.get(id)).toMatchObject({
-      status: "ready",
-      outcome: "reply",
-      response: "Recovered",
-    });
-    await c.dispose();
-  });
-  it("rechecks authorization immediately before queued admission", async () => {
-    let approved = true;
-    const worker = new Fake();
-    const factory = vi.fn(() => worker);
-    const c = new Coordinator({
-      maxWorkers: 1,
-      createWorker: factory,
-      beforeStart: () => {
-        if (!approved) throw Error("revoked");
-      },
-    });
-    const a = c.start({ prompt: "a", description: "a", worker: options });
-    const b = c.start({ prompt: "b", description: "b", worker: options });
-    await tick();
-    approved = false;
-    worker.finish();
-    await c.collect(a);
-    await tick();
-    expect(factory).toHaveBeenCalledOnce();
-    expect(c.get(b)).toMatchObject({
-      status: "ready",
-      outcome: "error",
-      error: "revoked",
-    });
-    await c.prompt();
-    expect(() => c.get(b)).toThrow();
-    await c.dispose();
-  });
-});
-
-describe("input handoff", () => {
-  it("does not publish an old settled response while a new started handoff is unresolved", async () => {
-    const { c, workers, start, onReady } = setup();
-    const id = start();
-    await tick();
-    const worker = workers[0]!;
-    const ack = Promise.withResolvers<"started">();
-    worker.send.mockImplementationOnce(() => ack.promise);
-    const sending = c.message(id, "next");
-    await tick();
-    worker.emit({ type: "agent_settled", aborted: false });
-    expect(c.get(id).status).toBe("active");
     expect(onReady).not.toHaveBeenCalled();
-    await expect(c.collect(id)).rejects.toThrow("Cannot collect");
-    worker.emit({ type: "agent_start" });
-    ack.resolve("started");
-    await sending;
-    expect(c.get(id).status).toBe("active");
-    expect(onReady).not.toHaveBeenCalled();
-    worker.finish("new result");
-    expect(c.get(id)).toMatchObject({
-      status: "ready",
-      response: "new result",
-    });
+    await expect(c.collect(a)).rejects.toThrow("Cannot collect");
+    workers[0]!.close();
+    await tick();
+    expect(c.get(a).status).toBe("ready");
+    expect(c.get(b).status).toBe("active");
+    expect(workers).toHaveLength(2);
     expect(onReady).toHaveBeenCalledOnce();
+    workers[1]!.close();
+    await tick();
     await c.dispose();
   });
-  it("publishes a fast new run that starts and settles before the send continuation", async () => {
-    const { c, workers, start, onReady } = setup();
-    const id = start();
-    await tick();
-    const worker = workers[0]!;
-    const ack = Promise.withResolvers<"started">();
-    worker.send.mockImplementationOnce(() => ack.promise);
-    const sending = c.message(id, "next");
-    await tick();
-    worker.emit({ type: "agent_settled", aborted: false });
-    worker.emit({ type: "agent_start" });
-    worker.finish("fast result");
-    expect(onReady).not.toHaveBeenCalled();
-    ack.resolve("started");
-    await sending;
-    expect(c.get(id)).toMatchObject({
-      status: "ready",
-      response: "fast result",
-    });
-    expect(onReady).toHaveBeenCalledOnce();
-    await c.dispose();
-  });
-  it("publishes a queued handoff whose existing run settles before acknowledgement", async () => {
-    const { c, workers, start } = setup();
-    const id = start();
-    await tick();
-    const worker = workers[0]!;
-    const ack = Promise.withResolvers<"queued">();
-    worker.send.mockImplementationOnce(() => ack.promise);
-    const sending = c.message(id, "steer");
-    await tick();
-    worker.finish("steered result");
-    ack.resolve("queued");
-    await sending;
-    expect(c.get(id)).toMatchObject({
-      status: "ready",
-      response: "steered result",
-    });
-    await c.dispose();
-  });
-});
 
-describe("user interrupt and prompt", () => {
-  it("interrupts resident work, prevents queued admission and keeps children paused after a prompt", async () => {
+  it("answers and continues with distinct workers but the same explicit session file", async () => {
+    const { c, workers, start, factory } = setup();
+    const id = start();
+    const sessionFile = c.get(id).sessionFile;
+    workers[0]!.close({ text: "Which schema?" });
+    await tick();
+    await c.message(id, "Production");
+    expect(workers[1]).not.toBe(workers[0]);
+    expect(workers[1]!.run).toHaveBeenCalledExactlyOnceWith("Production");
+    const pausing = c.pause(id);
+    workers[1]!.close({ interrupted: true });
+    await pausing;
+    await c.continue(id);
+    expect(workers[2]!.run).toHaveBeenCalledExactlyOnceWith(
+      "Continue the task.",
+    );
+    expect(factory.mock.calls.map((call) => call[1])).toEqual([
+      sessionFile,
+      sessionFile,
+      sessionFile,
+    ]);
+    for (const worker of workers) expect(worker.run).toHaveBeenCalledOnce();
+    workers[2]!.close();
+    await tick();
+    await c.dispose();
+  });
+
+  it("paused tasks release capacity without implicit resume on a user prompt", async () => {
     const { c, workers, start } = setup();
     const a = start(),
-      b = start();
-    await tick();
+      b = start("queued");
     const interrupted = c.interrupt();
+    const later = start("later");
     expect(c.get(b).status).toBe("paused");
+    workers[0]!.close({ interrupted: true });
     await interrupted;
-    expect(c.get(a).status).toBe("paused");
-    expect(c.interrupted).toBe(true);
-    const later = start("after interrupt");
-    expect(c.get(later).status).toBe("paused");
     await expect(c.continue(a)).rejects.toThrow("user prompt");
-    expect(await c.prompt()).toBe(true);
-    expect(c.interrupted).toBe(false);
-    expect(c.get(a).status).toBe("paused");
-    expect(c.get(b).status).toBe("paused");
+    await c.prompt();
     expect(workers).toHaveLength(1);
-    await c.continue(a);
-    expect(workers[0]!.send).toHaveBeenLastCalledWith(
-      "cleared steering\n\ncleared follow-up",
-    );
-    await c.stop(a);
+    for (const id of [a, b, later]) expect(c.get(id).status).toBe("paused");
     await c.continue(b);
-    await tick();
     expect(workers).toHaveLength(2);
-    await c.dispose();
-  });
-  it("does not send the initial task when interrupted during startup", async () => {
-    const gate = Promise.withResolvers<void>();
-    const worker = new Fake();
-    worker.start.mockImplementation(() => gate.promise);
-    const c = new Coordinator({ createWorker: () => worker });
-    const id = c.start({
-      prompt: "initial",
-      description: "initial",
-      worker: options,
-    });
+    expect(c.get(a).status).toBe("paused");
+    workers[1]!.close();
     await tick();
-    const interrupted = c.interrupt();
-    gate.resolve();
-    await interrupted;
-    expect(worker.send).not.toHaveBeenCalled();
-    expect(c.get(id).pendingInput).toContain("initial");
     await c.dispose();
   });
-  it("preserves cleared input when abort fails", async () => {
+
+  it("a closed paused execution frees capacity without taking the task", async () => {
     const { c, workers, start } = setup();
-    const id = start();
+    const a = start("a"),
+      b = start("b");
+    const pausing = c.pause(a);
     await tick();
-    const worker = workers[0]!;
-    worker.pause.mockImplementation(async () => {
-      worker.active = false;
-      worker.emit({
-        type: "worker_queue_cleared",
-        steering: ["important"],
-        followUp: [],
+    expect(workers).toHaveLength(1);
+    workers[0]!.close({ interrupted: true });
+    await pausing;
+    expect(c.get(a).status).toBe("paused");
+    expect(c.get(b).status).toBe("active");
+    expect(workers).toHaveLength(2);
+    workers[1]!.close();
+    await tick();
+    await c.dispose();
+  });
+
+  it("admits FIFO and combines corrections while queued", async () => {
+    const { c, workers, start } = setup();
+    start("a");
+    const b = start("b"),
+      d = start("d");
+    await c.message(b, "correction");
+    workers[0]!.close();
+    await tick();
+    expect(workers[1]!.run).toHaveBeenCalledExactlyOnceWith("b\n\ncorrection");
+    expect(c.get(d).status).toBe("queued");
+    workers[1]!.close();
+    await tick();
+    workers[2]!.close();
+    await tick();
+    await c.dispose();
+  });
+});
+
+describe("input ownership at close", () => {
+  it.each([false, true])(
+    "redirect waits for close and requeues old input only if unpersisted (%s)",
+    async (inputPersisted) => {
+      const { c, workers, start } = setup();
+      const id = start("brief");
+      const sending = c.message(id, "correction");
+      expect(workers[0]!.stop).toHaveBeenCalledOnce();
+      await tick();
+      expect(workers).toHaveLength(1);
+      workers[0]!.physicalClose();
+      await tick();
+      expect(workers).toHaveLength(1);
+      expect(c.get(id).status).toBe("active");
+      workers[0]!.close({ interrupted: true, inputPersisted });
+      await sending;
+      expect(workers).toHaveLength(2);
+      expect(workers[1]!.run).toHaveBeenCalledExactlyOnceWith(
+        inputPersisted ? "correction" : "brief\n\ncorrection",
+      );
+      expect(workers[1]!.stop).not.toHaveBeenCalled();
+      workers[1]!.close();
+      await tick();
+      await c.dispose();
+    },
+  );
+
+  it.each([false, true])(
+    "interrupt during redirect cancels restart and retains input (%s)",
+    async (inputPersisted) => {
+      const { c, workers, start } = setup();
+      const id = start("brief");
+      const sending = c.message(id, "correction");
+      const interrupted = c.interrupt();
+      workers[0]!.close({ interrupted: true, inputPersisted });
+      await Promise.all([sending, interrupted]);
+      expect(workers).toHaveLength(1);
+      expect(c.get(id)).toMatchObject({
+        status: "paused",
+        pendingInput: inputPersisted ? ["correction"] : ["brief", "correction"],
       });
-      throw Error("abort failed");
+      await c.prompt();
+      expect(workers).toHaveLength(1);
+      await c.continue(id);
+      expect(workers[1]!.run).toHaveBeenCalledExactlyOnceWith(
+        inputPersisted ? "correction" : "brief\n\ncorrection",
+      );
+      workers[1]!.close();
+      await tick();
+      await c.dispose();
+    },
+  );
+});
+
+describe("final reports and receipts", () => {
+  it.each(["collect", "failure"] as const)(
+    "replaces cumulative usage and reports it once on %s",
+    async (take) => {
+      const { c, workers, start } = setup();
+      const id = start();
+      workers[0]!.close({ usage: usage(10) });
+      await tick();
+      expect(c.drainUsage()).toBeUndefined();
+      await c.message(id, "next");
+      workers[1]!.close({
+        usage: usage(25),
+        ...(take === "failure" ? { error: "failed" } : {}),
+      });
+      await tick();
+      if (take === "collect") await c.collect(id);
+      else await c.prompt();
+      expect(c.drainUsage()).toEqual(usage(25));
+      await c.collect(id);
+      await c.stop(id);
+      await c.prompt();
+      expect(c.drainUsage()).toBeUndefined();
+      expect(c.summary().completed).toBe(take === "collect" ? 1 : 0);
+      const receipt = c.inspect(id);
+      expect(receipt).not.toHaveProperty("worker");
+      expect(receipt).not.toHaveProperty("run");
+      expect(receipt).not.toHaveProperty("status");
+      structuredClone(receipt);
+      await c.dispose();
+    },
+  );
+
+  it("sweeps final errors without another worker and preserves undelivered input", async () => {
+    const { c, workers, start, factory } = setup();
+    const id = start("valuable brief");
+    workers[0]!.close({
+      text: "partial",
+      error: "terminated",
+      inputPersisted: false,
+      usage: usage(7),
     });
-    await expect(c.interrupt()).rejects.toThrow("abort failed");
     await tick();
-    expect(c.get(id)).toMatchObject({
-      status: "ready",
-      outcome: "error",
-      pendingInput: ["important"],
-    });
-    await c.dispose();
-  });
-  it("closes final failures immediately, then transfers and removes them on user prompt without model action", async () => {
-    const { c, workers, start } = setup();
-    const id = start();
-    await tick();
-    workers[0]!.fatal();
-    await tick();
-    expect(workers[0]!.close).toHaveBeenCalledOnce();
-    expect(c.get(id)).toMatchObject({
-      status: "ready",
-      outcome: "error",
-      response: "partial answer",
-    });
+    expect(c.get(id)).toMatchObject({ status: "ready", outcome: "error" });
     const deliver = vi.fn();
-    expect(await c.prompt(deliver)).toBe(true);
+    await c.prompt(deliver);
     expect(deliver).toHaveBeenCalledWith([
       expect.objectContaining({
         id,
         outcome: "error",
         error: "terminated",
-        sessionFile: "native.jsonl",
+        pendingInput: ["valuable brief"],
       }),
     ]);
+    expect(factory).toHaveBeenCalledOnce();
     expect(c.list()).toEqual([]);
-    expect(c.summary()).toEqual({ completed: 0, tokens: 0 });
-    expect(c.drainUsage()).toEqual(usage);
-    await c.collect(id);
-    expect(c.drainUsage()).toBeUndefined();
-    await c.prompt(deliver);
-    expect(deliver).toHaveBeenLastCalledWith([]);
+    expect(c.inspect(id)).toMatchObject({ pendingInput: ["valuable brief"] });
+    expect(c.drainUsage()).toEqual(usage(7));
     await c.dispose();
   });
-  it("does not let an interrupt during cleanup restart the parent or lose the pending report", async () => {
+
+  it("reconciles displayed tokens with the whole-session snapshot, including non-streamed usage", async () => {
     const { c, workers, start } = setup();
     const id = start();
+    workers[0]!.close({ usage: usage(25) });
     await tick();
-    const gate = Promise.withResolvers<void>();
-    workers[0]!.close.mockImplementation(() => gate.promise);
-    workers[0]!.fatal();
-    await tick();
+    expect(c.get(id).tokens).toBe(25);
+    expect(c.summary().tokens).toBe(25);
+    expect((await c.collect(id)).tokens).toBe(25);
+    expect(c.summary().tokens).toBe(25);
+    expect(c.drainUsage()?.totalTokens).toBe(25);
+    await c.dispose();
+  });
+
+  it("does not disguise a genuine report failure as a successful pause", async () => {
+    const { c, workers, start } = setup();
+    const id = start();
+    const pausing = c.pause(id);
+    workers[0]!.close({
+      interrupted: true,
+      error: "Corrupt native session file",
+      inputPersisted: false,
+    });
+    await pausing;
+    expect(c.get(id)).toMatchObject({
+      status: "ready",
+      outcome: "error",
+      pendingInput: ["brief"],
+    });
     const deliver = vi.fn();
-    const prompt = c.prompt(deliver);
-    await tick();
-    await c.interrupt();
-    gate.resolve();
-    expect(await prompt).toBe(false);
-    await tick();
-    expect(deliver).not.toHaveBeenCalled();
-    expect(c.interrupted).toBe(true);
-    expect(c.get(id).outcome).toBe("error");
-    expect(await c.prompt(deliver)).toBe(true);
+    await c.prompt(deliver);
     expect(deliver).toHaveBeenCalledOnce();
     expect(c.list()).toEqual([]);
     await c.dispose();
   });
-  it("retains ownership after a failed close and retries it before forwarding a prompt", async () => {
+
+  it("retains a failed report if delivery throws", async () => {
     const { c, workers, start } = setup();
     const id = start();
-    await tick();
-    workers[0]!.close.mockRejectedValueOnce(new Error("close failed"));
-    workers[0]!.fatal();
-    await tick();
-    start("queued behind failed close");
-    expect(workers).toHaveLength(1);
-    await c.prompt();
-    await tick();
-    expect(() => c.get(id)).toThrow();
-    expect(workers).toHaveLength(2);
-    expect(c.inspect(id)).toMatchObject({
-      outcome: "error",
-      error: expect.stringContaining("Close failed"),
-    });
-    expect(c.drainUsage()).toEqual(usage);
-    await c.dispose();
-  });
-  it("captures late native usage after process shutdown, not just the live snapshot", async () => {
-    const { c, workers, start } = setup();
-    const id = start();
-    await tick();
-    const worker = workers[0]!;
-    worker.finish();
-    const finalUsage = {
-      ...usage,
-      input: 11,
-      totalTokens: 20,
-      cost: { ...usage.cost, total: 20 },
-    };
-    worker.close.mockImplementation(async () => {
-      worker.active = false;
-      worker.billed = finalUsage;
-    });
-    await c.collect(id);
-    expect(c.drainUsage()).toEqual(finalUsage);
-    expect(c.summary().tokens).toBe(10);
-    await c.dispose();
-  });
-  it("retries a failed stop without retaining a rejected take promise", async () => {
-    const { c, workers, start } = setup();
-    const id = start();
-    await tick();
-    workers[0]!.close.mockRejectedValueOnce(Error("temporary close failure"));
-    await expect(c.stop(id)).rejects.toThrow("temporary close failure");
-    expect(c.get(id).outcome).toBe("error");
-    expect(await c.stop(id)).toMatchObject({ outcome: "error" });
-    expect(workers[0]!.close).toHaveBeenCalledTimes(2);
-    expect(c.list()).toEqual([]);
-    await c.dispose();
-  });
-  it("keeps undelivered inputs in the transferred failure and idempotent receipt", async () => {
-    const worker = new Fake();
-    worker.send.mockRejectedValueOnce(Error("send failed"));
-    const c = new Coordinator({ createWorker: () => worker });
-    const id = c.start({
-      prompt: "valuable undelivered input",
-      description: "task",
-      worker: options,
-    });
-    await tick();
-    const deliver = vi.fn();
-    await c.prompt(deliver);
-    expect(deliver).toHaveBeenCalledWith([
-      expect.objectContaining({ pendingInput: ["valuable undelivered input"] }),
-    ]);
-    expect(c.inspect(id)).toMatchObject({
-      pendingInput: ["valuable undelivered input"],
-    });
-    await c.dispose();
-  });
-  it("keeps a report when delivery fails", async () => {
-    const { c, workers, start } = setup();
-    const id = start();
-    await tick();
-    workers[0]!.fatal();
+    workers[0]!.close({ error: "failed" });
     await tick();
     await expect(
       c.prompt(() => {
@@ -482,43 +359,176 @@ describe("user interrupt and prompt", () => {
       }),
     ).rejects.toThrow("delivery failed");
     expect(c.get(id).outcome).toBe("error");
-    expect(c.drainUsage()).toBeUndefined();
     await c.prompt();
-    expect(c.inspect(id)).toMatchObject({ outcome: "error" });
+    expect(c.inspect(id).outcome).toBe("error");
     await c.dispose();
   });
-  it("captures original abort usage and removes stopped tasks", async () => {
+
+  it("accepts a normal transformed reply without replaying an unproven literal input", async () => {
     const { c, workers, start } = setup();
     const id = start();
+    workers[0]!.close({ inputPersisted: false, text: "transformed reply" });
     await tick();
-    expect(await c.stop(id)).toMatchObject({ outcome: "stopped" });
-    expect(c.list()).toEqual([]);
-    expect(workers[0]!.pause).toHaveBeenCalledOnce();
-    expect(c.drainUsage()).toEqual(usage);
-    await c.stop(id);
-    expect(c.drainUsage()).toBeUndefined();
-    expect(c.summary().completed).toBe(0);
+    expect(c.get(id)).toMatchObject({
+      status: "ready",
+      outcome: "reply",
+      response: "transformed reply",
+    });
+    expect(c.get(id).pendingInput).toBeUndefined();
     await c.dispose();
   });
-  it("releases waiters on shutdown without waiting for startup", async () => {
-    const gate = Promise.withResolvers<void>();
-    const worker = new Fake();
-    worker.start.mockImplementation(() => gate.promise);
-    const c = new Coordinator({ createWorker: () => worker });
-    const id = c.start({
-      prompt: "task",
-      description: "task",
-      worker: options,
-    });
+
+  it("retries a failed stop without releasing its process or poisoning collection", async () => {
+    const { c, workers, start } = setup();
+    const id = start();
+    start("queued");
+    workers[0]!.stop.mockRejectedValueOnce(Error("termination failed"));
+    await expect(c.stop(id)).rejects.toThrow("termination failed");
+    expect(c.get(id)).toMatchObject({ status: "active", outcome: "error" });
+    expect(workers).toHaveLength(1);
+    const retry = c.stop(id);
+    workers[0]!.close({ interrupted: true, usage: usage(7) });
+    expect(await retry).toMatchObject({ id, outcome: "error" });
+    expect(workers).toHaveLength(2);
+    expect(c.drainUsage()).toEqual(usage(7));
+    workers[1]!.close();
     await tick();
-    const waiting = c.wait(id);
-    void waiting.catch(() => {});
     await c.dispose();
-    await expect(waiting).rejects.toThrow("disposed");
-    gate.resolve();
+  });
+
+  it("recovers after both an unexpected run rejection and a failed first stop", async () => {
+    const { c, workers, start } = setup();
+    const id = start();
+    start("queued");
+    workers[0]!.stop.mockRejectedValueOnce(Error("termination failed"));
+    workers[0]!.reject(Error("report transport failed"));
     await tick();
-    expect(worker.send).not.toHaveBeenCalled();
-    expect(worker.report).not.toHaveBeenCalled();
-    expect(worker.close).toHaveBeenCalledOnce();
+    expect(c.get(id)).toMatchObject({ status: "active", outcome: "error" });
+    expect(workers).toHaveLength(1);
+    const retry = c.stop(id);
+    workers[0]!.physicalClose();
+    expect(await retry).toMatchObject({
+      outcome: "error",
+      pendingInput: ["brief"],
+      error: expect.stringContaining("report transport failed"),
+    });
+    expect(workers).toHaveLength(2);
+    workers[1]!.close();
+    await tick();
+    await c.dispose();
+  });
+
+  it("unexpected run rejection is not success and retains ownership until stop closes", async () => {
+    const { c, workers, start, onReady } = setup();
+    const id = start();
+    start("queued");
+    workers[0]!.reject(Error("report transport failed"));
+    await tick();
+    expect(workers[0]!.stop).toHaveBeenCalledOnce();
+    expect(workers).toHaveLength(1);
+    expect(c.get(id).status).toBe("active");
+    expect(onReady).not.toHaveBeenCalled();
+    workers[0]!.physicalClose();
+    await tick();
+    expect(c.get(id)).toMatchObject({
+      status: "ready",
+      outcome: "error",
+      error: "report transport failed",
+      pendingInput: ["brief"],
+    });
+    workers[1]!.close();
+    await tick();
+    await c.dispose();
+  });
+});
+
+describe("admission and shutdown", () => {
+  it("rechecks authorization on queued admission, answers and resume", async () => {
+    let approved = true;
+    const beforeStart = vi.fn(() => {
+      if (!approved) throw Error("revoked");
+    });
+    const { c, workers, start, factory } = setup(1, beforeStart);
+    const a = start(),
+      b = start("queued");
+    approved = false;
+    workers[0]!.close();
+    await tick();
+    expect(c.get(b)).toMatchObject({ outcome: "error", error: "revoked" });
+    await c.message(a, "answer");
+    expect(c.get(a)).toMatchObject({
+      outcome: "error",
+      error: "revoked",
+      pendingInput: ["answer"],
+    });
+    approved = true;
+    const d = start("pause me");
+    const pausing = c.pause(d);
+    workers[1]!.close({ interrupted: true });
+    await pausing;
+    approved = false;
+    await c.continue(d);
+    expect(c.get(d)).toMatchObject({ outcome: "error", error: "revoked" });
+    expect(factory).toHaveBeenCalledTimes(2);
+    expect(beforeStart).toHaveBeenCalledTimes(5);
+    await c.dispose();
+  });
+
+  it("stops queued work before it starts and returns independent idempotent receipts", async () => {
+    const { c, workers, start } = setup();
+    start("active");
+    const id = start("never started");
+    const result = await c.stop(id);
+    expect(result).toMatchObject({
+      outcome: "stopped",
+      pendingInput: ["never started"],
+    });
+    expect(workers).toHaveLength(1);
+    result.execution.model = "mutated";
+    expect(c.inspect(id).execution.model).toBe("m");
+    expect(await c.stop(id)).toEqual(await c.collect(id));
+    workers[0]!.close();
+    await tick();
+    await c.dispose();
+  });
+
+  it.each(["stop", "dispose"] as const)(
+    "%s waits for physical close even before any native start event",
+    async (action) => {
+      const { c, workers, start } = setup();
+      const id = start();
+      let done = false;
+      const closing = (action === "stop" ? c.stop(id) : c.dispose()).then(
+        () => {
+          done = true;
+        },
+      );
+      await tick();
+      expect(done).toBe(false);
+      expect(workers[0]!.stop).toHaveBeenCalledOnce();
+      workers[0]!.close({ interrupted: true, inputPersisted: false });
+      await closing;
+      expect(c.list()).toEqual([]);
+      if (action === "stop")
+        expect(c.inspect(id)).toMatchObject({
+          outcome: "stopped",
+          pendingInput: ["brief"],
+        });
+      await c.dispose();
+    },
+  );
+
+  it("wait supports abort, timeout, and final report completion", async () => {
+    const { c, workers, start } = setup();
+    const id = start();
+    const abort = new AbortController();
+    const waiting = c.wait(id, abort.signal);
+    abort.abort();
+    await expect(waiting).rejects.toMatchObject({ name: "AbortError" });
+    await expect(c.wait(id, undefined, 1)).rejects.toThrow("timed out");
+    const final = c.wait(id);
+    workers[0]!.close();
+    await expect(final).resolves.toMatchObject({ status: "ready" });
+    await c.dispose();
   });
 });

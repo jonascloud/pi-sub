@@ -15,6 +15,7 @@ const theme = {
 const task = (overrides: Partial<TaskView> = {}): TaskView => ({
   id: "a",
   description: "Investigate",
+  sessionFile: "native.jsonl",
   level: 7,
   execution: { provider: "p", model: "m", thinking: "off" },
   status: "active",
