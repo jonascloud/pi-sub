@@ -18,4 +18,4 @@ A ladder and an independent cycling whitelist created two overlapping declaratio
 
 The flat file keeps extension configuration together without embedding it in native settings or introducing private settings APIs. Publication retains locking, exact-byte optimistic replacement, private files and final synchronous checks. Ignore only the configuration filename, never the whole Pi profile.
 
-Legacy paths are not runtime inputs or automatic migration sources. Move confirmed data through an explicit backed-up migration; preserve unrelated native settings and history. Reload running sessions after migration. Process boundaries, native transcript ownership, permission denial and original usage accounting are unchanged.
+Only the profile's confirmed ladder is a configuration input. Native Pi settings and history remain independent; process boundaries, native transcript ownership, permission denial and original usage accounting are unchanged.

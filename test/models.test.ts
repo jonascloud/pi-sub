@@ -33,10 +33,10 @@ vi.mock("proper-lockfile", async (importOriginal) => {
 
 let dir: string;
 const ladder: Ladder = {
-  "2": { model: "p/cheap:off", cost: 0 },
-  "6": { model: "p/main:low", cost: 0.07134 },
-  "8": { model: "p/main:high", cost: 9 },
-  "10": { model: "p/top:max", cost: null },
+  "2": "p/cheap:off",
+  "6": "p/main:low",
+  "8": "p/main:high",
+  "10": "p/top:max",
 };
 const available: AvailableModel[] = [
   { provider: "p", model: "cheap", thinking: ["off"] },
@@ -87,7 +87,7 @@ describe("model ladder", () => {
       expect(() => parseReference(text), text).toThrow();
   });
 
-  it("accepts only canonical integer rungs and exact entries with honest costs", () => {
+  it("accepts only canonical integer rungs and exact model references", () => {
     expect(validateLadder({})).toEqual({});
     expect(validateLadder(ladder)).toEqual(ladder);
     for (const key of [
@@ -107,33 +107,26 @@ describe("model ladder", () => {
       "candidates",
     ])
       expect(() => validateLadder({ [key]: ladder["6"] }), key).toThrow();
-    for (const cost of [-1, Infinity, -Infinity, NaN, "0", undefined])
-      expect(() =>
-        validateLadder({ "6": { model: "p/m:low", cost } }),
-      ).toThrow();
     for (const entry of [
       null,
       [],
       {},
+      1,
+      undefined,
+      "p/m",
+      "p/m:auto",
       { model: "p/m:low" },
-      { ...ladder["6"], selected: true },
-      { ...ladder["6"], ranking: 1 },
-      { cost: null, model: "p/m" },
     ])
       expect(() => validateLadder({ "6": entry })).toThrow();
     for (const value of [null, [], "{}", 1])
       expect(() => validateLadder(value)).toThrow();
-    expect(
-      validateLadder({ "1": { model: "p/m:off", cost: null } })["1"].cost,
-    ).toBeNull();
   });
 
-  it("uses the first currently available rung, never price or outside alternatives", () => {
+  it("uses the first currently available confirmed rung at or above the minimum", () => {
     expect(selectExecution(ladder, 3, available)).toEqual({
       provider: "p",
       model: "main",
       thinking: "low",
-      cost: 0.07134,
       power: 6,
     });
     expect(selectExecution(ladder, 7, available).power).toBe(8);
@@ -141,7 +134,7 @@ describe("model ladder", () => {
       { provider: "p", model: "main", thinking: ["high"] },
     ] satisfies AvailableModel[];
     expect(selectExecution(ladder, 3, highOnly).power).toBe(8);
-    expect(selectExecution(ladder, 9, available).cost).toBeNull();
+    expect(selectExecution(ladder, 9, available).power).toBe(10);
     expect(() => selectExecution(ladder, 1, [])).toThrow(/No available/);
     expect(() => selectExecution(ladder, 7, available.slice(0, 1))).toThrow();
     expect(() => selectExecution({}, 1, available)).toThrow();
@@ -167,7 +160,7 @@ describe("model ladder", () => {
     );
     expect(text.split("\n")).toHaveLength(7);
     expect(text).toBe(
-      '{\n  "2": {"model":"p/cheap:off","cost":0},\n  "6": {"model":"p/main:low","cost":0.07134},\n  "8": {"model":"p/main:high","cost":9},\n  "10": {"model":"p/top:max","cost":null}\n}\n',
+      '{\n  "2": "p/cheap:off",\n  "6": "p/main:low",\n  "8": "p/main:high",\n  "10": "p/top:max"\n}\n',
     );
     expect(JSON.parse(text)).toEqual(ladder);
     expect(formatLadder({})).toBe("{}\n");
@@ -176,32 +169,11 @@ describe("model ladder", () => {
     );
   });
 
-  it("uses only the profile, with no project fallback or automatic migration", async () => {
-    const original = process.cwd();
+  it("uses the configured profile and reports a missing ladder", () => {
     const path = ladderPath();
     expect(path).toBe(join(dir, "profile", "pi-sub-config.json"));
-    const legacy = join(dir, "profile", "pi-sub", "models.json");
-    await mkdir(dirname(legacy), { recursive: true });
-    await writeFile(legacy, formatLadder(ladder));
-    const project = join(dir, "project");
-    await mkdir(join(project, ".pi", "pi-sub"), { recursive: true });
-    await writeFile(
-      join(project, ".pi", "pi-sub", "models.json"),
-      formatLadder(ladder),
-    );
-    try {
-      process.chdir(project);
-      expect(ladderPath()).toBe(path);
-      expect(readLadderSource(path)).toBeUndefined();
-      expect(() => loadLadder(path)).toThrow(/\/sub:models/);
-      expect(readLadderSource(path)).toBeUndefined();
-      expect(await readFile(legacy, "utf8")).toBe(formatLadder(ladder));
-      vi.stubEnv("PI_CODING_AGENT_DIR", join(dir, "other"));
-      expect(ladderPath()).toBe(join(dir, "other", "pi-sub-config.json"));
-      expect(() => loadLadder(ladderPath())).toThrow();
-    } finally {
-      process.chdir(original);
-    }
+    expect(readLadderSource(path)).toBeUndefined();
+    expect(() => loadLadder(path)).toThrow(/\/sub:models/);
   });
 
   it("writes private complete replacements, preserving the ignore file", async () => {
@@ -311,14 +283,10 @@ describe("model ladder", () => {
     expect(readLadderSource(path)).toBeUndefined();
   });
 
-  it("preserves malformed/legacy sources until explicit exact-source repair", async () => {
+  it("preserves malformed sources until explicit exact-source repair", async () => {
     const path = ladderPath();
     await mkdir(dirname(path), { recursive: true });
-    for (const broken of [
-      "{",
-      '{"version":2,"candidates":[]}',
-      '{"6":{"model":"p/m:low","cost":-1}}',
-    ]) {
+    for (const broken of ["{", '{"6":"p/m:auto"}']) {
       await writeFile(path, broken);
       expect(() => loadLadder(path)).toThrow(/\/sub:models/);
       expect(readLadderSource(path)).toBe(broken);

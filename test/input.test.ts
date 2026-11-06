@@ -9,7 +9,7 @@ import piSub from "../index.ts";
 import * as models from "../src/models.ts";
 import * as modelSetup from "../src/setup.ts";
 import { SUBAGENT_GUIDANCE } from "../src/messages.ts";
-import { replyNotification, replyBatch } from "../src/replies.ts";
+import { replyBatch } from "../src/replies.ts";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 
 const fake = vi.hoisted(() => ({
@@ -252,7 +252,7 @@ test("new tasks select from fresh configuration after asynchronous directory pre
   ]);
   const load = vi
     .spyOn(models, "loadLadder")
-    .mockReturnValue({ "6": { model: "test/fake:off", cost: 0.1 } });
+    .mockReturnValue({ "6": "test/fake:off" });
   const directory = Promise.withResolvers<string>();
   vi.spyOn(modelSetup, "workerDirectory").mockReturnValue(directory.promise);
   const pending = tools
@@ -264,7 +264,7 @@ test("new tasks select from fresh configuration after asynchronous directory pre
       () => {},
       ctx,
     );
-  load.mockReturnValue({ "6": { model: "test/other:off", cost: 0.1 } });
+  load.mockReturnValue({ "6": "test/other:off" });
   directory.resolve("/tmp/sessions");
   await pending;
   expect(fake.start).toHaveBeenCalledWith(
@@ -280,7 +280,7 @@ test("cancellation during runtime directory preparation never admits an orphan t
     { provider: "test", model: "fake", thinking: ["off"] },
   ]);
   vi.spyOn(models, "loadLadder").mockReturnValue({
-    "6": { model: "test/fake:off", cost: 0.1 },
+    "6": "test/fake:off",
   });
   const directory = Promise.withResolvers<string>();
   const prepare = vi
@@ -381,7 +381,7 @@ test("one stable guidance section is replaced, not appended as repeated chat ins
     { provider: "test", model: "fake", thinking: ["off"] },
   ]);
   vi.spyOn(models, "loadLadder").mockReturnValue({
-    "6": { model: "test/fake:off", cost: 0.1 },
+    "6": "test/fake:off",
   });
   const systemPromptOptions = { sections: { pi_sub: "old section" } };
   emit("before_agent_start", { systemPromptOptions });
@@ -389,6 +389,8 @@ test("one stable guidance section is replaced, not appended as repeated chat ins
   emit("before_agent_start", { systemPromptOptions });
   expect(systemPromptOptions.sections.pi_sub).toBe(first);
   expect(first.split(SUBAGENT_GUIDANCE)).toHaveLength(2);
+  expect(first).toContain(models.STRENGTH_GUIDANCE);
+  expect(first).toContain("Your configured strength: 6/10");
   expect(first).toContain("1–6: test/fake:off");
   expect(sendMessage).not.toHaveBeenCalled();
   expect(
@@ -427,7 +429,7 @@ test("selection refinements use the native review session and never fall through
     phase: "review",
     revision: 2,
     paused: false,
-    draft: { "6": { model: "test/fake:off", cost: 0.1 } },
+    draft: { "6": "test/fake:off" },
   });
   const revise = vi
     .spyOn(modelSetup.ModelSetup.prototype, "revise")
@@ -681,7 +683,7 @@ test("announcing a batch is not delivery; only complete parent context messages 
   expect(fake.markDelivered).not.toHaveBeenCalled();
   emit("context", { messages: [] });
   expect(fake.markDelivered).not.toHaveBeenCalled();
-  const message = { ...replyNotification(reply), role: "custom", timestamp: 0 };
+  const message = { ...replyBatch([reply])!, role: "custom", timestamp: 0 };
   emit("context", { messages: [{ ...message, content: "preview" }] });
   expect(fake.markDelivered).not.toHaveBeenCalled();
   emit("context", { messages: [message] });

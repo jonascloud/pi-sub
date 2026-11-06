@@ -9,11 +9,6 @@ const clean = (text: string) =>
     .replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "")
     .replace(/\s+/g, " ")
     .trim();
-const cost = (value: number | null) =>
-  value === null
-    ? "unknown"
-    : `$${new Intl.NumberFormat("en-US", { maximumSignificantDigits: 5, useGrouping: false }).format(value)}`;
-
 /** A persistent, non-modal draft view leaves the normal prompt available. */
 export function renderModelSelection(
   view: SetupView | undefined,
@@ -39,7 +34,7 @@ export function renderModelSelection(
             : view.id
               ? `Researching · ${saved}`
               : "Preparing";
-  const lines = [`Model ladder · ${phase} · AA reference USD/task`];
+  const lines = [`Model ladder · ${phase}`];
   const warnings: string[] = [];
   const content: string[] = [];
   if (view.currentError)
@@ -61,19 +56,17 @@ export function renderModelSelection(
     const entry = ladder[level];
     const previous = view.current?.[level];
     if (!entry) {
-      content.push(`lvl ${level}  ${clean(previous!.model)} · removed`);
+      content.push(`lvl ${level}  ${clean(previous!)} · removed`);
       continue;
     }
     const change = !draft
       ? ""
       : !previous
         ? " · new"
-        : entry.model !== previous.model || entry.cost !== previous.cost
+        : entry !== previous
           ? " · changed"
           : "";
-    content.push(
-      `lvl ${level}  ${clean(entry.model)} · ${cost(entry.cost)}${change}`,
-    );
+    content.push(`lvl ${level}  ${clean(entry)}${change}`);
   }
   const emptyDraft = draft !== undefined && !Object.keys(draft).length;
   const emptySaved =

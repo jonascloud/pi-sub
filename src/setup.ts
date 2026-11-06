@@ -8,6 +8,7 @@ import {
 import type { Coordinator } from "./coordinator.ts";
 import {
   ladderPath,
+  STRENGTH_GUIDANCE,
   parseReference,
   validateLadder,
   formatLadder,
@@ -260,7 +261,7 @@ export class ModelSetup {
         description: "Review model ladder",
         level: undefined,
         worker: { ...worker, sessionDir },
-        prompt: `${instructions}\n\nSelected variants (research only):\n${JSON.stringify(s.selected)}\n\nCurrent ladder:\n${JSON.stringify(s.current ?? null)}\n${currentError ? `Current ladder is malformed; propose an explicit repair. ${currentError}\n` : ""}`,
+        prompt: `${instructions}\n\n${STRENGTH_GUIDANCE}\n\nSelected variants (research only):\n${JSON.stringify(s.selected)}\n\nCurrent ladder:\n${JSON.stringify(s.current ?? null)}\n${currentError ? `Current ladder is malformed; propose an explicit repair. ${currentError}\n` : ""}`,
       });
       this.state = {
         phase: "working",
@@ -288,19 +289,18 @@ export class ModelSetup {
           model.thinking.includes(ref.thinking),
       );
     for (const [level, row] of Object.entries(ladder)) {
-      const ref = parseReference(row.model);
-      const old = s.current?.[level];
-      const unchanged = old?.model === row.model && old.cost === row.cost;
+      const ref = parseReference(row);
+      const unchanged = s.current?.[level] === row;
       const selected = contains(s.selected, ref);
       // An already confirmed unavailable entry may remain unchanged, not silently regraded.
       if (unchanged && !contains(s.available, ref)) continue;
       if (!selected)
         throw new Error(
-          `Model selection does not authorize rung ${level}: ${row.model}`,
+          `Model selection does not authorize rung ${level}: ${row}`,
         );
       if (!contains(available, ref))
         throw new Error(
-          `Model is no longer available at rung ${level}: ${row.model}`,
+          `Model is no longer available at rung ${level}: ${row}`,
         );
     }
   }

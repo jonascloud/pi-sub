@@ -74,35 +74,26 @@ function notificationText(task: Parameters<typeof replyText>[0]) {
   };
 }
 
-export function replyNotification(task: TaskView) {
-  const response = stripTerminalSequences(task.error ?? task.response);
-  return {
-    customType: "pi-sub:response",
-    display: true,
-    content: notificationText(task).content,
-    details: {
-      ...structuredClone(task),
-      preview: truncateToWidth(
-        response.split(/\r?\n/).find((line) => line.trim()) ?? "",
-        160,
-      ),
-    },
-  };
-}
-
 /** One bounded native message; remaining replies stay eligible for the next turn. */
 export function replyBatch(tasks: readonly TaskView[]) {
-  const replies: ReturnType<typeof replyNotification>[] = [];
+  const replies: (TaskView & { preview: string })[] = [];
   let content = "";
   for (const task of tasks) {
-    const reply = replyNotification(task);
-    const next = content ? `${content}\n\n${reply.content}` : reply.content;
+    const text = notificationText(task).content;
+    const next = content ? `${content}\n\n${text}` : text;
     if (
       Buffer.byteLength(next, "utf8") > 24000 ||
       next.split("\n").length > 300
     )
       break;
-    replies.push(reply);
+    const response = stripTerminalSequences(task.error ?? task.response);
+    replies.push({
+      ...structuredClone(task),
+      preview: truncateToWidth(
+        response.split(/\r?\n/).find((line) => line.trim()) ?? "",
+        160,
+      ),
+    });
     content = next;
   }
   return replies.length
@@ -110,7 +101,7 @@ export function replyBatch(tasks: readonly TaskView[]) {
         customType: "pi-sub:response",
         display: true,
         content,
-        details: { replies: replies.map((reply) => reply.details) },
+        details: { replies },
       }
     : undefined;
 }
@@ -128,7 +119,7 @@ function replyReference(value: unknown): ReplyReference | undefined {
 }
 export function replyReports(details: unknown) {
   const data = record(details);
-  return (Array.isArray(data?.replies) ? data.replies : [details])
+  return (Array.isArray(data?.replies) ? data.replies : [])
     .map(record)
     .filter(
       (
@@ -166,12 +157,6 @@ export function deliveredReplies(message: AgentMessage): ReplyReference[] {
         : undefined;
   if (text === undefined) return [];
   if (message.role === "custom" && message.customType === "pi-sub:response") {
-    const batch = Array.isArray(record(message.details)?.replies);
-    if (!batch) {
-      const data = replyReports(message.details)[0];
-      const ref = replyReference(data);
-      return data && ref && text === replyText(data) ? [ref] : [];
-    }
     // Compare at exact segment positions, not substring matches: an answer may
     // itself quote another report. Truncation never acknowledges the whole batch.
     let offset = 0;

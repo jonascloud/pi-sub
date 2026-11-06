@@ -93,10 +93,9 @@ async function host(
         const ladder = JSON.parse(
           await readFile(join(agentDir, "pi-sub-config.json"), "utf8"),
         );
-        expect(ladder["6"]).toEqual({
-          model: `${env.WORKER_TEST_PICK_MODEL ?? "worker-test/fake"}:off`,
-          cost: 0.1,
-        });
+        expect(ladder["6"]).toBe(
+          `${env.WORKER_TEST_PICK_MODEL ?? "worker-test/fake"}:off`,
+        );
         expect(Object.keys(ladder)).toEqual(["6"]);
       });
     return { client, marker, dispose, cwd, agentDir };
@@ -119,7 +118,7 @@ async function proposal(client: RpcClient, rung: string) {
     return message.details as {
       task: { id: string; sessionFile: string };
       proposal: {
-        ladder: Record<string, { model: string; cost: number | null }>;
+        ladder: Record<string, string>;
         comparison: string;
       };
     };
@@ -163,7 +162,7 @@ test("native reply delivery keeps the task and its session available for follow-
     await writeFile(
       join(agentDir, "pi-sub-config.json"),
       JSON.stringify({
-        "6": { model: "worker-test/fake:off", cost: 0.1 },
+        "6": "worker-test/fake:off",
       }),
     );
     const delivered = (previous?: string) =>
@@ -227,7 +226,7 @@ test("a complete tool delivery needs no acceptance call and causes no delayed no
     await writeFile(
       join(agentDir, "pi-sub-config.json"),
       JSON.stringify({
-        "6": { model: "worker-test/fake:off", cost: 0.1 },
+        "6": "worker-test/fake:off",
       }),
     );
     await client.promptAndWait("integration:read-via-wait", undefined, 20000);
@@ -277,7 +276,7 @@ test("native turn boundaries batch concurrent replies into the already required 
     await writeFile(
       join(agentDir, "pi-sub-config.json"),
       JSON.stringify({
-        "6": { model: "worker-test/fake:off", cost: 0.1 },
+        "6": "worker-test/fake:off",
       }),
     );
     const settled = nextEvent(
@@ -526,7 +525,7 @@ test("proposal and prompt refinements remain drafts until explicit acceptance", 
     expect(await client.prompt("accept")).toBe("handled");
     await eventually(async () =>
       expect(JSON.parse(await readFile(path, "utf8"))).toEqual({
-        "7": { model: "worker-test/fake:off", cost: 0.2 },
+        "7": "worker-test/fake:off",
       }),
     );
     expect((await readFile(path, "utf8")).trim().split("\n")).toHaveLength(3);
@@ -596,9 +595,8 @@ test("acceptance never clobbers a config edited while its proposal was open", as
   try {
     const path = join(agentDir, "pi-sub-config.json"),
       manual = JSON.stringify({
-        "9": { model: "worker-test/fake:off", cost: 9 },
+        "9": "worker-test/fake:off",
       });
-    await mkdir(join(agentDir, "pi-sub"), { recursive: true });
     await writeFile(path, manual);
     expect(await client.prompt("accept")).toBe("handled");
     expect(await readFile(path, "utf8")).toBe(manual);
@@ -612,14 +610,14 @@ test("acceptance never clobbers a config edited while its proposal was open", as
   }
 }, 60000);
 
-test("two working directories share the confirmed ladder and never load a local override or fallback", async () => {
+test("two working directories share the profile ladder without project overrides", async () => {
   const first = await host();
   let second: Awaited<ReturnType<typeof host>> | undefined;
   try {
     second = await host({}, first.agentDir, false);
-    const local = join(second.cwd, ".pi/pi-sub/models.json");
-    await mkdir(join(second.cwd, ".pi/pi-sub"), { recursive: true });
-    await writeFile(local, "not a catalog");
+    const local = join(second.cwd, ".pi/pi-sub-config.json");
+    await mkdir(join(second.cwd, ".pi"), { recursive: true });
+    await writeFile(local, "not a ladder");
     await second.client.promptAndWait("integration:delegate", undefined, 20000);
     expect(await latestResult(second.client)).toMatchObject({
       outcome: "reply",
@@ -629,11 +627,6 @@ test("two working directories share the confirmed ladder and never load a local 
     ).toBe("*\n");
     const global = join(first.agentDir, "pi-sub-config.json");
     await writeFile(local, await readFile(global));
-    await mkdir(join(first.agentDir, "pi-sub"), { recursive: true });
-    await writeFile(
-      join(first.agentDir, "pi-sub/models.json"),
-      await readFile(global),
-    );
     await rm(global);
     await second.client.promptAndWait(
       "integration:probe-global",

@@ -26,8 +26,8 @@ export async function chooseModels(
   const models = structuredClone([...available]);
   const references = Object.entries(current ?? {}).map(([rung, entry]) => ({
     rung,
-    reference: parseReference(entry.model),
-    text: entry.model,
+    reference: parseReference(entry),
+    text: entry,
   }));
   const selected = new Set<number>();
   models.forEach((model, i) => {

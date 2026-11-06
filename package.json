@@ -5,7 +5,6 @@
   "type": "module",
   "license": "MIT",
   "description": "A small coordinator for native Pi subprocesses.",
-  "packageManager": "pnpm@11.25.0",
   "engines": {
     "node": ">=22.19.0"
   },
@@ -18,8 +17,7 @@
     "index.ts",
     "src",
     "instructions",
-    "docs",
-    "NOTICE.md"
+    "docs"
   ],
   "scripts": {
     "check": "tsc --noEmit",

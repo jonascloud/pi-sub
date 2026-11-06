@@ -7,9 +7,9 @@ const available: AvailableModel[] = [
   { provider: "p", model: "two", thinking: ["off"] },
 ];
 const ladder: Ladder = {
-  "1": { model: "p/one:high", cost: 1 },
-  "2": { model: "missing/model:off", cost: 2 },
-  "3": { model: "p/two:high", cost: 3 },
+  "1": "p/one:high",
+  "2": "missing/model:off",
+  "3": "p/two:high",
 };
 type Call = { title: string; options: string[]; signal?: AbortSignal };
 function fake(

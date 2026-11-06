@@ -2,7 +2,6 @@ import { expect, test } from "vitest";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { TaskView } from "../src/coordinator.ts";
 import {
-  replyNotification,
   replyBatch,
   pendingReplyBatch,
   announcedReplies,
@@ -25,23 +24,26 @@ const task: TaskView = {
 };
 
 test("replies carry identity and new information, not repeated operating instructions", () => {
-  const reply = replyNotification(task);
+  const reply = replyBatch([task])!;
   expect(reply.content).toBe(
     "Subagent task-1 (Review changes)\nQuestion?\nImportant detail.",
   );
   expect(reply.content).not.toContain("sub_message");
   expect(reply.content).not.toContain("sub_result");
   expect(reply.content).not.toContain("This may be a question");
-  expect(reply.details).toMatchObject({ ...task, preview: "Question?" });
-  const long = replyNotification({ ...task, response: "x".repeat(20000) });
-  expect(long.details.preview.length).toBeLessThan(200);
+  expect(reply.details.replies[0]).toMatchObject({
+    ...task,
+    preview: "Question?",
+  });
+  const long = replyBatch([{ ...task, response: "x".repeat(20000) }])!;
+  expect(long.details.replies[0]!.preview.length).toBeLessThan(200);
   expect(long.content.length).toBeLessThan(8100);
 });
 
 test("only complete native reply notifications acknowledge their exact reply", () => {
   const ready = { ...task, reply: { id: "reply-1", delivered: false } };
   const message = {
-    ...replyNotification(ready),
+    ...replyBatch([ready])!,
     role: "custom" as const,
     timestamp: 0,
   };
@@ -53,13 +55,19 @@ test("only complete native reply notifications acknowledge their exact reply", (
   );
   expect(deliveredReplies({ ...message, customType: "unrelated" })).toEqual([]);
   expect(
-    deliveredReplies({ ...message, details: { ...ready, reply: undefined } }),
+    deliveredReplies({
+      ...message,
+      details: { replies: [{ ...ready, reply: undefined }] },
+    }),
   ).toEqual([]);
   expect(
-    deliveredReplies({ ...message, details: { ...ready, outcome: "error" } }),
+    deliveredReplies({
+      ...message,
+      details: { replies: [{ ...ready, outcome: "error" }] },
+    }),
   ).toEqual([]);
   for (const response of ["x".repeat(20000), "line\n".repeat(110)]) {
-    const clipped = replyNotification({ ...ready, response });
+    const clipped = replyBatch([{ ...ready, response }])!;
     expect(clipped.content).toContain("[Truncated; use sub_result");
     expect(deliveredReplies({ ...message, ...clipped })).toEqual([]);
   }
@@ -87,15 +95,35 @@ test("batches acknowledge each complete answer, not clipped neighbours", () => {
     { id: c.id, replyId: "reply-c" },
   ]);
   expect(
-    deliveredReplies({ ...message, content: replyNotification(a).content }),
+    deliveredReplies({ ...message, content: replyBatch([a])!.content }),
   ).toEqual([{ id: a.id, replyId: "reply-a" }]);
   expect(deliveredReplies({ ...message, content: "Only a preview" })).toEqual(
     [],
   );
   expect(announcedReplies({ ...batch, customType: "unrelated" })).toEqual([]);
-  expect(announcedReplies(replyNotification(a))).toEqual([
+  expect(announcedReplies(replyBatch([a])!)).toEqual([
     { id: a.id, replyId: "reply-a" },
   ]);
+});
+
+test("quoted reports cannot acknowledge a reply at the wrong segment position", () => {
+  const b = { ...task, id: "b", reply: { id: "reply-b", delivered: false } };
+  const quoted = replyBatch([b])!.content;
+  const a = {
+    ...task,
+    id: "a",
+    response: `Quoted:\n${quoted}`,
+    reply: { id: "reply-a", delivered: false },
+  };
+  const batch = replyBatch([a, b])!;
+  const message = { ...batch, role: "custom" as const, timestamp: 0 };
+  expect(deliveredReplies(message)).toEqual([
+    { id: "a", replyId: "reply-a" },
+    { id: "b", replyId: "reply-b" },
+  ]);
+  expect(
+    deliveredReplies({ ...message, content: replyBatch([a])!.content }),
+  ).toEqual([{ id: "a", replyId: "reply-a" }]);
 });
 
 test("batches are bounded without losing the full reports or silently dropping later replies", () => {
@@ -187,7 +215,7 @@ const ready = (id: string): TaskView => ({
   reply: { id: `reply-${id}`, delivered: false },
 });
 const customMessage = (
-  value: ReturnType<typeof replyNotification>,
+  value: NonNullable<ReturnType<typeof replyBatch>>,
 ): AgentMessage => ({
   ...value,
   role: "custom",
@@ -220,7 +248,7 @@ test("live replies are selected oldest-first without a second queue or mutations
 test("native branch announcements suppress even compacted truncated reports", () => {
   const a = { ...ready("a"), response: "line\n".repeat(110) },
     b = ready("b");
-  const announcement = replyNotification(a);
+  const announcement = replyBatch([a])!;
   const history = session();
   history.getBranch = () => [
     {
@@ -240,7 +268,7 @@ test("native branch announcements suppress even compacted truncated reports", ()
 
 test("current boundary messages replace a stale projection without becoming delivery state", () => {
   const a = ready("a");
-  const announcement = customMessage(replyNotification(a));
+  const announcement = customMessage(replyBatch([a])!);
   const history = session([announcement]);
   expect(pendingReplyBatch([a], history)).toBeUndefined();
   // A preview boundary may project another branch/compaction than the saved one.
@@ -279,7 +307,7 @@ test("complete tool returns suppress announcements; previews and old replies do 
   expect(
     pendingReplyBatch(
       [successor],
-      session([result, customMessage(replyNotification(a))]),
+      session([result, customMessage(replyBatch([a])!)]),
     )!.details.replies[0]!.reply!.id,
   ).toBe("next-reply");
 });

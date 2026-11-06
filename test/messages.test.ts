@@ -10,7 +10,8 @@ import {
   renderModels,
   routingSummary,
 } from "../src/messages.ts";
-import { replyNotification, replyBatch } from "../src/replies.ts";
+import { replyBatch } from "../src/replies.ts";
+import { STRENGTH_GUIDANCE } from "../src/models.ts";
 
 const task: TaskView = {
   id: "task-1",
@@ -30,12 +31,11 @@ const theme = {
   bold: (s: string) => s,
   fg: (_color: string, s: string) => s,
 } as unknown as Parameters<typeof renderReply>[2];
-function render(expanded: boolean, width = 80, details = true) {
-  const reply = replyNotification(task);
+function render(expanded: boolean, width = 80) {
+  const reply = replyBatch([task])!;
   return renderReply(
     {
       ...reply,
-      details: details ? reply.details : undefined,
       role: "custom",
       timestamp: 0,
     },
@@ -82,7 +82,6 @@ test("TUI notifications are two-line previews with expandable complete delivery"
   expect(collapsed.join("\n")).toContain("Question?");
   expect(collapsed.join("\n")).not.toContain("Important detail");
   expect(render(true).join("\n")).toContain("Important detail.");
-  expect(render(false, 80, false)).toHaveLength(2); // Previously saved messages need no metadata migration.
   for (const width of [0, 1, 2, 20, 80])
     for (const line of render(false, width))
       expect(visibleWidth(line)).toBeLessThanOrEqual(width);
@@ -90,15 +89,15 @@ test("TUI notifications are two-line previews with expandable complete delivery"
 
 test("routing context groups identical outcomes instead of repeating every level", () => {
   const ladder = {
-    "6": { model: "p/m:off", cost: 0.1 },
-    "9": { model: "p/m:high", cost: null },
+    "6": "p/m:off",
+    "9": "p/m:high",
   };
   const text = routingSummary(ladder, [
     { provider: "p", model: "m", thinking: ["off", "high"] },
   ]);
   expect(text.split("\n")).toEqual([
-    "1–6: p/m:off · rung 6 · $0.1",
-    "7–9: p/m:high · rung 9 · unknown",
+    "1–6: p/m:off · rung 6",
+    "7–9: p/m:high · rung 9",
     "10: unavailable",
   ]);
   expect(routingSummary(ladder, [])).toBe("1–10: unavailable");
@@ -122,6 +121,7 @@ test("failure reports retain partial work and pending input without a cleanup tu
     "Failed work is closed and reported automatically",
   );
   expect(SUBAGENT_GUIDANCE).toContain("rather than acknowledging");
+  expect(SUBAGENT_GUIDANCE.split(STRENGTH_GUIDANCE)).toHaveLength(2);
 });
 
 function draw(
@@ -181,45 +181,32 @@ test("failed tasks expose every cause without expanding partial work or metadata
     '"outcome": "error"',
   ])
     expect(expanded).toContain(text);
-  // Old textual reports need no metadata migration and still expose their cause.
-  expect(draw(renderFailures, content).join("\n")).toContain(
-    "Permission denied",
-  );
   expect(draw(renderFailures, "failure", [{ id: "x" }]).join("\n")).toContain(
     "Execution failed",
   );
 });
 
-test("stop acknowledgements summarize task identities, including legacy JSON-only messages", () => {
+test("stop acknowledgements summarize task identities", () => {
   const { error: _error, ...data } = failure;
   const stopped = [
     { ...data, outcome: "stopped" },
     { ...data, id: "task-2", description: "Verify", outcome: "stopped" },
   ];
   const content = JSON.stringify(stopped, null, 2);
-  for (const details of [stopped, undefined]) {
-    const collapsed = draw(renderStopped, content, details).join("\n");
-    expect(collapsed).toContain("Stopped · 2 tasks");
-    expect(collapsed).not.toContain("task-1");
-    expect(collapsed).not.toContain("task-2");
-    expect(collapsed.trim()).toBe("Stopped · 2 tasks");
-    expect(collapsed).not.toContain("response");
-    expect(collapsed).not.toContain("{");
-    expect(draw(renderStopped, content, details, true).join("\n")).toContain(
-      "Partial investigation",
-    );
-  }
-  expect(draw(renderStopped, "[]", []).join("\n")).not.toContain("[]");
-  expect(draw(renderStopped, "[broken JSON").join("\n")).toContain(
-    "Stopped tasks",
+  expect(draw(renderStopped, content, stopped).join("\n").trim()).toBe(
+    "Stopped · 2 tasks",
   );
+  expect(draw(renderStopped, content, stopped, true).join("\n")).toContain(
+    "Partial investigation",
+  );
+  expect(draw(renderStopped, "[]", []).join("\n")).not.toContain("[]");
 });
 
 test("model proposals preview rationale and unsaved state, retaining full research on expansion", () => {
   const comparison =
     "# Comparison\nUse the smaller model for checks; keep the stronger rung for design.\n\nSources:\nhttps://example.test/models";
   const proposal = {
-    ladder: { "6": { model: "p/m:off", cost: 0.1 } },
+    ladder: { "6": "p/m:off" },
     comparison,
   };
   const details = {
@@ -227,24 +214,17 @@ test("model proposals preview rationale and unsaved state, retaining full resear
     proposal,
   };
   const content = `${comparison}\n\nDRAFT (not saved):\n${JSON.stringify(proposal.ladder, null, 2)}`;
-  for (const metadata of [details, undefined]) {
-    const collapsed = draw(renderModels, content, metadata).join("\n");
-    expect(collapsed).toContain("DRAFT — not saved");
-    expect(collapsed).toContain("Use the smaller model for checks");
-    expect(collapsed).not.toContain('"6"');
-    expect(collapsed).not.toContain("p/m:off");
-    const expanded = draw(renderModels, content, metadata, true, 180).join(
-      "\n",
-    );
-    expect(expanded).toContain("AA reference USD/task");
-    expect(expanded).toContain("https://example.test/models");
-    expect(expanded).toContain('"6"');
-    expect(expanded).toContain("p/m:off");
-  }
-  expect(draw(renderModels, content, details).join("\n")).toContain(
-    "Review changes",
-  );
-  const expanded = draw(renderModels, content, details, true).join("\n");
+  const collapsed = draw(renderModels, content, details).join("\n");
+  expect(collapsed).toContain("DRAFT — not saved");
+  expect(collapsed).toContain("Use the smaller model for checks");
+  expect(collapsed).toContain("Review changes");
+  expect(collapsed).not.toContain('"6"');
+  expect(collapsed).not.toContain("p/m:off");
+  const expanded = draw(renderModels, content, details, true, 180).join("\n");
+  expect(expanded).toContain("DRAFT — not saved");
+  expect(expanded).toContain("https://example.test/models");
+  expect(expanded).toContain('"6"');
+  expect(expanded).toContain("p/m:off");
   expect(expanded).toContain("native.jsonl");
   expect(expanded).toContain('"task"');
   expect(expanded.match(/https:\/\/example.test\/models/g)).toHaveLength(1); // Do not repeat the proposal inside task metadata.
@@ -252,8 +232,8 @@ test("model proposals preview rationale and unsaved state, retaining full resear
 
 test("model previews prefer rationale over headings and embedded JSON", () => {
   for (const comparison of [
-    '# Comparison\n```json\n{"6":{"model":"raw/ladder"}}\n```\nSmaller model is sufficient for checks.',
-    '{\n"6": {"model":"raw/ladder"}\n}\nSmaller model is sufficient for checks.',
+    '# Comparison\n```json\n{"6":"raw/ladder:off"}\n```\nSmaller model is sufficient for checks.',
+    '{\n"6": "raw/ladder:off"\n}\nSmaller model is sufficient for checks.',
     "# Smaller model is sufficient for checks.",
   ]) {
     const details = { proposal: { ladder: {}, comparison } };
@@ -288,7 +268,7 @@ test("stopping preserves failed and already accepted outcomes rather than claimi
 
 test("expanded replies and proposals recover complete source payloads without repeating them", () => {
   const response = "x".repeat(20000) + "\nEND_OF_FULL_REPLY";
-  const reply = replyNotification({ ...task, response });
+  const reply = replyBatch([{ ...task, response }])!;
   expect(reply.content).not.toContain("END_OF_FULL_REPLY");
   const expanded = draw(
     renderReply,
@@ -368,11 +348,6 @@ test("renderers handle content arrays and malformed metadata without mutating pa
         expect(() => draw(renderer, content, details, expanded)).not.toThrow();
       expect(JSON.stringify({ content, details })).toBe(before);
     }
-  const reply = draw(renderReply, content).join("\n");
-  expect(reply).toContain("Review changes");
-  expect(reply).not.toContain("task-1");
-  expect(reply).toContain("Useful answer");
-  expect(reply).not.toContain("not text");
   expect(draw(renderReply, content, undefined, true).join("\n")).toContain(
     "Full detail",
   );
@@ -387,7 +362,11 @@ test("all views respect width and output padding, collapsed and expanded", () =>
     [
       renderReply,
       "Subagent task-1\n漢字 answer\nFull delivery",
-      { id: "task-1", description: "Review 漢字", preview: "漢字 answer" },
+      {
+        replies: [
+          { ...task, description: "Review 漢字", preview: "漢字 answer" },
+        ],
+      },
     ],
     [renderFailures, failureSummary([failure]), [failure]],
     [renderStopped, JSON.stringify([failure]), [failure]],
@@ -411,7 +390,14 @@ test("all views respect width and output padding, collapsed and expanded", () =>
           ))
             expect(visibleWidth(line)).toBeLessThanOrEqual(width);
   expect(
-    draw(renderReply, "Header\nAnswer", undefined, false, 20, 2)[0],
+    draw(
+      renderReply,
+      "Header\nAnswer",
+      replyBatch([task])!.details,
+      false,
+      20,
+      2,
+    )[0],
   ).toMatch(/^ {2}\S.* {2}$/);
   // A long identity cannot consume the separate, immediately visible cause row.
   expect(
@@ -442,7 +428,16 @@ test("terminal commands and controls are sanitized in previews and full delivery
               task: { ...task, description: unsafe },
               proposal: { ladder: {}, comparison: unsafe },
             }
-          : { id: task.id, description: unsafe, preview: unsafe };
+          : {
+              replies: [
+                {
+                  ...task,
+                  description: unsafe,
+                  response: unsafe,
+                  preview: unsafe,
+                },
+              ],
+            };
     for (const expanded of [false, true]) {
       const text = draw(renderer, unsafe, details, expanded, 200).join("\n");
       expect(text).toContain("Visible");
@@ -455,7 +450,7 @@ test("terminal commands and controls are sanitized in previews and full delivery
 
 test("preview metadata stays bounded while expansion preserves its full payload", () => {
   const long = "x".repeat(20000) + "END_OF_PAYLOAD";
-  const details = { id: "task-1", description: long, preview: long };
+  const details = { replies: [{ ...task, description: long, preview: long }] };
   const before = JSON.stringify(details);
   expect(
     draw(renderReply, "Full delivery", details, false, 10000).join("\n").length,

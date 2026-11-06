@@ -10,8 +10,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - uses: pnpm/action-setup@v4
-      - run: pnpm install --frozen-lockfile --ignore-scripts
-      - run: pnpm run check
-      - run: pnpm run format:check
-      - run: pnpm test
+      - run: npm ci --ignore-scripts
+      - run: npm run check
+      - run: npm run format:check
+      - run: npm test

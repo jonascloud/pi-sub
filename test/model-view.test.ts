@@ -8,22 +8,21 @@ const view: SetupView = {
   revision: 2,
   paused: false,
   current: {
-    "6": { model: "test/old:low", cost: 0.1 },
-    "9": { model: "test/old:high", cost: 1 },
+    "6": "test/old:low",
+    "9": "test/old:high",
   },
   draft: {
-    "6": { model: "test/new:low", cost: 0.2 },
-    "7": { model: "test/new:medium", cost: null },
+    "6": "test/new:low",
+    "7": "test/new:medium",
   },
 };
 describe("model selection panel", () => {
   it("puts draft state and concrete changes before actions without claiming activation", () => {
     const lines = renderModelSelection(view, 140).join("\n");
     expect(lines).toContain("DRAFT 2 — not saved");
-    expect(lines).toContain("AA reference USD/task");
     expect(lines.split("\n")[0]!.length).toBeLessThan(80);
-    expect(lines).toContain("test/new:low · $0.2 · changed");
-    expect(lines).toContain("test/new:medium · unknown · new");
+    expect(lines).toContain("test/new:low · changed");
+    expect(lines).toContain("test/new:medium · new");
     expect(lines).toContain("test/old:high · removed");
     expect(lines).toContain("accept · cancel");
     expect(lines).not.toContain("unchanged");
@@ -144,19 +143,18 @@ describe("model selection panel", () => {
       );
     }
   });
-  it("keeps reference costs distinct from spending and sanitizes panel text", () => {
+  it("sanitizes panel text", () => {
     const unsafe = "\x1b]8;;https://evil.test\x07visible\x1b]8;;\x07\x07\b";
     const lines = renderModelSelection(
       {
         ...view,
         currentError: unsafe,
-        draft: { "6": { model: unsafe, cost: 0 } },
+        draft: { "6": unsafe },
       },
       160,
     ).join("\n");
-    expect(lines).toContain("AA reference USD/task");
-    expect(lines).toContain("visible · $0");
-    expect(lines).not.toMatch(/actual spend|spent|\x1b|\x07|\x08/);
+    expect(lines).toContain("visible");
+    expect(lines).not.toMatch(/[\x1b\x07\x08]/);
     expect(lines).not.toContain("evil.test");
   });
 });

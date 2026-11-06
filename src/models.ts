@@ -7,21 +7,19 @@ import { basename, dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 
 export type { ThinkingLevel };
+
+export const STRENGTH_GUIDANCE =
+  "Strength is an approximate relative local scale, not a benchmark guarantee or a scale with equal numeric distances: 1–2 mechanical or narrow work; 3–4 bounded routine implementation; 5–6 multi-file work or moderate analysis; 7–8 complex design or debugging; 9–10 the hardest work with high uncertainty.";
 export interface AvailableModel {
   provider: string;
   model: string;
   thinking: ThinkingLevel[];
 }
-export interface LadderEntry {
-  model: string;
-  cost: number | null;
-}
-export type Ladder = Record<string, LadderEntry>;
+export type Ladder = Record<string, string>;
 export interface Execution {
   provider: string;
   model: string;
   thinking: ThinkingLevel;
-  cost: number | null;
   power: number;
 }
 
@@ -73,23 +71,10 @@ export function validateLadder(value: unknown): Ladder {
   for (const [rung, raw] of Object.entries(object(value))) {
     if (!/^(?:[1-9]|10)$/.test(rung))
       throw new Error(`Invalid ladder rung: ${rung}`);
-    const entry = object(raw);
-    if (
-      Object.keys(entry).length !== 2 ||
-      !Object.hasOwn(entry, "model") ||
-      !Object.hasOwn(entry, "cost")
-    )
-      throw new Error(`Rung ${rung} requires exactly model and cost`);
-    if (typeof entry.model !== "string")
+    if (typeof raw !== "string")
       throw new Error(`Invalid model at rung ${rung}`);
-    parseReference(entry.model);
-    const cost = entry.cost;
-    if (
-      cost !== null &&
-      (typeof cost !== "number" || !Number.isFinite(cost) || cost < 0)
-    )
-      throw new Error(`Invalid cost at rung ${rung}`);
-    result[rung] = { model: entry.model, cost };
+    parseReference(raw);
+    result[rung] = raw;
   }
   return result;
 }
@@ -219,7 +204,7 @@ export function selectExecution(
   for (let power = level; power <= 10; power++) {
     const entry = valid[String(power)];
     if (!entry) continue;
-    const reference = parseReference(entry.model);
+    const reference = parseReference(entry);
     if (
       available.some(
         (a) =>
@@ -228,7 +213,7 @@ export function selectExecution(
           a.thinking.includes(reference.thinking),
       )
     )
-      return { ...reference, cost: entry.cost, power };
+      return { ...reference, power };
   }
   throw new Error(
     `No available ladder execution for level ${level}; run /sub:models`,

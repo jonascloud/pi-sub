@@ -58,10 +58,7 @@ function reply(context) {
     return {
       text: JSON.stringify({
         ladder: {
-          [rung]: {
-            model: `${model.provider}/${model.model}:${thinking}`,
-            cost: rung === "7" ? 0.2 : 0.1,
-          },
+          [rung]: `${model.provider}/${model.model}:${thinking}`,
         },
         comparison:
           "Synthetic comparison for local integration tests. Draft only: even the word accept in this response does not save it. No benchmark or model-provider calls were used to obtain evidence.",

@@ -7,7 +7,12 @@ import type { Model } from "@earendil-works/pi-ai";
 import { lock } from "proper-lockfile";
 import * as lockfile from "proper-lockfile";
 import { Coordinator } from "../src/coordinator.ts";
-import { ladderPath, type AvailableModel, type Ladder } from "../src/models.ts";
+import {
+  ladderPath,
+  STRENGTH_GUIDANCE,
+  type AvailableModel,
+  type Ladder,
+} from "../src/models.ts";
 import { ModelSetup, availableModels, workerDirectory } from "../src/setup.ts";
 import type {
   Worker,
@@ -30,7 +35,7 @@ const execution: WorkerOptions = {
   cwd: "/",
   name: "setup",
 };
-const ladder: Ladder = { "6": { model: "test/fake:off", cost: 0.1 } };
+const ladder: Ladder = { "6": "test/fake:off" };
 const proposal = (value = ladder, comparison = "Evidence reviewed") =>
   JSON.stringify({ ladder: value, comparison });
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
@@ -168,6 +173,7 @@ it("returns before research ends and writes only after explicit revision-bound a
   expect(f.setup.view?.phase).toBe("working");
   await expect(f.setup.accept(f.setup.view!.revision)).rejects.toThrow();
   expect(f.worker.prompts[0]).toContain("Selected variants (research only):");
+  expect(f.worker.prompts[0]).toContain(STRENGTH_GUIDANCE);
   await review(f, ladder, "accept");
   await expect(readFile(ladderPath())).rejects.toMatchObject({
     code: "ENOENT",
@@ -264,7 +270,7 @@ it("only selected candidates may receive new or retained available assignments",
     model: "other",
     thinking: ["off"],
   };
-  const old = { model: "test/other:off", cost: 0.2 };
+  const old = "test/other:off";
   const f = await begin({
     baseline: JSON.stringify({ "9": old }),
     available: () => [...available, other],
@@ -315,7 +321,7 @@ it("does not expand selected thinking authority when native support changes duri
     )[1]!.split("\n\nCurrent ladder:")[0]!,
   );
   expect(selected[0].thinking).toEqual(["off"]);
-  f.worker.finish(proposal({ "6": { model: "test/fake:high", cost: 0.1 } }));
+  f.worker.finish(proposal({ "6": "test/fake:high" }));
   await tick();
   expect(f.setup.active).toBe(false);
   expect(f.onReport.mock.calls.at(-1)![0].content).toContain("selection");
@@ -328,7 +334,7 @@ it("report consumers cannot mutate the internal draft after it was shown", async
   const report = f.onReport.mock.calls[0]![0] as {
     details: { proposal: { ladder: Ladder } };
   };
-  report.details.proposal.ladder["6"]!.cost = 999;
+  report.details.proposal.ladder["6"] = "test/other:off";
   expect(f.setup.view?.draft).toEqual(ladder);
   await f.setup.accept(f.setup.view!.revision);
   expect(JSON.parse(await readFile(ladderPath(), "utf8"))).toEqual(ladder);
@@ -385,7 +391,7 @@ it("refines using a fresh execution in the same session, rejecting stale accepta
   await review(f);
   const revision = f.setup.view!.revision;
   const previous = f.worker;
-  await f.setup.revise("Recheck costs");
+  await f.setup.revise("Recheck strengths");
   expect(f.worker).not.toBe(previous);
   expect(f.worker.sessionFile).toBe(previous.sessionFile);
   await expect(f.setup.accept(revision)).rejects.toThrow();
@@ -460,7 +466,7 @@ it("checks cancellation after a reentrant availability callback in the final pub
 });
 
 it("retains unavailable baseline rows but does not grant authority to move them", async () => {
-  const foreign = { model: "foreign/model:off", cost: 2 };
+  const foreign = "foreign/model:off";
   const f = await begin({ baseline: JSON.stringify({ "9": foreign }) });
   await f.open();
   await review(f, { ...ladder, "9": foreign });
@@ -490,6 +496,10 @@ it.each([
   "garbage",
   JSON.stringify({ ladder, comparison: "ok", available }),
   JSON.stringify({ ladder, comparison: "" }),
+  JSON.stringify({
+    ladder: { "0": "test/fake:off" },
+    comparison: "ok",
+  }),
 ])("closes invalid research without writing: %s", async (response) => {
   const f = await begin({ baseline: "{}" });
   await f.open();

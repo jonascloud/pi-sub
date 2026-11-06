@@ -45,8 +45,7 @@ export interface Worker {
   onEvent(listener: (event: WorkerEvent) => void): () => void;
 }
 
-const excludedTools =
-  "subagent,get_subagent_result,steer_subagent,sub_task,sub_message,sub_result,sub_control";
+const excludedTools = "sub_task,sub_message,sub_result,sub_control";
 const stderrLimit = 16 * 1024;
 const recordLimit = 16 * 1024 * 1024;
 const terminateGrace = 1000;

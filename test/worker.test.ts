@@ -131,6 +131,9 @@ process.stdin.on('end', () => {
       "--exclude-tools",
     ]),
   );
+  expect(launch.args[launch.args.indexOf("--exclude-tools") + 1]).toBe(
+    "sub_task,sub_message,sub_result,sub_control",
+  );
   expect(launch.args).not.toContain("--approve");
   expect(launch.child).toBe("1");
   expect(events).toEqual(["message_end", "message_end"]);

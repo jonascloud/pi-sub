@@ -186,7 +186,7 @@ export default function piSub(pi: ExtensionAPI): void {
     if (task.level !== undefined) {
       const retained = Object.entries(loadLadder(ladderPath())).some(
         ([level, entry]) => {
-          const ref = parseReference(entry.model);
+          const ref = parseReference(entry);
           return (
             Number(level) >= task.level! &&
             ref.provider === execution.provider &&
@@ -443,7 +443,7 @@ export default function piSub(pi: ExtensionAPI): void {
       const ladder = loadLadder(ladderPath());
       const self = Object.entries(ladder)
         .filter(([, entry]) => {
-          const ref = parseReference(entry.model);
+          const ref = parseReference(entry);
           return (
             ref.provider === ctx.model?.provider &&
             ref.model === ctx.model.id &&
@@ -453,7 +453,7 @@ export default function piSub(pi: ExtensionAPI): void {
         .map(([level]) => Number(level));
       table =
         `Your configured strength: ${self.length ? Math.max(...self) + "/10" : "unknown"}.\n` +
-        "Ladder · reference USD/AA task, not actual price or quota:\n" +
+        "Confirmed ladder (minimum level → execution):\n" +
         routingSummary(ladder, available);
     } catch (error) {
       table = reason(error);

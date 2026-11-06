@@ -11,6 +11,7 @@ import type { TaskResult } from "./coordinator.ts";
 import { replyReports, replyText } from "./replies.ts";
 import {
   describeLevels,
+  STRENGTH_GUIDANCE,
   type AvailableModel,
   type Ladder,
   type Execution,
@@ -18,6 +19,7 @@ import {
 
 /** One stable instruction section; notifications carry observations, not a manual. */
 export const SUBAGENT_GUIDANCE = `Delegate bounded, self-contained work when briefing, research, verification and integration overhead are worthwhile. Choose the minimum sufficient level; the confirmed ladder determines execution. Children do not inherit your conversation or interactive UI.
+${STRENGTH_GUIDANCE}
 Tasks are asynchronous; a reply may be a question rather than a final result. Delivered replies remain available for follow-up; finish:true closes a task, it is not needed to acknowledge a report or clear its widget row. User interruption pauses children; a new prompt resumes only you. Failed work is closed and reported automatically.
 Use reports internally; surface only material results, blockers or user decisions. Ignore reports for already collected or stopped tasks rather than acknowledging or collecting them again.`;
 
@@ -40,7 +42,7 @@ export function routingSummary(
     .map(({ from, to, execution: e }) => {
       const level = from === to ? `${from}` : `${from}–${to}`;
       return e
-        ? `${level}: ${e.provider}/${e.model}:${e.thinking} · rung ${e.power} · ${e.cost === null ? "unknown" : `$${e.cost}`}`
+        ? `${level}: ${e.provider}/${e.model}:${e.thinking} · rung ${e.power}`
         : `${level}: unavailable`;
     })
     .join("\n");
@@ -185,52 +187,16 @@ export const renderReply: MessageRenderer = (message, options, theme) => {
       theme,
     );
   }
-  if (options.expanded && typeof details?.response === "string") {
-    const { response, ...metadata } = details;
-    const body = typeof metadata.error === "string" ? metadata.error : response;
-    return fullDelivery(
-      {
-        ...message,
-        content: `Subagent ${preview(metadata.id, 64)} (${identity(metadata)})\n${body}`,
-        details: metadata,
-      },
-      options,
-    );
-  }
   if (options.expanded) return fullDelivery(message, options);
-  const lines = messageText(message).split("\n");
-  const oldHeader = /^Subagent (\S+) \((.*)\)(?: has a response:)?$/.exec(
-    lines[0] ?? "",
-  );
-  const title =
-    (details && identity(details)) ||
-    (oldHeader
-      ? preview(oldHeader[2]) || preview(oldHeader[1], 8)
-      : preview(lines[0])) ||
-    "Subagent";
-  const answer =
-    preview(details?.preview) ||
-    preview(lines.slice(1).find((line) => line.trim()));
   return compact(
-    [
-      { text: `${title} · response`, style: "title" },
-      { text: answer, style: "dim" },
-    ],
+    [{ text: "Subagent response · details unavailable", style: "title" }],
     options,
     theme,
   );
 };
 
 function reports(message: Message): Record<string, unknown>[] {
-  let value = message.details;
-  if (!Array.isArray(value)) {
-    // Old stopped messages stored the reports only as JSON content.
-    try {
-      value = JSON.parse(messageText(message));
-    } catch {
-      return [];
-    }
-  }
+  const value = message.details;
   return Array.isArray(value)
     ? value.filter((item) => {
         const task = record(item);
@@ -247,8 +213,11 @@ export const renderFailures: MessageRenderer = (message, options, theme) => {
   if (options.expanded) return fullDelivery(message, options);
   const tasks = reports(message);
   if (!tasks.length) {
-    // Legacy textual failure summaries already put the causes before partial work.
-    return fullDelivery({ ...message, details: undefined }, options);
+    return compact(
+      [{ text: "Failed · details unavailable", style: "error" }],
+      options,
+      theme,
+    );
   }
   return compact(
     tasks.flatMap((task) => [
@@ -267,7 +236,6 @@ export const renderFailures: MessageRenderer = (message, options, theme) => {
 export const renderStopped: MessageRenderer = (message, options, theme) => {
   if (options.expanded) return fullDelivery(message, options);
   const tasks = reports(message);
-  const content = messageText(message).trim();
   const label = (task: Record<string, unknown>) =>
     task.outcome === "error"
       ? "Failed"
@@ -300,9 +268,7 @@ export const renderStopped: MessageRenderer = (message, options, theme) => {
         ]
       : [
           {
-            text: /^[\[{]/.test(content)
-              ? "Stopped tasks · details unavailable"
-              : preview(content) || "Stopped tasks",
+            text: "Stopped tasks · details unavailable",
             style: "title",
           },
         ],
@@ -343,8 +309,7 @@ export const renderModels: MessageRenderer = (message, options, theme) => {
     typeof proposal.comparison === "string" &&
     proposal.comparison.trim().length > 0;
   const content = messageText(message);
-  const legacy = content.indexOf("DRAFT (not saved):");
-  const isDraft = draft || legacy >= 0;
+
   if (options.expanded) {
     let delivery = message;
     if (draft) {
@@ -363,12 +328,10 @@ export const renderModels: MessageRenderer = (message, options, theme) => {
     return fullDelivery(
       delivery,
       options,
-      isDraft
-        ? "Model ladder · DRAFT — not saved · AA reference USD/task · baseline at open"
-        : undefined,
+      draft ? "Model ladder · DRAFT — not saved" : undefined,
     );
   }
-  if (!isDraft)
+  if (!draft)
     return compact(
       [
         {
@@ -389,11 +352,9 @@ export const renderModels: MessageRenderer = (message, options, theme) => {
         style: "title",
       },
       {
-        text: rationale(
-          draft ? (proposal.comparison as string) : content.slice(0, legacy),
-        ),
+        text: rationale(proposal.comparison as string),
       },
-      ...(draft && Object.keys(proposal.ladder as object).length === 0
+      ...(Object.keys(proposal.ladder as object).length === 0
         ? [
             {
               text: "Empty draft — delegation disabled if accepted.",
