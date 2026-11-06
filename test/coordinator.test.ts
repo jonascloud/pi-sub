@@ -358,6 +358,95 @@ describe("input ownership at close", () => {
 });
 
 describe("final reports and receipts", () => {
+  it.each(["collect", "stop", "failure"] as const)(
+    "preserves separate input/output counts through streaming, continuation and %s",
+    async (take) => {
+      const { c, workers, start } = setup();
+      const id = start();
+      const snapshot = (
+        input: number,
+        output: number,
+        cacheRead: number,
+      ): Usage => ({
+        ...usage(input + output + cacheRead),
+        input,
+        output,
+        cacheRead,
+      });
+      const stream = (worker: Fake, value: Usage) =>
+        worker.emit({
+          type: "message_end",
+          message: {
+            role: "assistant",
+            api: "openai-completions",
+            provider: "p",
+            model: "m",
+            content: [],
+            stopReason: "stop",
+            usage: value,
+            timestamp: 0,
+          },
+        });
+      expect(c.summary()).toMatchObject({
+        tokens: 0,
+        inputTokens: 0,
+        outputTokens: 0,
+      });
+      stream(workers[0]!, snapshot(10, 2, 88));
+      expect(c.summary()).toMatchObject({
+        tokens: 100,
+        inputTokens: 10,
+        outputTokens: 2,
+      });
+      workers[0]!.close({ usage: snapshot(12, 3, 185) });
+      await tick();
+      expect(c.summary()).toMatchObject({
+        tokens: 200,
+        inputTokens: 12,
+        outputTokens: 3,
+      });
+
+      await c.message(id, "next");
+      stream(workers[1]!, snapshot(5, 4, 41));
+      expect(c.summary()).toMatchObject({
+        tokens: 250,
+        inputTokens: 17,
+        outputTokens: 7,
+      });
+      workers[1]!.close({
+        usage: snapshot(20, 10, 270),
+        ...(take === "failure" ? { error: "failed" } : {}),
+      });
+      await tick();
+      expect(c.summary()).toMatchObject({
+        tokens: 300,
+        inputTokens: 20,
+        outputTokens: 10,
+      });
+      if (take === "collect") await c.collect(id);
+      else if (take === "stop") await c.stop(id);
+      else await c.prompt();
+      c.drainUsage();
+      await c.collect(id); // Receipt retrieval and billing drains do not change display totals.
+      expect(c.summary()).toMatchObject({
+        tokens: 300,
+        inputTokens: 20,
+        outputTokens: 10,
+      });
+
+      const next = start("another task");
+      workers[2]!.close({ usage: snapshot(7, 8, 5) });
+      await tick();
+      await c.collect(next);
+      expect(c.summary()).toMatchObject({
+        tokens: 320,
+        inputTokens: 27,
+        outputTokens: 18,
+      });
+      await c.dispose();
+    },
+  );
+
   it.each(["collect", "failure"] as const)(
     "replaces cumulative usage and reports it once on %s",
     async (take) => {

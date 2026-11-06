@@ -39,8 +39,17 @@ const time = (ms: number) => {
     ? `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`
     : `${Math.floor(s / 3600)}:${String(Math.floor(s / 60) % 60).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
 };
+// Match Pi's footer formatting without depending on its private component module.
 const tokenCount = (n: number) =>
-  `${n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 1_000 ? `${(n / 1_000).toFixed(1)}k` : n} token`;
+  n < 1_000
+    ? String(n)
+    : n < 10_000
+      ? `${(n / 1_000).toFixed(1)}k`
+      : n < 1_000_000
+        ? `${Math.round(n / 1_000)}k`
+        : n < 10_000_000
+          ? `${(n / 1_000_000).toFixed(1)}M`
+          : `${Math.round(n / 1_000_000)}M`;
 const pad = (s: string, n: number) =>
   " ".repeat(Math.max(0, n - visibleWidth(s))) + s;
 
@@ -178,13 +187,14 @@ export function renderWidget(
     ...(returned ? [`${returned} delivered`] : []),
     ...(summary.completed ? [`${summary.completed} done`] : []),
   ];
+  const tokens = `↑${tokenCount(summary.inputTokens)} ↓${tokenCount(summary.outputTokens)}`;
   const rootOnly = room === 0;
   const parts = rootOnly
-    ? [...counts(hidden), ...totals, tokenCount(summary.tokens), "pi-sub"]
+    ? [...counts(hidden), ...totals, tokens, "pi-sub"]
     : [
         shown.length || hidden.length ? "──┴─ pi-sub" : "pi-sub",
         ...totals,
-        tokenCount(summary.tokens),
+        tokens,
       ];
   let root = parts[0] ?? "pi-sub";
   for (const part of parts.slice(1)) {

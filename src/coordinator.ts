@@ -41,6 +41,8 @@ export interface TaskResult extends TaskData {
 export interface Summary {
   completed: number;
   tokens: number;
+  inputTokens: number;
+  outputTokens: number;
 }
 type Intent = "pause" | "redirect" | "stop";
 type Execution = {
@@ -62,6 +64,8 @@ type Task = {
   run?: Execution;
   take?: Promise<TaskResult>;
   usage?: Usage;
+  inputTokens: number;
+  outputTokens: number;
   sessionId?: string;
   elapsed: number;
   activeSince?: number;
@@ -74,7 +78,12 @@ export class Coordinator {
   private tasks = new Map<string, Task>();
   private receipts = new Map<string, TaskResult>();
   private usage?: Usage;
-  private totals: Summary = { completed: 0, tokens: 0 };
+  private totals: Summary = {
+    completed: 0,
+    tokens: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+  };
   private listeners = new Set<() => void>();
   private disposed = false;
   private suspended = false;
@@ -195,12 +204,13 @@ export class Coordinator {
     return true;
   }
   summary(): Summary {
-    return {
-      ...this.totals,
-      tokens:
-        this.totals.tokens +
-        [...this.tasks.values()].reduce((n, t) => n + t.data.tokens, 0),
-    };
+    const summary = { ...this.totals };
+    for (const t of this.tasks.values()) {
+      summary.tokens += t.data.tokens;
+      summary.inputTokens += t.inputTokens;
+      summary.outputTokens += t.outputTokens;
+    }
+    return summary;
   }
   start(request: {
     prompt: string;
@@ -237,6 +247,8 @@ export class Coordinator {
       activity: "",
       options: request.worker,
       pending: [request.prompt],
+      inputTokens: 0,
+      outputTokens: 0,
       elapsed: 0,
     };
     this.tasks.set(id, t);
@@ -358,6 +370,8 @@ export class Coordinator {
         .join("\n");
       if (text) t.data.response = text;
       t.data.tokens += value.usage?.totalTokens ?? 0;
+      t.inputTokens += value.usage?.input ?? 0;
+      t.outputTokens += value.usage?.output ?? 0;
     }
     // Completion events are progress only. The process's close/report ends execution.
     this.emit();
@@ -377,6 +391,8 @@ export class Coordinator {
       // Whole-session snapshots replace both billing and displayed totals.
       t.usage = report.usage;
       t.data.tokens = report.usage.totalTokens;
+      t.inputTokens = report.usage.input;
+      t.outputTokens = report.usage.output;
     }
     // A successful native reply may follow an input transformation. On abort or
     // failure, replay conservatively when the original instruction is unproven.
@@ -489,6 +505,8 @@ export class Coordinator {
       this.receipts.set(result.id, structuredClone(result));
       if (t.usage) this.usage = addUsage(this.usage, t.usage);
       this.totals.tokens += result.tokens;
+      this.totals.inputTokens += t.inputTokens;
+      this.totals.outputTokens += t.outputTokens;
       if (result.outcome === "reply") this.totals.completed++;
       this.emit();
     }

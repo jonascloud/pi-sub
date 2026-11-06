@@ -34,10 +34,30 @@ const render = (
   summary: Summary = {
     completed: 0,
     tokens: tasks.reduce((n, t) => n + t.tokens, 0),
+    inputTokens: tasks.reduce((n, t) => n + t.tokens, 0),
+    outputTokens: 0,
   },
 ) => renderWidget(tasks, width, height, theme, summary);
 
 describe("widget rendering", () => {
+  it.each([
+    [0, 0, "↑0 ↓0"],
+    [192000, 27000, "↑192k ↓27k"],
+    [999, 1234, "↑999 ↓1.2k"],
+    [1000000, 10500000, "↑1.0M ↓11M"],
+  ])(
+    "formats input %i and output %i like Pi's footer",
+    (inputTokens, outputTokens, expected) => {
+      const rows = render([], 100, 12, {
+        completed: 1,
+        tokens: inputTokens + outputTokens,
+        inputTokens,
+        outputTokens,
+      });
+      expect(rows[0]).toContain(expected);
+      expect(rows[0]).not.toContain("token");
+    },
+  );
   it("shows confirmed process closure in progress rather than apparent thinking", () => {
     const row = render([task({ operation: "closing" })])[0]!;
     expect(row).toContain("cls");
@@ -106,7 +126,7 @@ describe("widget rendering", () => {
         120,
         12,
         { ...theme, fg },
-        { completed: 0, tokens: 21 },
+        { completed: 0, tokens: 21, inputTokens: 21, outputTokens: 0 },
       );
       const dimmed = fg.mock.calls
         .filter(([color]) => color === "dim")
@@ -119,7 +139,7 @@ describe("widget rendering", () => {
       120,
       12,
       { ...theme, fg },
-      { completed: 0, tokens: 21 },
+      { completed: 0, tokens: 21, inputTokens: 21, outputTokens: 0 },
     );
     expect(fg.mock.calls.some(([color]) => color === "dim")).toBe(false);
   });
@@ -170,7 +190,7 @@ describe("widget rendering", () => {
     expect(rows[1]).toContain("failed");
     expect(rows[1]).toContain("err");
     expect(rows[2]).toContain("+3 run 3");
-    expect(rows[3]).toContain("105 token");
+    expect(rows[3]).toContain("↑105 ↓0");
     expect(rows[3]).not.toContain("run");
   });
   it("keeps archive totals after live tasks are removed without retaining failed rows", () => {
@@ -181,13 +201,19 @@ describe("widget rendering", () => {
       description: "Failed identity",
     });
     expect(render([failed]).join("\n")).toContain("err");
-    const summary = { completed: 3, tokens: 12000 };
+    const summary = {
+      completed: 3,
+      tokens: 12000,
+      inputTokens: 10000,
+      outputTokens: 2000,
+    };
     const rows = render([], 100, 12, summary);
     expect(rows).toHaveLength(1);
     expect(rows[0]).toContain("3 done");
     expect(rows[0]).not.toContain("failed");
     expect(rows[0]).not.toContain("stopped");
-    expect(rows[0]).toContain("12.0k token");
+    expect(rows[0]).toContain("↑10k ↓2.0k");
+    expect(rows[0]).not.toContain("token");
     expect(rows.join("\n")).not.toContain("Failed identity");
     expect(rows.join("\n")).not.toContain("broken");
     expect(render([])).toEqual([]);
@@ -283,7 +309,12 @@ it("polls only visible active rows, reserves space below, resumes and cleans up"
   const unsubscribe = vi.fn();
   const coordinator = {
     list: () => tasks,
-    summary: () => ({ completed: 0, tokens: 21 }),
+    summary: () => ({
+      completed: 0,
+      tokens: 21,
+      inputTokens: 21,
+      outputTokens: 0,
+    }),
     subscribe: (fn: () => void) => {
       listener = fn;
       return unsubscribe;
