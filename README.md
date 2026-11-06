@@ -9,8 +9,7 @@ A **task** owns a native Pi session. Each **execution** is a fresh `pi --mode js
 Requires Pi 1.5-compatible host packages and Node.js 22.19 or newer:
 
 ```sh
-npm ci --ignore-scripts
-pi install /absolute/path/to/pi-sub
+pi install git:github.com/jonascloud/pi-sub
 ```
 
 Use `/reload` after installation or source changes.
@@ -119,7 +118,10 @@ Acceptance, explicit stop or automatic failure collection transfers original ass
 
 ## Development
 
+Clone the repository and install its dependencies. To load the local checkout in Pi, run `pi install /absolute/path/to/pi-sub`.
+
 ```sh
+npm ci --ignore-scripts
 npm run check
 npm test
 npm run format:check
