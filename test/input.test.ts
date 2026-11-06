@@ -8,7 +8,7 @@ import type { TaskResult, TaskView } from "../src/coordinator.ts";
 import piSub from "../index.ts";
 import * as models from "../src/models.ts";
 import * as modelSetup from "../src/setup.ts";
-import { SUBAGENT_GUIDANCE } from "../src/messages.ts";
+import { SUBAGENT_GUIDANCE, replyNotification } from "../src/messages.ts";
 
 const fake = vi.hoisted(() => ({
   interrupted: false,
@@ -19,6 +19,7 @@ const fake = vi.hoisted(() => ({
   onReady: undefined as ((task: TaskView) => void) | undefined,
   start: vi.fn(),
   stop: vi.fn(),
+  markDelivered: vi.fn(),
 }));
 vi.mock("../src/coordinator.ts", () => ({
   Coordinator: class {
@@ -35,6 +36,7 @@ vi.mock("../src/coordinator.ts", () => ({
     interrupt = fake.interrupt;
     start = fake.start;
     stop = fake.stop;
+    markDelivered = fake.markDelivered;
     get = () => ({ id: "new-task" });
     drainUsage = () => undefined;
     list = () => [];
@@ -54,6 +56,7 @@ beforeEach(() => {
   fake.runnable = true;
   fake.start.mockReset().mockReturnValue("new-task");
   fake.stop.mockReset();
+  fake.markDelivered.mockReset();
   fake.prompt.mockReset().mockResolvedValue(true);
   fake.interrupt.mockReset().mockImplementation(async () => {
     fake.interrupted = true;
@@ -602,6 +605,34 @@ test("background replies cannot wake a second parent model turn while human sele
   expect(sendMessage).toHaveBeenCalledWith(
     expect.objectContaining({ customType: "pi-sub:response" }),
     { deliverAs: "followUp", triggerTurn: false },
+  );
+});
+
+test("queuing a notification is not delivery; only complete parent context messages count", () => {
+  const { emit, sendMessage } = setup();
+  emit("agent_start");
+  const reply: TaskView = {
+    ...failure,
+    outcome: "reply",
+    error: undefined,
+    response: "Question?",
+    status: "ready",
+    level: 1,
+    activity: "",
+    reply: { id: "reply-1", delivered: false },
+  };
+  fake.onReady!(reply);
+  expect(sendMessage).toHaveBeenCalledOnce();
+  expect(fake.markDelivered).not.toHaveBeenCalled();
+  emit("context", { messages: [] });
+  expect(fake.markDelivered).not.toHaveBeenCalled();
+  const message = { ...replyNotification(reply), role: "custom", timestamp: 0 };
+  emit("context", { messages: [{ ...message, content: "preview" }] });
+  expect(fake.markDelivered).not.toHaveBeenCalled();
+  emit("context", { messages: [message] });
+  expect(fake.markDelivered).toHaveBeenCalledExactlyOnceWith(
+    reply.id,
+    "reply-1",
   );
 });
 

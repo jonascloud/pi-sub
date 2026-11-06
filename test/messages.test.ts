@@ -5,6 +5,7 @@ import {
   SUBAGENT_GUIDANCE,
   failureSummary,
   replyNotification,
+  deliveredReplies,
   renderReply,
   renderFailures,
   renderStopped,
@@ -56,6 +57,90 @@ test("replies carry identity and new information, not repeated operating instruc
   const long = replyNotification({ ...task, response: "x".repeat(20000) });
   expect(long.details.preview.length).toBeLessThan(200);
   expect(long.content.length).toBeLessThan(8100);
+});
+
+test("only complete native reply notifications acknowledge their exact reply", () => {
+  const ready = { ...task, reply: { id: "reply-1", delivered: false } };
+  const message = {
+    ...replyNotification(ready),
+    role: "custom" as const,
+    timestamp: 0,
+  };
+  expect(deliveredReplies(message)).toEqual([
+    { id: task.id, replyId: "reply-1" },
+  ]);
+  expect(deliveredReplies({ ...message, content: "Only a preview" })).toEqual(
+    [],
+  );
+  expect(deliveredReplies({ ...message, customType: "unrelated" })).toEqual([]);
+  expect(
+    deliveredReplies({ ...message, details: { ...ready, reply: undefined } }),
+  ).toEqual([]);
+  expect(
+    deliveredReplies({ ...message, details: { ...ready, outcome: "error" } }),
+  ).toEqual([]);
+  for (const response of ["x".repeat(20000), "line\n".repeat(110)]) {
+    const clipped = replyNotification({ ...ready, response });
+    expect(clipped.content).toContain("[Truncated; use sub_result");
+    expect(deliveredReplies({ ...message, ...clipped })).toEqual([]);
+  }
+});
+
+test("complete tool returns acknowledge replies without accepting tasks", () => {
+  const ready = { ...task, reply: { id: "reply-1", delivered: false } };
+  const message = {
+    role: "toolResult" as const,
+    toolCallId: "call-1",
+    toolName: "sub_result",
+    content: [{ type: "text" as const, text: JSON.stringify(ready, null, 2) }],
+    details: ready,
+    isError: false,
+    timestamp: 0,
+  };
+  expect(deliveredReplies(message)).toEqual([
+    { id: task.id, replyId: "reply-1" },
+  ]);
+  expect(
+    deliveredReplies({
+      ...message,
+      details: { ...ready, extra: "diagnostics" },
+      content: [{ type: "text", text: JSON.stringify(ready) }],
+    }),
+  ).toEqual([{ id: task.id, replyId: "reply-1" }]);
+  expect(
+    deliveredReplies({
+      ...message,
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({ ...ready, response: "shortened" }),
+        },
+      ],
+    }),
+  ).toEqual([]);
+  expect(deliveredReplies({ ...message, isError: true })).toEqual([]);
+  expect(deliveredReplies({ ...message, toolName: "unrelated" })).toEqual([]);
+  expect(
+    deliveredReplies({
+      ...message,
+      content: [{ type: "text", text: "[Truncated]" }],
+    }),
+  ).toEqual([]);
+  const values = [
+    ready,
+    { ...ready, id: "second", reply: { id: "reply-2", delivered: false } },
+  ];
+  expect(
+    deliveredReplies({
+      ...message,
+      toolName: "sub_control",
+      details: values,
+      content: [{ type: "text", text: JSON.stringify(values, null, 2) }],
+    }),
+  ).toEqual([
+    { id: task.id, replyId: "reply-1" },
+    { id: "second", replyId: "reply-2" },
+  ]);
 });
 
 test("TUI notifications are two-line previews with expandable complete delivery", () => {

@@ -13,6 +13,10 @@ import type { Coordinator, Summary, TaskView } from "./coordinator.ts";
 
 type WidgetTheme = Pick<Theme, "fg" | "bold">;
 const active = (task: TaskView) => task.status === "active";
+const delivered = (task: TaskView) =>
+  task.status === "ready" &&
+  task.outcome === "reply" &&
+  task.reply?.delivered === true;
 const clean = (text: string) =>
   stripTerminalSequences(text)
     .replace(/[\r\n\t\x00-\x1f\x7f-\x9f]+/g, " ")
@@ -49,7 +53,7 @@ const priority = (t: TaskView) =>
         ? 2
         : 3;
 function select(tasks: readonly TaskView[], height: number) {
-  const rows = tasks;
+  const rows = tasks.filter((task) => !delivered(task));
   const room = Math.max(0, Math.min(12, height) - 1);
   const capacity = rows.length > room && room > 1 ? room - 1 : room;
   const selected = new Set(
@@ -169,12 +173,16 @@ export function renderWidget(
       ),
     );
   }
-  const totals = summary.completed ? [`${summary.completed} done`] : [];
+  const returned = tasks.filter(delivered).length;
+  const totals = [
+    ...(returned ? [`${returned} delivered`] : []),
+    ...(summary.completed ? [`${summary.completed} done`] : []),
+  ];
   const rootOnly = room === 0;
   const parts = rootOnly
     ? [...counts(hidden), ...totals, tokenCount(summary.tokens), "pi-sub"]
     : [
-        tasks.length ? "──┴─ pi-sub" : "pi-sub",
+        shown.length || hidden.length ? "──┴─ pi-sub" : "pi-sub",
         ...totals,
         tokenCount(summary.tokens),
       ];

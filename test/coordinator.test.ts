@@ -94,6 +94,66 @@ function setup(maxWorkers = 1, beforeStart?: (task: TaskView) => void) {
   return { c, workers, start, factory, onReady };
 }
 
+describe("reply delivery is not task acceptance", () => {
+  it("delivers a reply once, keeps questions resumable, and isolates successor replies", async () => {
+    const { c, workers, start } = setup();
+    const id = start();
+    expect(c.markDelivered(id, "unknown")).toBe(false);
+    workers[0]!.close({ text: "Which schema?", usage: usage(25) });
+    await tick();
+    const first = c.get(id);
+    expect(first.reply).toMatchObject({ delivered: false });
+    const changed = vi.fn();
+    const detach = c.subscribe(changed);
+    expect(c.markDelivered(id, first.reply!.id)).toBe(true);
+    expect(c.markDelivered(id, first.reply!.id)).toBe(false);
+    expect(changed).toHaveBeenCalledOnce();
+    detach();
+    expect(c.get(id)).toMatchObject({
+      status: "ready",
+      response: "Which schema?",
+      reply: { delivered: true },
+    });
+    expect(first.reply!.delivered).toBe(false); // Snapshots cannot change underneath a carrier.
+    expect(c.summary().completed).toBe(0);
+    expect(c.drainUsage()).toBeUndefined();
+
+    const blocker = start("occupy the slot");
+    await c.message(id, "Production");
+    expect(c.get(id).status).toBe("queued");
+    expect(c.get(id).reply).toBeUndefined();
+    expect(c.markDelivered(id, first.reply!.id)).toBe(false);
+    workers[1]!.close();
+    await tick();
+    expect(c.get(blocker).status).toBe("ready");
+    expect(workers[2]!.sessionFile).toBe(first.sessionFile);
+    expect(workers[2]!.run).toHaveBeenCalledExactlyOnceWith("Production");
+    workers[2]!.close({ text: "Checked production.", usage: usage(75) });
+    await tick();
+    const next = c.get(id);
+    expect(next.reply!.id).not.toBe(first.reply!.id);
+    expect(c.markDelivered(id, first.reply!.id)).toBe(false);
+    expect(c.get(id).reply!.delivered).toBe(false);
+    expect(c.markDelivered(id, next.reply!.id)).toBe(true);
+    await c.collect(id);
+    expect(c.markDelivered(id, next.reply!.id)).toBe(false);
+    expect(c.summary().completed).toBe(1);
+    expect(c.drainUsage()).toEqual(usage(75));
+    await c.dispose();
+  });
+
+  it("does not treat a failure or an unknown task as a delivered reply", async () => {
+    const { c, workers, start } = setup();
+    const id = start();
+    workers[0]!.close({ error: "worker failed" });
+    await tick();
+    expect(c.markDelivered(id, "anything")).toBe(false);
+    expect(c.markDelivered("unknown", "anything")).toBe(false);
+    expect(c.get(id)).toMatchObject({ status: "ready", outcome: "error" });
+    await c.dispose();
+  });
+});
+
 describe("one session, fresh execution processes", () => {
   it("does not complete or admit on native settlement; closed ready tasks free capacity", async () => {
     const { c, workers, start, onReady } = setup();

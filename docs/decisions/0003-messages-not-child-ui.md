@@ -18,7 +18,7 @@ State-dependent actions and consequential warnings remain visible where needed: 
 
 ## Native views
 
-Use native tool call/result and custom-message renderers, not another screen or UI controller. The widget shows current state; transcript rows show historical actions and observations. Task identity and useful outcomes outrank IDs, execution settings and diagnostic JSON. Expansion exposes full requests, results and metadata without changing the model-facing protocol.
+Use native tool call/result and custom-message renderers, not another screen or UI controller. The widget shows outstanding attention; transcript rows show historical actions and observations. A complete reply actually included in the parent's native context folds automatically into a delivered count, not a done count. Its task remains available for follow-up until explicit acceptance or stop. The coordinator owns this reply-specific acknowledgment; rendering neither acknowledges delivery nor changes task lifetime. Task identity and useful outcomes outrank IDs, execution settings and diagnostic JSON. Expansion exposes full requests, results and metadata without changing the model-facing protocol.
 
 Tool requests use action labels until a result exists; only confirmed outcomes use past-tense success labels. Keeping the outcome in the result renderer also works with native HTML exports, which render requests before their results. A self-rendered tool shell prevents an ordinary observation timeout from inheriting the native error background. Physical pausing/closing and any failure cause remain distinguishable. Unknown batch progress is not presented as complete success.
 

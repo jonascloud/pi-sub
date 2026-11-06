@@ -29,6 +29,8 @@ export interface TaskView extends TaskData {
   outcome?: Outcome;
   operation?: "pausing" | "closing";
   activity: string;
+  /** Delivery belongs to this reply, not to the task's eventual acceptance. */
+  reply?: { id: string; delivered: boolean };
   pendingInput?: string[];
 }
 export interface TaskResult extends TaskData {
@@ -54,6 +56,7 @@ type Task = {
   status: TaskStatus;
   outcome?: Outcome;
   activity: string;
+  reply?: TaskView["reply"];
   pending: string[];
   run?: Execution;
   take?: Promise<TaskResult>;
@@ -140,6 +143,7 @@ export class Coordinator {
       status: t.status,
       outcome: t.outcome,
       activity: t.activity,
+      ...(t.reply ? { reply: { ...t.reply } } : {}),
       ...(t.run?.intent
         ? {
             operation:
@@ -170,6 +174,23 @@ export class Coordinator {
   inspect(id: string): TaskView | TaskResult {
     const receipt = this.receipts.get(id);
     return receipt ? structuredClone(receipt) : this.get(id);
+  }
+  /** A parent context contains this exact reply; keep its task resumable. */
+  markDelivered(id: string, replyId: string): boolean {
+    const t = this.tasks.get(id);
+    if (
+      !t ||
+      t.status !== "ready" ||
+      t.outcome !== "reply" ||
+      t.run ||
+      !t.reply ||
+      t.reply.id !== replyId ||
+      t.reply.delivered
+    )
+      return false;
+    t.reply.delivered = true;
+    this.emit();
+    return true;
   }
   summary(): Summary {
     return {
@@ -257,6 +278,7 @@ export class Coordinator {
         t.pending = [];
         t.run = run;
         t.outcome = undefined;
+        t.reply = undefined;
         t.activity = "";
         t.data.response = "";
         delete t.data.error;
@@ -367,6 +389,7 @@ export class Coordinator {
       this.status(t, redirect ? "queued" : "paused");
     } else {
       t.outcome = "reply";
+      t.reply = { id: randomUUID(), delivered: false };
       this.status(t, "ready");
       if (!t.take) this.ready(t);
     }
@@ -409,6 +432,7 @@ export class Coordinator {
       return;
     }
     t.outcome = undefined;
+    t.reply = undefined;
     this.status(t, "queued");
     this.admit();
   }

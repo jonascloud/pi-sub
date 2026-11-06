@@ -150,6 +150,66 @@ async function latestResult(client: RpcClient) {
   return JSON.parse(result.content.find((part) => part.type === "text")!.text);
 }
 
+test("native reply delivery keeps the task and its session available for follow-up", async () => {
+  const { client, agentDir, dispose } = await host({}, undefined, false);
+  try {
+    await writeFile(
+      join(agentDir, "pi-sub-config.json"),
+      JSON.stringify({
+        "6": { model: "worker-test/fake:off", cost: 0.1 },
+      }),
+    );
+    const delivered = (previous?: string) =>
+      eventually(async () => {
+        const messages = await client.getMessages();
+        const index = messages.findLastIndex(
+          (message) =>
+            message.role === "custom" &&
+            message.customType === "pi-sub:response" &&
+            (message.details as { reply?: { id: string } })?.reply?.id !==
+              previous,
+        );
+        expect(index).toBeGreaterThanOrEqual(0);
+        // The native parent has made a request containing the notification.
+        expect(
+          messages
+            .slice(index + 1)
+            .some((message) => message.role === "assistant"),
+        ).toBe(true);
+        const message = messages[index]!;
+        if (message.role !== "custom") throw new Error("No reply notification");
+        return message.details as {
+          id: string;
+          sessionFile: string;
+          reply: { id: string; delivered: boolean };
+        };
+      });
+    await client.promptAndWait("integration:notify", undefined, 20000);
+    const first = await delivered();
+    expect(first.reply.delivered).toBe(false); // The queued snapshot is not a receipt.
+    await client.promptAndWait("integration:inspect", undefined, 20000);
+    expect(await latestResult(client)).toMatchObject({
+      id: first.id,
+      status: "ready",
+      outcome: "reply",
+      reply: { id: first.reply.id, delivered: true },
+    });
+    await client.promptAndWait("integration:refine-task", undefined, 20000);
+    const next = await delivered(first.reply.id);
+    expect(next.id).toBe(first.id);
+    expect(next.sessionFile).toBe(first.sessionFile);
+    expect(next.reply.id).not.toBe(first.reply.id);
+    await client.promptAndWait("integration:inspect", undefined, 20000);
+    expect(await latestResult(client)).toMatchObject({
+      id: first.id,
+      status: "ready",
+      reply: { id: next.reply.id, delivered: true },
+    });
+  } finally {
+    await dispose();
+  }
+}, 40000);
+
 /** Real parent Pi + real child Pi; only the model provider is synthetic. */
 test("bootstraps, delegates, accepts and reports original child usage once", async () => {
   const { client, dispose, cwd } = await host();

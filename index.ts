@@ -36,6 +36,7 @@ import {
   SUBAGENT_GUIDANCE,
   failureSummary,
   replyNotification,
+  deliveredReplies,
   renderReply,
   renderFailures,
   renderStopped,
@@ -346,6 +347,14 @@ export default function piSub(pi: ExtensionAPI): void {
       return { action: "handled" };
     }
   });
+  // sendMessage only queues a follow-up. A context hook sees the messages
+  // actually handed to the parent, including tool returns and idle deliveries.
+  pi.on("context", (event) => {
+    if (lifetime.signal.aborted || !coordinator) return;
+    for (const message of event.messages)
+      for (const reply of deliveredReplies(message))
+        coordinator.markDelivered(reply.id, reply.replyId);
+  });
   pi.on("turn_start", (_event, ctx) => {
     context = ctx;
     observe(ctx.signal);
@@ -396,6 +405,7 @@ export default function piSub(pi: ExtensionAPI): void {
           description: task.description,
           status: task.status,
           outcome: task.outcome,
+          reply: task.reply,
         })),
     )}\n\n${table}`;
   });
@@ -594,7 +604,7 @@ export default function piSub(pi: ExtensionAPI): void {
       exposure: "model-only",
       executionMode: "sequential",
       description:
-        "Read or wait for a response. finish:true accepts/removes a ready response; a timeout only ends the wait.",
+        "Read or wait for a response. Complete deliveries collapse the widget row but keep the task available for follow-up. finish:true explicitly accepts/removes it; a timeout only ends the wait.",
       parameters: Type.Object(
         {
           id: Type.String(),

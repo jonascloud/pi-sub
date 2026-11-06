@@ -221,6 +221,44 @@ describe("widget rendering", () => {
     ).join("\n");
     expect(failed).toContain("Invalid proposal");
   });
+  it("collapses delivered replies without calling them completed", () => {
+    const reply = task({
+      status: "ready",
+      outcome: "reply",
+      reply: { id: "reply-1", delivered: true },
+    });
+    const lines = render([reply], 120);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("1 delivered");
+    expect(lines[0]).not.toContain("done");
+    expect(lines[0]).not.toContain("rdy");
+    expect(lines[0]).not.toContain("──┴─");
+    expect(
+      render([{ ...reply, reply: { id: "reply-2", delivered: false } }], 120),
+    ).toHaveLength(2);
+  });
+  it("does not spend row capacity on delivered replies or hide failures and pauses", () => {
+    const reply = task({
+      status: "ready",
+      outcome: "reply",
+      reply: { id: "reply-1", delivered: true },
+    });
+    const text = render(
+      [
+        reply,
+        { ...reply, id: "failed", outcome: "error", error: "Provider failed" },
+        { ...reply, id: "paused", status: "paused" },
+        task({ description: "Still running" }),
+      ],
+      200,
+      5,
+    ).join("\n");
+    expect(text).toContain("Provider failed");
+    expect(text).toContain("pse");
+    expect(text).toContain("Still running");
+    expect(text).toContain("1 delivered");
+    expect(text).not.toContain("+1");
+  });
   it("shows paused and reply states", () => {
     expect(render([task({ status: "paused" })])[0]).toContain("pse");
     expect(render([task({ status: "ready", outcome: "reply" })])[0]).toContain(

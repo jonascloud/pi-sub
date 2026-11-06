@@ -74,6 +74,7 @@ function reply(context) {
     if (
       [
         "integration:delegate",
+        "integration:notify",
         "integration:probe-global",
         "integration:pause",
         "integration:failure",
@@ -96,6 +97,7 @@ function reply(context) {
       [
         "integration:inspect",
         "integration:continue",
+        "integration:refine-task",
         "integration:accept",
         "integration:failure-receipt",
       ].includes(text) &&
@@ -110,15 +112,20 @@ function reply(context) {
       );
       return text === "integration:continue"
         ? { name: "sub_control", args: { id: task.id, action: "continue" } }
-        : {
-            name: "sub_result",
-            args: {
-              id: task.id,
-              ...(text === "integration:accept"
-                ? { wait: true, timeout: 15, finish: true }
-                : {}),
-            },
-          };
+        : text === "integration:refine-task"
+          ? {
+              name: "sub_message",
+              args: { id: task.id, message: "Check the production schema." },
+            }
+          : {
+              name: "sub_result",
+              args: {
+                id: task.id,
+                ...(text === "integration:accept"
+                  ? { wait: true, timeout: 15, finish: true }
+                  : {}),
+              },
+            };
     }
     if (text === "integration:retry" && results.at(-1)?.toolName === "sub_task")
       return { error: "429 rate limit test" };

@@ -7,6 +7,7 @@ import {
   Text,
   truncateToWidth,
 } from "@earendil-works/pi-tui";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { TaskView, TaskResult } from "./coordinator.ts";
 import {
   describeLevels,
@@ -17,7 +18,7 @@ import {
 
 /** One stable instruction section; notifications carry observations, not a manual. */
 export const SUBAGENT_GUIDANCE = `Delegate bounded, self-contained work when briefing, research, verification and integration overhead are worthwhile. Choose the minimum sufficient level; the confirmed ladder determines execution. Children do not inherit your conversation or interactive UI.
-Tasks are asynchronous; a reply may be a question rather than a final result. Decide whether to continue or accept it. User interruption pauses children; a new prompt resumes only you. Failed work is closed and reported automatically.
+Tasks are asynchronous; a reply may be a question rather than a final result. Delivered replies remain available for follow-up; finish:true closes a task, it is not needed to acknowledge a report or clear its widget row. User interruption pauses children; a new prompt resumes only you. Failed work is closed and reported automatically.
 Use reports internally; surface only material results, blockers or user decisions. Ignore reports for already collected or stopped tasks rather than acknowledging or collecting them again.`;
 
 export function routingSummary(
@@ -45,19 +46,31 @@ export function routingSummary(
     .join("\n");
 }
 
-export function replyNotification(task: TaskView) {
+function replyText(
+  task: Pick<TaskView, "id" | "description" | "response" | "error">,
+): string {
   const response = stripTerminalSequences(task.error ?? task.response);
   const description = truncateToWidth(
     stripTerminalSequences(task.description).replace(/\s+/g, " ").trim(),
     160,
   );
+  return `Subagent ${task.id} (${description})\n${response}`;
+}
+
+export function replyNotification(task: TaskView) {
+  const response = stripTerminalSequences(task.error ?? task.response);
+  const clipped = truncateHead(replyText(task), {
+    maxBytes: 8000,
+    maxLines: 100,
+  });
   return {
     customType: "pi-sub:response",
     display: true,
-    content: truncateHead(`Subagent ${task.id} (${description})\n${response}`, {
-      maxBytes: 8000,
-      maxLines: 100,
-    }).content,
+    content:
+      clipped.content +
+      (clipped.truncated
+        ? "\n[Truncated; use sub_result for the full response.]"
+        : ""),
     details: {
       ...structuredClone(task),
       preview: truncateToWidth(
@@ -66,6 +79,84 @@ export function replyNotification(task: TaskView) {
       ),
     },
   };
+}
+
+/** Exact reply identities carried by complete, model-visible parent messages. */
+export function deliveredReplies(
+  message: AgentMessage,
+): { id: string; replyId: string }[] {
+  const reference = (value: unknown) => {
+    const data = record(value);
+    const reply = record(data?.reply);
+    return data?.status === "ready" &&
+      data.outcome === "reply" &&
+      typeof data.id === "string" &&
+      typeof reply?.id === "string"
+      ? { id: data.id, replyId: reply.id }
+      : undefined;
+  };
+  const content = "content" in message ? message.content : undefined;
+  const text =
+    typeof content === "string"
+      ? content
+      : Array.isArray(content) && content.every((part) => part.type === "text")
+        ? content.map((part) => part.text).join("")
+        : undefined;
+  if (text === undefined) return [];
+  if (message.role === "custom" && message.customType === "pi-sub:response") {
+    const data = record(message.details);
+    const ref = reference(data);
+    if (
+      !ref ||
+      typeof data?.description !== "string" ||
+      typeof data.response !== "string" ||
+      (data.error !== undefined && typeof data.error !== "string")
+    )
+      return [];
+    const expected = replyText({
+      id: ref.id,
+      description: data.description,
+      response: data.response,
+      error: data.error,
+    });
+    return text === expected ? [ref] : [];
+  }
+  if (
+    message.role === "toolResult" &&
+    !message.isError &&
+    ["sub_task", "sub_message", "sub_result", "sub_control"].includes(
+      message.toolName,
+    )
+  ) {
+    let visible: unknown;
+    try {
+      visible = JSON.parse(text);
+    } catch {
+      return []; // Truncated tool returns are not complete deliveries.
+    }
+    const originals = Array.isArray(message.details)
+      ? message.details
+      : [message.details];
+    const values = Array.isArray(visible) ? visible : [visible];
+    return values.flatMap((value) => {
+      const ref = reference(value);
+      if (!ref) return [];
+      const original = record(
+        originals.find((candidate) => {
+          const other = reference(candidate);
+          return other?.id === ref.id && other.replyId === ref.replyId;
+        }),
+      );
+      const data = record(value);
+      // Match the actual answer, not serialization whitespace or extra metadata.
+      return typeof data?.response === "string" &&
+        data.response === original?.response &&
+        data.error === original?.error
+        ? [ref]
+        : [];
+    });
+  }
+  return [];
 }
 
 type Message = Parameters<MessageRenderer>[0];
