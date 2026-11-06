@@ -58,6 +58,14 @@ describe("model selection panel", () => {
     expect(renderModelSelection(view, 120, 4).join("\n")).toContain(
       "full draft and comparison in transcript",
     );
+    for (const [shown, height] of [
+      [view, 2],
+      [{ ...view, currentError: "invalid JSON" }, 3],
+    ] as const) {
+      const tiny = renderModelSelection(shown, 120, height).join("\n");
+      expect(tiny).toContain("full draft and comparison in transcript");
+      expect(tiny).not.toContain("accept · cancel");
+    }
     expect(renderModelSelection(undefined, 80)).toEqual([]);
     expect(
       renderModelSelection({ ...view, draft: {} }, 140).join("\n"),

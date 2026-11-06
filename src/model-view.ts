@@ -124,6 +124,10 @@ export function renderModelSelection(
       );
     }
   }
-  lines.push(footer);
+  lines.push(
+    content.length && room <= warnings.length
+      ? `+${content.length} rows · full draft and comparison in transcript`
+      : footer,
+  );
   return lines.map((line) => truncateToWidth(line, width));
 }

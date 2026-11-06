@@ -4,16 +4,13 @@ import type { TaskView, TaskResult } from "../src/coordinator.ts";
 import {
   SUBAGENT_GUIDANCE,
   failureSummary,
-  replyNotification,
-  replyBatch,
-  announcedReplies,
-  deliveredReplies,
   renderReply,
   renderFailures,
   renderStopped,
   renderModels,
   routingSummary,
 } from "../src/messages.ts";
+import { replyNotification, replyBatch } from "../src/replies.ts";
 
 const task: TaskView = {
   id: "task-1",
@@ -47,98 +44,6 @@ function render(expanded: boolean, width = 80, details = true) {
   )!.render(width);
 }
 
-test("replies carry identity and new information, not repeated operating instructions", () => {
-  const reply = replyNotification(task);
-  expect(reply.content).toBe(
-    "Subagent task-1 (Review changes)\nQuestion?\nImportant detail.",
-  );
-  expect(reply.content).not.toContain("sub_message");
-  expect(reply.content).not.toContain("sub_result");
-  expect(reply.content).not.toContain("This may be a question");
-  expect(reply.details).toMatchObject({ ...task, preview: "Question?" });
-  const long = replyNotification({ ...task, response: "x".repeat(20000) });
-  expect(long.details.preview.length).toBeLessThan(200);
-  expect(long.content.length).toBeLessThan(8100);
-});
-
-test("only complete native reply notifications acknowledge their exact reply", () => {
-  const ready = { ...task, reply: { id: "reply-1", delivered: false } };
-  const message = {
-    ...replyNotification(ready),
-    role: "custom" as const,
-    timestamp: 0,
-  };
-  expect(deliveredReplies(message)).toEqual([
-    { id: task.id, replyId: "reply-1" },
-  ]);
-  expect(deliveredReplies({ ...message, content: "Only a preview" })).toEqual(
-    [],
-  );
-  expect(deliveredReplies({ ...message, customType: "unrelated" })).toEqual([]);
-  expect(
-    deliveredReplies({ ...message, details: { ...ready, reply: undefined } }),
-  ).toEqual([]);
-  expect(
-    deliveredReplies({ ...message, details: { ...ready, outcome: "error" } }),
-  ).toEqual([]);
-  for (const response of ["x".repeat(20000), "line\n".repeat(110)]) {
-    const clipped = replyNotification({ ...ready, response });
-    expect(clipped.content).toContain("[Truncated; use sub_result");
-    expect(deliveredReplies({ ...message, ...clipped })).toEqual([]);
-  }
-});
-
-test("batches acknowledge each complete answer, not clipped neighbours", () => {
-  const a = { ...task, reply: { id: "reply-a", delivered: false } };
-  const b = {
-    ...a,
-    id: "task-b",
-    response: "line\n".repeat(110),
-    reply: { id: "reply-b", delivered: false },
-  };
-  const c = { ...a, id: "task-c", reply: { id: "reply-c", delivered: false } };
-  const batch = replyBatch([a, b, c])!;
-  const message = { ...batch, role: "custom" as const, timestamp: 0 };
-  expect(batch.details.replies).toHaveLength(3);
-  expect(announcedReplies(batch)).toEqual([
-    { id: a.id, replyId: "reply-a" },
-    { id: b.id, replyId: "reply-b" },
-    { id: c.id, replyId: "reply-c" },
-  ]);
-  expect(deliveredReplies(message)).toEqual([
-    { id: a.id, replyId: "reply-a" },
-    { id: c.id, replyId: "reply-c" },
-  ]);
-  expect(
-    deliveredReplies({ ...message, content: replyNotification(a).content }),
-  ).toEqual([{ id: a.id, replyId: "reply-a" }]);
-  expect(deliveredReplies({ ...message, content: "Only a preview" })).toEqual(
-    [],
-  );
-  expect(announcedReplies({ ...batch, customType: "unrelated" })).toEqual([]);
-  expect(announcedReplies(replyNotification(a))).toEqual([
-    { id: a.id, replyId: "reply-a" },
-  ]);
-});
-
-test("batches are bounded without losing the full reports or silently dropping later replies", () => {
-  const tasks = Array.from({ length: 10 }, (_, n) => ({
-    ...task,
-    id: `task-${n}`,
-    response: "line of results\n".repeat(200),
-    reply: { id: `reply-${n}`, delivered: false },
-  }));
-  const batch = replyBatch(tasks)!;
-  expect(batch.details.replies.length).toBeGreaterThan(1);
-  expect(batch.details.replies.length).toBeLessThan(tasks.length);
-  expect(Buffer.byteLength(batch.content, "utf8")).toBeLessThanOrEqual(24000);
-  expect(batch.content.split("\n").length).toBeLessThanOrEqual(300);
-  expect(batch.details.replies[0]!.response).toBe(tasks[0]!.response);
-  const remaining = tasks.slice(batch.details.replies.length);
-  expect(replyBatch(remaining)!.details.replies[0]!.id).toBe(remaining[0]!.id);
-  expect(replyBatch([])).toBeUndefined();
-});
-
 test("batch previews and expansions render every reply without duplicating answer JSON", () => {
   const batch = replyBatch([
     task,
@@ -167,63 +72,6 @@ test("batch previews and expansions render every reply without duplicating answe
       for (const line of component.render(width))
         expect(visibleWidth(line)).toBeLessThanOrEqual(width);
   }
-});
-
-test("complete tool returns acknowledge replies without accepting tasks", () => {
-  const ready = { ...task, reply: { id: "reply-1", delivered: false } };
-  const message = {
-    role: "toolResult" as const,
-    toolCallId: "call-1",
-    toolName: "sub_result",
-    content: [{ type: "text" as const, text: JSON.stringify(ready, null, 2) }],
-    details: ready,
-    isError: false,
-    timestamp: 0,
-  };
-  expect(deliveredReplies(message)).toEqual([
-    { id: task.id, replyId: "reply-1" },
-  ]);
-  expect(
-    deliveredReplies({
-      ...message,
-      details: { ...ready, extra: "diagnostics" },
-      content: [{ type: "text", text: JSON.stringify(ready) }],
-    }),
-  ).toEqual([{ id: task.id, replyId: "reply-1" }]);
-  expect(
-    deliveredReplies({
-      ...message,
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify({ ...ready, response: "shortened" }),
-        },
-      ],
-    }),
-  ).toEqual([]);
-  expect(deliveredReplies({ ...message, isError: true })).toEqual([]);
-  expect(deliveredReplies({ ...message, toolName: "unrelated" })).toEqual([]);
-  expect(
-    deliveredReplies({
-      ...message,
-      content: [{ type: "text", text: "[Truncated]" }],
-    }),
-  ).toEqual([]);
-  const values = [
-    ready,
-    { ...ready, id: "second", reply: { id: "reply-2", delivered: false } },
-  ];
-  expect(
-    deliveredReplies({
-      ...message,
-      toolName: "sub_control",
-      details: values,
-      content: [{ type: "text", text: JSON.stringify(values, null, 2) }],
-    }),
-  ).toEqual([
-    { id: task.id, replyId: "reply-1" },
-    { id: "second", replyId: "reply-2" },
-  ]);
 });
 
 test("TUI notifications are two-line previews with expandable complete delivery", () => {

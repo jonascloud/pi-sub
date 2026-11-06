@@ -8,11 +8,8 @@ import type { TaskResult, TaskView } from "../src/coordinator.ts";
 import piSub from "../index.ts";
 import * as models from "../src/models.ts";
 import * as modelSetup from "../src/setup.ts";
-import {
-  SUBAGENT_GUIDANCE,
-  replyNotification,
-  replyBatch,
-} from "../src/messages.ts";
+import { SUBAGENT_GUIDANCE } from "../src/messages.ts";
+import { replyNotification, replyBatch } from "../src/replies.ts";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 
 const fake = vi.hoisted(() => ({

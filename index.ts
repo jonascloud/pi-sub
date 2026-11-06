@@ -38,15 +38,13 @@ import { mountWidget, availableWidgetHeight } from "./src/widget.ts";
 import {
   SUBAGENT_GUIDANCE,
   failureSummary,
-  replyBatch,
-  announcedReplies,
-  deliveredReplies,
   renderReply,
   renderFailures,
   renderStopped,
   renderModels,
   routingSummary,
 } from "./src/messages.ts";
+import { pendingReplyBatch, deliveredReplies } from "./src/replies.ts";
 
 const reason = (error: unknown) =>
   error instanceof Error ? error.message : String(error);
@@ -69,35 +67,10 @@ export default function piSub(pi: ExtensionAPI): void {
   const lifetime = new AbortController();
   let idleDelivery: ReturnType<typeof setImmediate> | undefined;
 
-  // The tasks are the inbox. Native history records announcements; complete
-  // context delivery acknowledges replies separately, without accepting tasks.
-  const pendingReplies = (ctx: ExtensionContext, messages?: AgentMessage[]) => {
-    if (lifetime.signal.aborted || !coordinator?.runnable) return [];
-    const replies = coordinator
-      .list()
-      .reverse()
-      .filter(
-        (task) =>
-          task.level !== undefined &&
-          task.status === "ready" &&
-          task.outcome === "reply" &&
-          task.reply &&
-          !task.reply.delivered,
-      );
-    if (!replies.length) return [];
-    const covered = new Set<string>();
-    for (const entry of ctx.sessionManager.getBranch())
-      if (entry.type === "custom_message")
-        for (const reply of announcedReplies(entry)) covered.add(reply.replyId);
-    for (const message of messages ??
-      ctx.sessionManager.buildSessionProjection().messages) {
-      if (message.role === "custom")
-        for (const reply of announcedReplies(message))
-          covered.add(reply.replyId);
-      for (const reply of deliveredReplies(message)) covered.add(reply.replyId);
-    }
-    return replies.filter((task) => !covered.has(task.reply!.id));
-  };
+  const replyBatchFor = (ctx: ExtensionContext, messages?: AgentMessage[]) =>
+    lifetime.signal.aborted || !coordinator?.runnable
+      ? undefined
+      : pendingReplyBatch(coordinator.list(), ctx.sessionManager, messages);
   const scheduleReplies = () => {
     if (idleDelivery || lifetime.signal.aborted || !coordinator?.runnable)
       return;
@@ -114,7 +87,7 @@ export default function piSub(pi: ExtensionAPI): void {
       )
         return;
       try {
-        const batch = replyBatch(pendingReplies(ctx));
+        const batch = replyBatchFor(ctx);
         if (batch) pi.sendMessage(batch, { triggerTurn: !selection?.active });
       } catch (error) {
         notify(
@@ -423,12 +396,10 @@ export default function piSub(pi: ExtensionAPI): void {
     context = ctx;
     if (event.outcome !== "completed" || ctx.signal?.aborted || dialogOpen)
       return;
-    const batch = replyBatch(
-      pendingReplies(ctx, [
-        ...event.context.contextMessages,
-        ...event.context.pendingMessages,
-      ]),
-    );
+    const batch = replyBatchFor(ctx, [
+      ...event.context.contextMessages,
+      ...event.context.pendingMessages,
+    ]);
     if (!batch) return;
     return {
       entries: [
