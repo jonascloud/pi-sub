@@ -100,16 +100,18 @@ export function renderWidget(
     (!tasks.length && !summary.completed && !summary.tokens)
   )
     return [];
+  // Reserve six columns on roomy terminals, reclaiming them below 46 columns.
+  width -= Math.min(6, Math.max(0, width - 40));
   const { shown, hidden, room } = select(tasks, height);
   const columns = [
     {
-      min: 6,
+      min: 5,
       values: shown.map((t) => (t.level == null ? "" : `lvl ${t.level}`)),
     },
     { min: 3, values: shown.map((t) => code(t)) },
-    { min: 6, values: shown.map((t) => `${t.turns}↻`) },
-    { min: 5, values: shown.map((t) => `${t.toolUses}⚒`) },
-    { min: 8, values: shown.map((t) => time(t.elapsedMs)) },
+    { min: 4, values: shown.map((t) => `${t.turns}↻`) },
+    { min: 4, values: shown.map((t) => `${t.toolUses}⚒`) },
+    { min: 4, values: shown.map((t) => time(t.elapsedMs)) },
   ].map((c) => ({
     ...c,
     size: Math.max(c.min, ...c.values.map(visibleWidth)),
@@ -127,19 +129,29 @@ export function renderWidget(
     if (width <= 3) return truncateToWidth(status, width, "");
     const prefix = chrome ? (row === 0 ? "  ┌─ " : "  ├─ ") : "";
     const metadata = columns
-      .map((c, i) => (enabled[i] ? `${pad(c.values[row]!, c.size)} ` : ""))
+      .map((c, i) => {
+        if (!enabled[i]) return "";
+        const value = pad(c.values[row]!, c.size);
+        return `${i === 4 && !active(task) ? theme.fg("dim", value) : value} `;
+      })
       .join("");
     const remaining = Math.max(0, width - visibleWidth(prefix + metadata));
     const description = clean(task.description);
     const currentDetail = detail(task);
-    // Give both identity and useful detail room, but never replace the identity.
-    const detailRoom =
+    // Share space when both texts are long; give unused space to the other.
+    const detailShare =
       currentDetail && remaining >= 23
-        ? Math.min(Math.floor((remaining - 4) / 2), remaining - 15)
+        ? Math.min(
+            visibleWidth(currentDetail),
+            Math.floor((remaining - 4) / 2),
+            remaining - 18,
+          )
         : 0;
-    const descRoom = detailRoom ? remaining - detailRoom - 3 : remaining;
+    const descRoom = detailShare ? remaining - detailShare - 3 : remaining;
+    const title = truncateToWidth(description, descRoom, "…");
+    const detailRoom = detailShare ? remaining - visibleWidth(title) - 3 : 0;
     const tail =
-      theme.bold(truncateToWidth(description, descRoom, "…")) +
+      theme.bold(title) +
       (detailRoom
         ? ` · ${truncateToWidth(currentDetail, detailRoom, "…")}`
         : "");

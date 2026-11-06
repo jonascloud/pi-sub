@@ -62,6 +62,67 @@ describe("widget rendering", () => {
       updated[1]!.indexOf("Second"),
     );
   });
+  it("uses compact metadata and fills a long response up to a six-column right inset", () => {
+    const row = render(
+      [
+        task({
+          description: "Globale Config-Datei",
+          status: "ready",
+          outcome: "reply",
+          turns: 9,
+          toolUses: 21,
+          elapsedMs: 127000,
+          response: "x".repeat(300),
+        }),
+      ],
+      160,
+    )[0]!;
+    expect(row.indexOf("Globale Config-Datei")).toBe(30);
+    expect(row).toContain("lvl 7 rdy   9↻  21⚒ 2:07");
+    expect(visibleWidth(row)).toBe(154);
+    expect(stripTerminalSequences(row).endsWith("…")).toBe(true);
+    expect(
+      render([task({ turns: 999, toolUses: 999 })], 160)[0]!.indexOf(
+        "Investigate",
+      ),
+    ).toBe(30);
+  });
+  it("returns unused detail space to a long task name as well", () => {
+    const row = render(
+      [task({ description: "Investigate ".repeat(30), response: "OK" })],
+      120,
+    )[0]!;
+    const start = row.indexOf("Investigate");
+    const end = row.indexOf(" · OK");
+    expect(end - start).toBeGreaterThan(60);
+    expect(visibleWidth(row)).toBe(114);
+    expect(row.endsWith(" · OK")).toBe(true);
+  });
+  it("dims only frozen elapsed times while active and terminating clocks stay normal", () => {
+    for (const status of ["ready", "paused", "queued", "active"] as const) {
+      const fg = vi.fn((_color: string, text: string) => text);
+      renderWidget(
+        [task({ status })],
+        120,
+        12,
+        { ...theme, fg },
+        { completed: 0, tokens: 21 },
+      );
+      const dimmed = fg.mock.calls
+        .filter(([color]) => color === "dim")
+        .map(([, text]) => text.trim());
+      expect(dimmed).toEqual(status === "active" ? [] : ["1:05"]);
+    }
+    const fg = vi.fn((_color: string, text: string) => text);
+    renderWidget(
+      [task({ operation: "closing" })],
+      120,
+      12,
+      { ...theme, fg },
+      { completed: 0, tokens: 21 },
+    );
+    expect(fg.mock.calls.some(([color]) => color === "dim")).toBe(false);
+  });
   it("preserves useful task identity at 40 columns and adds response when there is room", () => {
     const row = render(
       [
