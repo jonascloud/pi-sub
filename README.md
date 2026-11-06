@@ -88,9 +88,19 @@ In the terminal, Escape also pauses children while the parent is idle; dismissin
 
 No ID means all applicable tasks; `/sub:pause` without an ID is the global interrupt and also aborts the parent. Explicit operator start/continue commands pass through the same failure cleanup before starting work. In RPC mode, use `prompt("/sub:pause")` for a global interrupt while the parent is idle: bare RPC `abort` emits no public extension event in that situation. Active run aborts, retry-backoff aborts and compaction signals are observed through native lifecycle hooks. Pause retains the original task and session. It does not freeze a model request or undo file writes and external side effects. Parent shutdown, reload or session replacement terminates owned executions; it does not restore pending work on restart. Native Pi session files remain under `.pi/pi-sub/sessions` for inspection.
 
+## Views
+
+Native tool rows show the task name and confirmed action or outcome: delegated, queued, instruction updated, response, accepted, paused, resumed or stopped. A reply is not labelled done merely because execution ended. Reads preview the answer; acceptance does not repeat it. A wait timeout is ordinary feedback, not cancellation. Batch actions summarize confirmed results and expose failures rather than claiming universal success.
+
+Expand a row through Pi's configured tool-expansion control to inspect the original request, full response, ID, session path, required minimum level, actual model/thinking, elapsed time and usage counters. Running calls also expose their request when expanded. Tool renderers use native row-local state and support native HTML exports; they do not inspect or restart workers. Model-facing tool content and original usage attribution are unchanged.
+
+Reply notifications, collected failures, stop acknowledgements and model comparisons use matching compact transcript views. Causes remain visible on failures. Full structured reports remain available when expanded; long replies and comparisons come from their preserved metadata without repeating the same proposal inside diagnostic JSON. Normal previews omit IDs, model names and JSON. RPC/print consumers retain structured data rather than TUI formatting.
+
+The non-modal model panel marks drafts as unsaved, labels costs as AA USD/task references and compares changes with the opening snapshot, not a live read of the saved file. Empty-draft and repair warnings take priority over rows when space is limited. Publication errors remain visible; a saving state does not promise that an already committed change can still be cancelled.
+
 ## Widget and usage
 
-The above-editor tree has stable newest-first rows with fixed-width level, short activity, turns, tools and time fields. Tokens appear only in the bottom summary. Task and current detail have priority at narrow widths. Only live tasks have rows. Accepted replies and stopped tasks are removed immediately. Final errors remain visible until the next user-prompt cleanup, then disappear without leaving an open-error counter. Completion totals and tokens survive task removal. Activity includes `thk`, `txt`, `cmd`, `rd`, `rdy`, `pse` (paused), `psg` (pausing), `err` and `stp`.
+The above-editor tree has stable newest-first rows with fixed-width level, short activity, turns, tools and time fields. Tokens appear only in the bottom summary. Task and current detail have priority at narrow widths. Only live tasks have rows. Accepted replies and stopped tasks are removed immediately. Final errors remain visible until the next user-prompt cleanup, then disappear without leaving an open-error counter. Completion totals and tokens survive task removal. Activity includes `thk`, `txt`, `cmd`, `rd`, `rdy`, `pse` (paused), `psg` (pausing), `cls` (closing), `err` and `stp`.
 
 There are no spinners. Visible active elapsed time refreshes every 700 ms; lifecycle changes render immediately. The widget does not poll while idle or fully hidden. There are no worker heartbeats, RPC state queries or settlement handshakes: native events show progress, and process closure ends execution.
 

@@ -15,11 +15,15 @@ type WidgetTheme = Pick<Theme, "fg" | "bold">;
 const active = (task: TaskView) => task.status === "active";
 const clean = (text: string) =>
   stripTerminalSequences(text)
-    .replace(/[\r\n\t\x00-\x1f\x7f]+/g, " ")
+    .replace(/[\r\n\t\x00-\x1f\x7f-\x9f]+/g, " ")
     .trim();
+// Research proposals have their own panel; do not leak its JSON into the task row.
+const detail = (task: TaskView) =>
+  clean(task.error || (task.level === undefined ? "" : task.response));
 const code = (task: TaskView) => {
   if (task.outcome === "error") return "err";
   if (task.operation === "pausing") return "psg";
+  if (task.operation === "closing") return "cls";
   if (task.outcome === "stopped") return "stp";
   if (task.status === "active")
     return clean(task.activity).slice(0, 3) || "thk";
@@ -66,8 +70,12 @@ function counts(items: readonly TaskView[]): string[] {
     ["err", (t) => code(t) === "err"],
     ["pse", (t) => code(t) === "pse"],
     ["psg", (t) => code(t) === "psg"],
+    ["cls", (t) => code(t) === "cls"],
     ["rdy", (t) => code(t) === "rdy"],
-    ["run", (t) => active(t) && !["err", "psg", "stp"].includes(code(t))],
+    [
+      "run",
+      (t) => active(t) && !["err", "psg", "cls", "stp"].includes(code(t)),
+    ],
     ["que", (t) => code(t) === "que"],
     ["stp", (t) => code(t) === "stp"],
   ];
@@ -111,8 +119,7 @@ export function renderWidget(
   const used = () =>
     (chrome ? 5 : 0) +
     columns.reduce((n, c, i) => n + (enabled[i] ? c.size + 1 : 0), 0);
-  const target =
-    shown.some((t) => t.error || t.response) && width >= 35 ? 23 : 12;
+  const target = shown.some((t) => detail(t)) && width >= 35 ? 23 : 12;
   for (const i of [4, 3, 2, 0]) if (used() + target > width) enabled[i] = false;
   if (used() + (target === 23 ? 28 : 12) > width) chrome = false;
   const lines = shown.map((task, row) => {
@@ -124,16 +131,18 @@ export function renderWidget(
       .join("");
     const remaining = Math.max(0, width - visibleWidth(prefix + metadata));
     const description = clean(task.description);
-    const detail = clean(task.error || task.response);
+    const currentDetail = detail(task);
     // Give both identity and useful detail room, but never replace the identity.
     const detailRoom =
-      detail && remaining >= 23
+      currentDetail && remaining >= 23
         ? Math.min(Math.floor((remaining - 4) / 2), remaining - 15)
         : 0;
     const descRoom = detailRoom ? remaining - detailRoom - 3 : remaining;
     const tail =
       theme.bold(truncateToWidth(description, descRoom, "…")) +
-      (detailRoom ? ` · ${truncateToWidth(detail, detailRoom, "…")}` : "");
+      (detailRoom
+        ? ` · ${truncateToWidth(currentDetail, detailRoom, "…")}`
+        : "");
     return truncateToWidth(prefix + metadata + tail, width);
   });
   if (hidden.length && room > shown.length) {

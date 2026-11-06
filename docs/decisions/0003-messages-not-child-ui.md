@@ -16,6 +16,14 @@ Keep operating guidance in one stable system-prompt section and operation-specif
 
 State-dependent actions and consequential warnings remain visible where needed: an uncommitted draft is not active, empty selection disables delegation, and cancellation cannot undo publication. Persistent controls are not repeated chat messages. Dynamic routing facts are grouped rather than repeating identical choices for every level.
 
+## Native views
+
+Use native tool call/result and custom-message renderers, not another screen or UI controller. The widget shows current state; transcript rows show historical actions and observations. Task identity and useful outcomes outrank IDs, execution settings and diagnostic JSON. Expansion exposes full requests, results and metadata without changing the model-facing protocol.
+
+Tool requests use action labels until a result exists; only confirmed outcomes use past-tense success labels. Keeping the outcome in the result renderer also works with native HTML exports, which render requests before their results. A self-rendered tool shell prevents an ordinary observation timeout from inheriting the native error background. Physical pausing/closing and any failure cause remain distinguishable. Unknown batch progress is not presented as complete success.
+
+Model proposals stay explicitly unsaved. Comparisons refer to the opening baseline; publication remains the existing optimistic transaction. Display does not grant approval, infer semantic completion, collect tasks or manage processes.
+
 ## Rationale and consequences
 
 Print mode does not wrap its no-op UI with observable dialog events. Unlike the earlier RPC bridge, the coordinator cannot diagnose every UI attempt. It uses native safe defaults rather than claiming universal interception.

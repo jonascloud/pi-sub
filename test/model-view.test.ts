@@ -21,6 +21,7 @@ describe("model selection panel", () => {
     const lines = renderModelSelection(view, 140).join("\n");
     expect(lines).toContain("DRAFT 2 — not saved");
     expect(lines).toContain("AA reference USD/task");
+    expect(lines.split("\n")[0]!.length).toBeLessThan(80);
     expect(lines).toContain("test/new:low · $0.2 · changed");
     expect(lines).toContain("test/new:medium · unknown · new");
     expect(lines).toContain("test/old:high · removed");
@@ -61,5 +62,93 @@ describe("model selection panel", () => {
     expect(
       renderModelSelection({ ...view, draft: {} }, 140).join("\n"),
     ).toContain("delegation disabled if accepted");
+  });
+  it("does not claim a saved ladder before one exists or a draft was committed", () => {
+    const requested = renderModelSelection(
+      { phase: "working", revision: 1, paused: false },
+      160,
+    ).join("\n");
+    expect(requested).toContain("Preparing");
+    expect(requested).not.toContain("saved ladder");
+    const researching = {
+      phase: "working" as const,
+      revision: 1,
+      paused: false,
+      id: "research",
+    };
+    expect(renderModelSelection(researching, 160).join("\n")).toContain(
+      "Researching · no saved ladder at start",
+    );
+    expect(
+      renderModelSelection({ ...researching, current: view.current }, 160).join(
+        "\n",
+      ),
+    ).toContain("Researching · saved-at-start ladder");
+    const broken = renderModelSelection(
+      { ...researching, currentError: "bad JSON", paused: true },
+      160,
+    ).join("\n");
+    expect(broken).toContain("Paused · saved-at-start file needs repair");
+    expect(broken).not.toContain("Paused · saved ladder");
+    const saving = renderModelSelection({ ...view, phase: "saving" }, 160).join(
+      "\n",
+    );
+    expect(saving).not.toContain("not yet saved"); // Publication can precede completion of storage cleanup.
+    expect(saving).toContain("cancel before commit");
+  });
+  it("retains repair and empty-draft warnings ahead of rows even at minimum height", () => {
+    const critical = {
+      ...view,
+      draft: {},
+      currentError: "invalid JSON " + "x".repeat(500),
+    };
+    for (const height of [1, 2, 3, 4, 5, 12]) {
+      const lines = renderModelSelection(critical, 120, height);
+      const text = lines.join("\n");
+      expect(lines.length).toBeLessThanOrEqual(height);
+      expect(text).toMatch(/repair/i);
+      expect(text).toMatch(/empty draft/i);
+      expect(text).toContain("delegation disabled if accepted");
+      for (const line of lines)
+        expect(visibleWidth(line)).toBeLessThanOrEqual(120);
+    }
+    // Removed rows used to push the empty-draft consequence out of the panel.
+    expect(
+      renderModelSelection({ ...view, draft: {} }, 120, 3).join("\n"),
+    ).toContain("delegation disabled if accepted");
+  });
+  it("shows a saved empty ladder as disabled while research or a replacement draft is pending", () => {
+    for (const pending of [
+      {
+        ...view,
+        current: {},
+        draft: undefined,
+        phase: "working" as const,
+        id: "research",
+      },
+      { ...view, current: {} },
+    ]) {
+      expect(renderModelSelection(pending, 180).join("\n")).toContain(
+        "Empty saved-at-start ladder — delegation disabled in baseline",
+      );
+      expect(renderModelSelection(pending, 180, 1).join("\n")).toContain(
+        "EMPTY saved-at-start ladder — delegation disabled in baseline",
+      );
+    }
+  });
+  it("keeps reference costs distinct from spending and sanitizes panel text", () => {
+    const unsafe = "\x1b]8;;https://evil.test\x07visible\x1b]8;;\x07\x07\b";
+    const lines = renderModelSelection(
+      {
+        ...view,
+        currentError: unsafe,
+        draft: { "6": { model: unsafe, cost: 0 } },
+      },
+      160,
+    ).join("\n");
+    expect(lines).toContain("AA reference USD/task");
+    expect(lines).toContain("visible · $0");
+    expect(lines).not.toMatch(/actual spend|spent|\x1b|\x07|\x08/);
+    expect(lines).not.toContain("evil.test");
   });
 });

@@ -5,7 +5,10 @@ import {
 import type { SetupView } from "./setup.ts";
 
 const clean = (text: string) =>
-  stripTerminalSequences(text).replace(/\s+/g, " ").trim();
+  stripTerminalSequences(text)
+    .replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
 const cost = (value: number | null) =>
   value === null
     ? "unknown"
@@ -18,25 +21,35 @@ export function renderModelSelection(
   height = 12,
 ): string[] {
   if (!view || width < 1 || height < 1) return [];
+  // SetupView.current is the opening snapshot, not a live read of the file.
+  const saved = view.currentError
+    ? "saved-at-start file needs repair"
+    : view.current !== undefined
+      ? "saved-at-start ladder"
+      : "no saved ladder at start";
   const phase =
     view.phase === "review"
       ? `DRAFT ${view.revision} — not saved`
       : view.phase === "saving"
-        ? "Saving"
+        ? `Saving draft ${view.revision}`
         : view.paused
-          ? "Paused · saved ladder"
+          ? `Paused · ${saved}`
           : view.id
-            ? "Researching · saved ladder"
+            ? `Researching · ${saved}`
             : "Preparing";
-  const lines = [`Model selection · ${phase} · AA reference USD/task`];
+  const lines = [`Model ladder · ${phase} · AA reference USD/task`];
+  const warnings: string[] = [];
   const content: string[] = [];
   if (view.currentError)
-    content.push(`Saved file needs repair: ${clean(view.currentError)}`);
-  const ladder = view.draft ?? view.current ?? {};
+    warnings.push(
+      `Saved file needs repair (at start): ${clean(view.currentError)}`,
+    );
+  const draft = view.phase === "working" ? undefined : view.draft;
+  const ladder = draft ?? view.current ?? {};
   const levels = [
     ...new Set([
       ...Object.keys(ladder),
-      ...Object.keys(view.draft ? (view.current ?? {}) : {}),
+      ...Object.keys(draft ? (view.current ?? {}) : {}),
     ]),
   ].sort((a, b) => Number(a) - Number(b));
   for (const level of levels) {
@@ -46,7 +59,7 @@ export function renderModelSelection(
       content.push(`lvl ${level}  ${clean(previous!.model)} · removed`);
       continue;
     }
-    const change = !view.draft
+    const change = !draft
       ? ""
       : !previous
         ? " · new"
@@ -57,10 +70,15 @@ export function renderModelSelection(
       `lvl ${level}  ${clean(entry.model)} · ${cost(entry.cost)}${change}`,
     );
   }
-  if (view.draft && !Object.keys(view.draft).length)
-    content.push("Empty draft — delegation disabled if accepted.");
-  else if (!levels.length && view.phase !== "working")
-    content.push("Empty ladder — delegation disabled.");
+  const emptyDraft = draft !== undefined && !Object.keys(draft).length;
+  const emptySaved =
+    view.current !== undefined && !Object.keys(view.current).length;
+  if (emptyDraft)
+    warnings.push("Empty draft — delegation disabled if accepted.");
+  else if (emptySaved)
+    warnings.push(
+      "Empty saved-at-start ladder — delegation disabled in baseline.",
+    );
   const footer =
     view.phase === "saving"
       ? "cancel before commit"
@@ -71,14 +89,35 @@ export function renderModelSelection(
           : view.paused
             ? "Refine to resume · cancel"
             : "Refine by prompt · cancel";
-  if (height === 1) return [truncateToWidth(lines[0]!, width)];
+  // Warnings outrank rows and actions. In a tiny panel keep all critical states
+  // together, rather than letting removed rows bury an empty draft or repair.
+  const critical = [
+    view.currentError ? "REPAIR needed at start" : "",
+    emptyDraft ? "EMPTY draft — delegation disabled if accepted" : "",
+    !emptyDraft && emptySaved
+      ? "EMPTY saved-at-start ladder — delegation disabled in baseline"
+      : "",
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  if (height === 1)
+    return [
+      truncateToWidth(critical ? `${critical} · ${phase}` : lines[0]!, width),
+    ];
   const room = Math.max(0, height - 2);
-  if (content.length <= room) lines.push(...content);
-  else if (room > 0) {
-    lines.push(...content.slice(0, room - 1));
-    lines.push(
-      `+${content.length - room + 1} rows · full draft and comparison in transcript`,
-    );
+  if (warnings.length > room) {
+    if (room === 0) lines[0] = `${critical} · ${phase}`;
+    else lines.push(critical);
+  } else {
+    lines.push(...warnings);
+    const rows = room - warnings.length;
+    if (content.length <= rows) lines.push(...content);
+    else if (rows > 0) {
+      lines.push(...content.slice(0, rows - 1));
+      lines.push(
+        `+${content.length - rows + 1} rows · full draft and comparison in transcript`,
+      );
+    }
   }
   lines.push(footer);
   return lines.map((line) => truncateToWidth(line, width));

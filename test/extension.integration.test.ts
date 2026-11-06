@@ -152,7 +152,7 @@ async function latestResult(client: RpcClient) {
 
 /** Real parent Pi + real child Pi; only the model provider is synthetic. */
 test("bootstraps, delegates, accepts and reports original child usage once", async () => {
-  const { client, dispose } = await host();
+  const { client, dispose, cwd } = await host();
   try {
     await client.promptAndWait("integration:delegate", undefined, 20000);
     const messages = await client.getMessages();
@@ -168,6 +168,21 @@ test("bootstraps, delegates, accepts and reports original child usage once", asy
     const stats = await client.getSessionStats();
     expect(stats.cost).toBe(stats.assistantMessages * 10 + 20); // setup + task
     expect(stats.tokens.input).toBe(stats.assistantMessages * 10 + 20);
+    const exported = await client.exportHtml(join(cwd, "views.html"));
+    const html = await readFile(exported.path, "utf8");
+    const embedded =
+      /<script id="session-data" type="application\/json">([^<]+)<\/script>/.exec(
+        html,
+      );
+    expect(embedded).not.toBeNull();
+    const exportedData = JSON.parse(
+      Buffer.from(embedded![1]!, "base64").toString("utf8"),
+    );
+    const rendered = JSON.stringify(exportedData.renderedTools);
+    expect(rendered.includes("Delegated")).toBe(true);
+    expect(rendered.includes("Accepted")).toBe(true);
+    expect(rendered.includes("Required level:")).toBe(true);
+    expect(rendered.includes("Delegating…")).toBe(false);
     await client.promptAndWait("integration:repeat", undefined, 20000);
     const repeated = await client.getSessionStats();
     expect(repeated.cost).toBe(repeated.assistantMessages * 10 + 20);

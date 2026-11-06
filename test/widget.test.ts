@@ -38,6 +38,11 @@ const render = (
 ) => renderWidget(tasks, width, height, theme, summary);
 
 describe("widget rendering", () => {
+  it("shows confirmed process closure in progress rather than apparent thinking", () => {
+    const row = render([task({ operation: "closing" })])[0]!;
+    expect(row).toContain("cls");
+    expect(row).not.toContain("thk");
+  });
   it("uses a bottom-rooted tree and aligned, expanding metadata", () => {
     const rows = render([
       task({ turns: 1000000 }),
@@ -140,6 +145,20 @@ describe("widget rendering", () => {
     expect(rows[1]).toContain("+2");
     expect(rows[0]).not.toContain("token");
     expect(rows[0]).not.toContain("model");
+  });
+  it("leaves research JSON in its own panel but retains genuine failure causes", () => {
+    const proposal = task({
+      level: undefined,
+      response: '{"ladder":{"6":{"model":"test/m:off"}}}',
+      status: "ready",
+      outcome: "reply",
+    });
+    expect(render([proposal], 120).join("\n")).not.toContain("ladder");
+    const failed = render(
+      [{ ...proposal, outcome: "error", error: "Invalid proposal" }],
+      120,
+    ).join("\n");
+    expect(failed).toContain("Invalid proposal");
   });
   it("shows paused and reply states", () => {
     expect(render([task({ status: "paused" })])[0]).toContain("pse");

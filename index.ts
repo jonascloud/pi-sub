@@ -29,12 +29,16 @@ import {
   type SetupView,
 } from "./src/setup.ts";
 import { renderModelSelection } from "./src/model-view.ts";
+import { taskToolRenderers } from "./src/tool-view.ts";
 import { mountWidget, availableWidgetHeight } from "./src/widget.ts";
 import {
   SUBAGENT_GUIDANCE,
   failureSummary,
   replyNotification,
   renderReply,
+  renderFailures,
+  renderStopped,
+  renderModels,
   routingSummary,
 } from "./src/messages.ts";
 
@@ -45,6 +49,9 @@ export default function piSub(pi: ExtensionAPI): void {
   // Children load normal Pi resources, but must not recursively install their coordinator.
   if (process.env.PI_SUB_CHILD === "1") return;
   pi.registerMessageRenderer("pi-sub:response", renderReply);
+  pi.registerMessageRenderer("pi-sub:failures", renderFailures);
+  pi.registerMessageRenderer("pi-sub:stopped", renderStopped);
+  pi.registerMessageRenderer("pi-sub:models", renderModels);
   let context: ExtensionContext | undefined;
   let coordinator: Coordinator | undefined;
   let unmount: (() => void) | undefined;
@@ -56,7 +63,10 @@ export default function piSub(pi: ExtensionAPI): void {
   const lifetime = new AbortController();
 
   const notify = (text: string, type: "info" | "error" = "info") => {
-    text = stripTerminalSequences(text);
+    text = stripTerminalSequences(text).replace(
+      /[\x00-\x08\x0b-\x1f\x7f-\x9f]/g,
+      "",
+    );
     if (lifetime.signal.aborted) return;
     if (context?.hasUI) context.ui.notify(text, type);
     else if (type === "error") console.error(text);
@@ -71,7 +81,7 @@ export default function piSub(pi: ExtensionAPI): void {
       onReady(task) {
         if (lifetime.signal.aborted || task.level === undefined) return;
         if (task.outcome === "error") {
-          notify(`${task.description} (${task.id}): ${task.error}`, "error");
+          notify(`${task.description} · failed\n${task.error}`, "error");
           return;
         }
         if (!coordinator?.runnable) return;
@@ -470,6 +480,7 @@ export default function piSub(pi: ExtensionAPI): void {
                   .filter((task) => task.status === "paused");
             for (const task of tasks) authorized(task.id, ctx);
             for (const task of tasks) await manager().continue(task.id);
+            if (!tasks.length) notify("No paused tasks.");
           }
           if (action === "stop") {
             const results = await Promise.all(
@@ -486,9 +497,11 @@ export default function piSub(pi: ExtensionAPI): void {
                   customType: "pi-sub:stopped",
                   display: true,
                   content: JSON.stringify(results, null, 2),
+                  details: results,
                 },
                 { triggerTurn: false },
               );
+            else notify("No tasks to stop.");
           }
         } catch (error) {
           notify(reason(error), "error");
@@ -500,6 +513,7 @@ export default function piSub(pi: ExtensionAPI): void {
   pi.registerTool(
     defineTool({
       name: "sub_task",
+      ...taskToolRenderers("sub_task"),
       label: "Subagent",
       exposure: "model-only",
       executionMode: "sequential",
@@ -549,6 +563,7 @@ export default function piSub(pi: ExtensionAPI): void {
   pi.registerTool(
     defineTool({
       name: "sub_message",
+      ...taskToolRenderers("sub_message"),
       label: "Message subagent",
       exposure: "model-only",
       executionMode: "sequential",
@@ -574,6 +589,7 @@ export default function piSub(pi: ExtensionAPI): void {
   pi.registerTool(
     defineTool({
       name: "sub_result",
+      ...taskToolRenderers("sub_result"),
       label: "Subagent response",
       exposure: "model-only",
       executionMode: "sequential",
@@ -612,6 +628,7 @@ export default function piSub(pi: ExtensionAPI): void {
   pi.registerTool(
     defineTool({
       name: "sub_control",
+      ...taskToolRenderers("sub_control"),
       label: "Control subagent",
       exposure: "model-only",
       executionMode: "sequential",

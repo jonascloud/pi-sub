@@ -2,6 +2,7 @@ import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import type {
   ExtensionAPI,
   ExtensionContext,
+  ToolRenderers,
 } from "@earendil-works/pi-coding-agent";
 import type { TaskResult, TaskView } from "../src/coordinator.ts";
 import piSub from "../index.ts";
@@ -17,6 +18,7 @@ const fake = vi.hoisted(() => ({
   interrupt: vi.fn<() => Promise<void>>(),
   onReady: undefined as ((task: TaskView) => void) | undefined,
   start: vi.fn(),
+  stop: vi.fn(),
 }));
 vi.mock("../src/coordinator.ts", () => ({
   Coordinator: class {
@@ -32,6 +34,7 @@ vi.mock("../src/coordinator.ts", () => ({
     prompt = fake.prompt;
     interrupt = fake.interrupt;
     start = fake.start;
+    stop = fake.stop;
     get = () => ({ id: "new-task" });
     drainUsage = () => undefined;
     list = () => [];
@@ -50,6 +53,7 @@ beforeEach(() => {
   fake.interrupted = false;
   fake.runnable = true;
   fake.start.mockReset().mockReturnValue("new-task");
+  fake.stop.mockReset();
   fake.prompt.mockReset().mockResolvedValue(true);
   fake.interrupt.mockReset().mockImplementation(async () => {
     fake.interrupted = true;
@@ -68,9 +72,13 @@ function setup(mode = "rpc") {
   >();
   const tools = new Map<
     string,
-    { description: string; execute: (...args: any[]) => Promise<any> }
+    ToolRenderers & {
+      description: string;
+      execute: (...args: any[]) => Promise<any>;
+    }
   >();
   const sendMessage = vi.fn();
+  const registerMessageRenderer = vi.fn();
   const notify = vi.fn();
   const abort = vi.fn();
   let terminalInput: ((data: string) => unknown) | undefined;
@@ -94,7 +102,7 @@ function setup(mode = "rpc") {
       handlers.set(name, handler),
     registerCommand: (name: string, command: any) =>
       commands.set(name, command),
-    registerMessageRenderer: vi.fn(),
+    registerMessageRenderer,
     registerTool: (tool: {
       name: string;
       description: string;
@@ -116,6 +124,7 @@ function setup(mode = "rpc") {
     sendMessage,
     notify,
     abort,
+    registerMessageRenderer,
     key: (data: string) => terminalInput!(data),
   };
 }
@@ -133,6 +142,38 @@ const failure: TaskResult = {
   outcome: "error",
   error: "worker exited",
 };
+
+test("every subagent tool and transcript message has a native renderer", () => {
+  const { tools, registerMessageRenderer } = setup();
+  for (const tool of tools.values()) {
+    expect(tool.renderCall).toBeTypeOf("function");
+    expect(tool.renderResult).toBeTypeOf("function");
+  }
+  expect(
+    registerMessageRenderer.mock.calls.map(([name]) => name).sort(),
+  ).toEqual([
+    "pi-sub:failures",
+    "pi-sub:models",
+    "pi-sub:response",
+    "pi-sub:stopped",
+  ]);
+});
+
+test("operator stop preserves machine-readable content and supplies presentation metadata", async () => {
+  const { commands, ctx, sendMessage } = setup();
+  const report = { ...failure, outcome: "stopped" };
+  fake.stop.mockResolvedValue(report);
+  await commands.get("sub:stop")!.handler("failed", ctx);
+  expect(sendMessage).toHaveBeenCalledWith(
+    {
+      customType: "pi-sub:stopped",
+      display: true,
+      content: JSON.stringify([report], null, 2),
+      details: [report],
+    },
+    { triggerTurn: false },
+  );
+});
 
 test.each(["interactive", "rpc"])(
   "%s input delegates cleanup and forwards its report without a model turn",
