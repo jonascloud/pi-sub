@@ -30,7 +30,7 @@ function reply(context) {
     );
     return {
       text: JSON.stringify({
-        version: 1,
+        version: 2,
         methodVersion: 1,
         generatedAt: new Date().toISOString(),
         approved,
@@ -46,7 +46,6 @@ function reply(context) {
             retrievedAt: new Date().toISOString(),
             rationale:
               "Synthetic evidence for local integration tests, not a real model assessment.",
-            selected: thinking === "off",
           })),
         ),
       }),
@@ -59,6 +58,7 @@ function reply(context) {
     if (
       [
         "integration:delegate",
+        "integration:probe-global",
         "integration:pause",
         "integration:failure",
         "integration:retry",

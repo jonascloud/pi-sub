@@ -99,6 +99,9 @@ export class Coordinator {
   get interrupted() {
     return this.suspended;
   }
+  get interruptEpoch() {
+    return this.epoch;
+  }
   get runnable() {
     return !this.disposed && !this.suspended && !this.preparing;
   }

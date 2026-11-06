@@ -15,6 +15,7 @@ import {
 import {
   catalogPath,
   describeLevels,
+  hasEvidence,
   loadCatalog,
   REFERENCE_COST,
   selectExecution,
@@ -165,6 +166,18 @@ export default function piSub(pi: ExtensionAPI): void {
         "The retained execution is no longer approved or available. Stop this subagent instead.",
       );
     }
+    if (task.level !== undefined) {
+      const rating = loadCatalog(catalogPath()).candidates.find(
+        (candidate) =>
+          candidate.provider === execution.provider &&
+          candidate.model === execution.model &&
+          candidate.thinking === execution.thinking,
+      );
+      if (!rating || !hasEvidence(rating) || rating.power < task.level)
+        throw new Error(
+          "The retained execution no longer meets the task's minimum level. Stop this subagent instead.",
+        );
+    }
   };
   const authorized = (id: string, ctx: ExtensionContext) =>
     authorizeTask(manager().get(id), ctx);
@@ -245,7 +258,7 @@ export default function piSub(pi: ExtensionAPI): void {
     let table: string;
     try {
       const approved = approvedModels(ctx);
-      const catalog = loadCatalog(catalogPath(ctx.cwd));
+      const catalog = loadCatalog(catalogPath());
       const self = catalog.candidates.find(
         (candidate) =>
           candidate.provider === ctx.model?.provider &&
@@ -284,7 +297,7 @@ export default function piSub(pi: ExtensionAPI): void {
 
   pi.registerCommand("sub:models", {
     description:
-      "Research and build capabilities for Pi's scoped models (or only the current model when unscoped).",
+      "Update global model ratings for Pi's scoped models (or only the current model when unscoped).",
     handler: async (_args, ctx) => {
       try {
         checkContext(ctx);
@@ -299,25 +312,26 @@ export default function piSub(pi: ExtensionAPI): void {
         if (!getSupportedThinkingLevels(model).includes(thinking))
           throw new Error("Unsupported setup thinking level.");
         settingUp = true;
+        let sessionDir: string;
         try {
           if (!(await preparePrompt())) {
             settingUp = false;
             return;
           }
+          sessionDir = await workerDirectory(ctx.cwd);
         } catch (error) {
           settingUp = false;
           throw error;
         }
         void setupModels({
           coordinator: manager(),
-          cwd: ctx.cwd,
           worker: {
             cwd: ctx.cwd,
             provider: model.provider,
             model: model.id,
             thinking,
             name: "pi-sub model setup",
-            sessionDir: workerDirectory(ctx.cwd),
+            sessionDir,
             args: ["--approve"],
           },
           approved: () => approvedModels(context ?? ctx),
@@ -329,11 +343,11 @@ export default function piSub(pi: ExtensionAPI): void {
           },
         })
           .then((result) => {
-            notify(`Model catalog activated: ${result.path}`);
+            notify(`Global model ratings updated: ${result.path}`);
             pi.sendMessage({
               customType: "pi-sub:models",
               display: true,
-              content: `Model catalog activated with ${result.catalog.candidates.filter((candidate) => candidate.selected).length} selected variants. Original setup usage will be reported with the next subagent tool result.`,
+              content: `Global model ratings updated: ${result.path}. ${result.catalog.candidates.filter(hasEvidence).length} variants have complete evidence. Current Pi availability and scope still govern routing; ratings grant no authorization. Original setup usage will be reported with the next subagent tool result.`,
             });
           })
           .catch((error) =>
@@ -420,10 +434,12 @@ export default function piSub(pi: ExtensionAPI): void {
           signal?.throwIfAborted();
           const approved = approvedModels(ctx);
           const execution = selectExecution(
-            loadCatalog(catalogPath(ctx.cwd)),
+            loadCatalog(catalogPath()),
             args.level,
             approved,
           );
+          const sessionDir = await workerDirectory(ctx.cwd);
+          signal?.throwIfAborted();
           const id = manager().start({
             prompt: args.prompt,
             description: args.description || args.prompt.slice(0, 80),
@@ -432,7 +448,7 @@ export default function piSub(pi: ExtensionAPI): void {
               ...execution,
               cwd: ctx.cwd,
               name: args.description || "Pi subagent",
-              sessionDir: workerDirectory(ctx.cwd),
+              sessionDir,
               args: ["--approve"],
             },
           });

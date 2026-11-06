@@ -1,6 +1,8 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import { readFileSync } from "node:fs";
-import { mkdir, open, rename, unlink } from "node:fs/promises";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { lock } from "proper-lockfile";
+import { readFileSync, renameSync } from "node:fs";
+import { mkdir, open, unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 
@@ -27,19 +29,17 @@ export interface Candidate {
   source?: string;
   retrievedAt?: string;
   rationale: string;
-  selected: boolean;
 }
 export interface Catalog {
-  version: 1;
+  version: 2;
   methodVersion: 1;
   generatedAt: string;
-  approved: ApprovedModel[];
   candidates: Candidate[];
 }
 export const METHOD_VERSION = 1;
 export const REFERENCE_COST = 0.07141741932294249;
-export const catalogPath = (cwd: string): string =>
-  join(cwd, ".pi", "pi-sub", "models.json");
+export const catalogPath = (): string =>
+  join(getAgentDir(), "pi-sub", "models.json");
 const levels = new Set<string>([
   "off",
   "minimal",
@@ -104,27 +104,15 @@ function tuples(approved: readonly ApprovedModel[]): Set<string> {
     ),
   );
 }
-export function validateCatalog(
-  value: unknown,
-  approved: readonly ApprovedModel[],
-): Catalog {
+export function validateCatalog(value: unknown): Catalog {
   const o = object(value, [
     "version",
     "methodVersion",
     "generatedAt",
-    "approved",
     "candidates",
   ]);
-  if (o.version !== 1 || o.methodVersion !== METHOD_VERSION)
+  if (o.version !== 2 || o.methodVersion !== METHOD_VERSION)
     throw new Error("Unsupported catalog version");
-  const snapshot = approvedModels(o.approved),
-    expected = tuples(approvedModels(approved));
-  const allowed = tuples(snapshot);
-  if (
-    allowed.size !== expected.size ||
-    [...allowed].some((k) => !expected.has(k))
-  )
-    throw new Error("Approved snapshot does not match approved models");
   if (!Array.isArray(o.candidates)) throw new Error("Invalid candidates");
   const seen = new Set<string>();
   const candidates: Candidate[] = o.candidates.map((entry: unknown) => {
@@ -138,23 +126,18 @@ export function validateCatalog(
       "source",
       "retrievedAt",
       "rationale",
-      "selected",
     ]);
     const provider = str(c.provider, "provider"),
       model = str(c.model, "model"),
       t = thinking(c.thinking);
     const key = identity(provider, model, t);
-    if (!allowed.has(key))
-      throw new Error("Unapproved or unsupported candidate");
     if (seen.has(key)) throw new Error("Duplicate candidate");
     seen.add(key);
-    if (typeof c.selected !== "boolean") throw new Error("Invalid selected");
     const result: Candidate = {
       provider,
       model,
       thinking: t,
       rationale: str(c.rationale, "rationale"),
-      selected: c.selected,
     };
     if (c.power !== undefined) {
       if (
@@ -189,36 +172,79 @@ export function validateCatalog(
       result.source = source;
     }
     if (c.retrievedAt !== undefined) result.retrievedAt = date(c.retrievedAt);
-    if (
-      result.selected &&
-      (result.power === undefined ||
-        result.cost === undefined ||
-        result.score === undefined ||
-        !result.source ||
-        !result.retrievedAt)
-    )
-      throw new Error("Selected candidate requires complete evidence");
     return result;
   });
-  if (seen.size !== allowed.size)
-    throw new Error("Missing approved candidate coverage");
   return {
-    version: 1,
+    version: 2,
     methodVersion: 1,
     generatedAt: date(o.generatedAt),
-    approved: snapshot,
     candidates,
   };
 }
-export function parseCatalog(
+export function parseProposal(
   text: string,
   approved: readonly ApprovedModel[],
 ): Catalog {
   let body = text.trim();
   const fence = /^```json[ \t]*\r?\n([\s\S]*?)\r?\n```$/i.exec(body);
   if (fence) body = fence[1];
-  return validateCatalog(JSON.parse(body), approved);
+  const proposal = object(JSON.parse(body), [
+    "version",
+    "methodVersion",
+    "generatedAt",
+    "approved",
+    "candidates",
+  ]);
+  const expected = tuples(approvedModels(approved));
+  const snapshot = tuples(approvedModels(proposal.approved));
+  if (
+    !expected.size ||
+    expected.size !== snapshot.size ||
+    [...snapshot].some((key) => !expected.has(key))
+  )
+    throw new Error("Approved snapshot does not match approved models");
+  const { approved: _snapshot, ...raw } = proposal;
+  const catalog = validateCatalog(raw);
+  if (
+    catalog.candidates.length !== expected.size ||
+    catalog.candidates.some(
+      (c) => !expected.has(identity(c.provider, c.model, c.thinking)),
+    )
+  )
+    throw new Error("Missing approved candidate coverage or foreign candidate");
+  return catalog;
 }
+type EvidencedCandidate = Candidate &
+  Required<
+    Pick<Candidate, "power" | "cost" | "score" | "source" | "retrievedAt">
+  >;
+
+export function hasEvidence(
+  candidate: Candidate,
+): candidate is EvidencedCandidate {
+  if (
+    [
+      candidate.power,
+      candidate.cost,
+      candidate.score,
+      candidate.source,
+      candidate.retrievedAt,
+    ].some((value) => value === undefined)
+  )
+    return false;
+  try {
+    validateCatalog({
+      version: 2,
+      methodVersion: METHOD_VERSION,
+      generatedAt: candidate.retrievedAt,
+      candidates: [candidate],
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function selectExecution(
   catalog: Catalog,
   level: number,
@@ -227,14 +253,13 @@ export function selectExecution(
   if (!Number.isInteger(level) || level < 1 || level > 10)
     throw new Error("Level must be an integer from 1 to 10");
   const allowed = tuples(approved);
-  const eligible = catalog.candidates.filter(
-    (c) =>
-      c.selected &&
-      c.power !== undefined &&
-      c.power >= level &&
-      c.cost !== undefined &&
-      allowed.has(identity(c.provider, c.model, c.thinking)),
-  );
+  const eligible = catalog.candidates
+    .filter(hasEvidence)
+    .filter(
+      (c) =>
+        c.power >= level &&
+        allowed.has(identity(c.provider, c.model, c.thinking)),
+    );
   const cmp = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
   eligible.sort(
     (a, b) =>
@@ -247,7 +272,7 @@ export function selectExecution(
   const c = eligible[0];
   if (!c)
     throw new Error(
-      `No approved selected execution available for level ${level}; run /sub:models to refresh`,
+      `No approved evidenced execution available for level ${level}; run /sub:models to refresh`,
     );
   return {
     provider: c.provider,
@@ -279,36 +304,72 @@ export function loadCatalog(path: string): Catalog {
       throw new Error("Model catalog missing; run /sub:models");
     throw e;
   }
-  const raw: unknown = JSON.parse(text);
-  const snapshot = object(raw, [
-    "version",
-    "methodVersion",
-    "generatedAt",
-    "approved",
-    "candidates",
-  ]).approved;
-  return validateCatalog(raw, approvedModels(snapshot));
+  return validateCatalog(JSON.parse(text));
 }
 export async function saveCatalog(
   path: string,
-  catalog: Catalog,
+  update: Catalog,
   beforeCommit?: () => void,
-): Promise<void> {
-  const valid = validateCatalog(catalog, catalog.approved);
-  const data = JSON.stringify(valid, null, 2) + "\n";
-  await mkdir(dirname(path), { recursive: true });
+): Promise<Catalog> {
+  const valid = validateCatalog(update);
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  try {
+    const ignore = await open(join(dirname(path), ".gitignore"), "wx", 0o600);
+    try {
+      await ignore.writeFile("*\n", "utf8");
+    } finally {
+      await ignore.close();
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  }
+  const release = await lock(path, {
+    realpath: false,
+    retries: { retries: 12, factor: 1, minTimeout: 100, maxTimeout: 100 },
+  });
   const temp = join(dirname(path), `.${randomUUID()}.tmp`);
   try {
+    let current: Catalog | undefined;
+    try {
+      // Only a missing file is a new catalog; invalid existing data must survive.
+      current = validateCatalog(JSON.parse(readFileSync(path, "utf8")));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    const candidates = new Map(
+      current?.candidates.map((c) => [
+        identity(c.provider, c.model, c.thinking),
+        c,
+      ]),
+    );
+    for (const c of valid.candidates)
+      candidates.set(identity(c.provider, c.model, c.thinking), c);
+    const merged: Catalog = {
+      ...valid,
+      generatedAt:
+        current &&
+        Date.parse(current.generatedAt) > Date.parse(valid.generatedAt)
+          ? current.generatedAt
+          : valid.generatedAt,
+      candidates: [...candidates.values()],
+    };
     const file = await open(temp, "wx", 0o600);
     try {
-      await file.writeFile(data, "utf8");
+      await file.writeFile(JSON.stringify(merged, null, 2) + "\n", "utf8");
     } finally {
       await file.close();
     }
     beforeCommit?.();
-    await rename(temp, path);
-  } catch (error) {
-    await unlink(temp).catch(() => {});
-    throw error;
+    // Keep final approval/cancellation verification and publication in one JS turn.
+    renameSync(temp, path);
+    return merged;
+  } finally {
+    try {
+      await unlink(temp).catch((error: NodeJS.ErrnoException) => {
+        if (error.code !== "ENOENT") throw error;
+      });
+    } finally {
+      await release();
+    }
   }
 }

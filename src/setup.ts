@@ -1,11 +1,11 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Coordinator } from "./coordinator.ts";
 import {
   catalogPath,
-  parseCatalog,
+  parseProposal,
   saveCatalog,
   type ApprovedModel,
   type Catalog,
@@ -59,19 +59,19 @@ function snapshot(models: readonly ApprovedModel[]): string {
 
 export interface SetupOptions {
   coordinator: Coordinator;
-  cwd: string;
   worker: WorkerOptions;
   approved: () => ApprovedModel[];
   signal?: AbortSignal;
   onStarted?: (id: string) => void;
 }
 
-/** Research is an ordinary supervised task; only a validated complete proposal replaces the catalog. */
+/** Research updates only its reviewed tuples in the profile's global catalog. */
 export async function setupModels(
   options: SetupOptions,
 ): Promise<{ id: string; catalog: Catalog; path: string }> {
   options.signal?.throwIfAborted();
-  const approved = options.approved();
+  const path = catalogPath();
+  const approved = structuredClone(options.approved());
   if (!approved.length)
     throw new Error(
       "No approved models are available. Select a model or configure /scoped-models first.",
@@ -80,15 +80,6 @@ export async function setupModels(
     new URL("../instructions/model-capabilities.md", import.meta.url),
     "utf8",
   );
-  options.signal?.throwIfAborted();
-  const directory = dirname(catalogPath(options.cwd));
-  await mkdir(directory, { recursive: true, mode: 0o700 });
-  await writeFile(join(directory, ".gitignore"), "*\n", {
-    flag: "wx",
-    mode: 0o600,
-  }).catch((error) => {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-  });
   options.signal?.throwIfAborted();
   const id = options.coordinator.start({
     description: "Build model capabilities",
@@ -106,22 +97,27 @@ export async function setupModels(
     )
       throw new Error(task.error ?? "Setup stopped or failed.");
     response = task.response;
-    const catalog = parseCatalog(response, approved);
-    if (!catalog.candidates.some((candidate) => candidate.selected))
-      throw new Error("Research produced no supported, evidenced selection.");
+    const proposal = parseProposal(response, approved);
+    const epoch = options.coordinator.interruptEpoch;
     const verify = () => {
       options.signal?.throwIfAborted();
+      if (
+        options.coordinator.interrupted ||
+        options.coordinator.interruptEpoch !== epoch
+      )
+        throw new Error("Model setup interrupted before catalog commit.");
+      const current = options.coordinator.get(id);
+      if (current.status !== "ready" || current.outcome !== "reply")
+        throw new Error("Model setup stopped before catalog commit.");
       if (snapshot(approved) !== snapshot(options.approved()))
         throw new Error(
           "Model approval changed during research; run /sub:models again.",
         );
     };
     verify();
-    // Accept the captured response and original usage before activating the proposal.
+    // Keep the ready task controllable while waiting for the global write lock.
+    const catalog = await saveCatalog(path, proposal, verify);
     await options.coordinator.collect(id);
-    verify();
-    const path = catalogPath(options.cwd);
-    await saveCatalog(path, catalog, verify);
     return { id, catalog, path };
   } catch (error) {
     try {
@@ -132,11 +128,19 @@ export async function setupModels(
     }
     const reason = error instanceof Error ? error.message : String(error);
     throw new Error(
-      `${reason}${response ? `\nResearch response: ${response.slice(0, 1600)}` : ""}\nPrevious catalog was not replaced.`,
+      `${reason}${response ? `\nResearch response: ${response.slice(0, 1600)}` : ""}\nGlobal catalog: ${path}. Invalid or interrupted research is not committed; inspect the catalog before retrying a storage error.`,
     );
   }
 }
 
-export function workerDirectory(cwd: string): string {
-  return join(cwd, ".pi", "pi-sub", "sessions");
+export async function workerDirectory(cwd: string): Promise<string> {
+  const directory = join(cwd, ".pi", "pi-sub");
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  await writeFile(join(directory, ".gitignore"), "*\n", {
+    flag: "wx",
+    mode: 0o600,
+  }).catch((error) => {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  });
+  return join(directory, "sessions");
 }

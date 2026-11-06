@@ -5,6 +5,8 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import type { TaskResult, TaskView } from "../src/coordinator.ts";
 import piSub from "../index.ts";
+import * as models from "../src/models.ts";
+import * as modelSetup from "../src/setup.ts";
 
 const fake = vi.hoisted(() => ({
   interrupted: false,
@@ -13,6 +15,7 @@ const fake = vi.hoisted(() => ({
     vi.fn<(deliver: (failures: TaskResult[]) => void) => Promise<boolean>>(),
   interrupt: vi.fn<() => Promise<void>>(),
   onReady: undefined as ((task: TaskView) => void) | undefined,
+  start: vi.fn(),
 }));
 vi.mock("../src/coordinator.ts", () => ({
   Coordinator: class {
@@ -27,16 +30,23 @@ vi.mock("../src/coordinator.ts", () => ({
     }
     prompt = fake.prompt;
     interrupt = fake.interrupt;
+    start = fake.start;
+    get = () => ({ id: "new-task" });
+    drainUsage = () => undefined;
   },
 }));
 vi.mock("../src/widget.ts", () => ({ mountWidget: () => () => {} }));
 
-afterEach(() => vi.unstubAllEnvs());
+afterEach(() => {
+  vi.unstubAllEnvs();
+  vi.restoreAllMocks();
+});
 
 beforeEach(() => {
   vi.stubEnv("PI_SUB_CHILD", "");
   fake.interrupted = false;
   fake.runnable = true;
+  fake.start.mockReset().mockReturnValue("new-task");
   fake.prompt.mockReset().mockResolvedValue(true);
   fake.interrupt.mockReset().mockImplementation(async () => {
     fake.interrupted = true;
@@ -52,6 +62,10 @@ function setup(mode = "rpc") {
   const commands = new Map<
     string,
     { handler: (args: string, ctx: ExtensionContext) => Promise<void> }
+  >();
+  const tools = new Map<
+    string,
+    { execute: (...args: any[]) => Promise<any> }
   >();
   const sendMessage = vi.fn();
   const notify = vi.fn();
@@ -75,7 +89,10 @@ function setup(mode = "rpc") {
       handlers.set(name, handler),
     registerCommand: (name: string, command: any) =>
       commands.set(name, command),
-    registerTool: vi.fn(),
+    registerTool: (tool: {
+      name: string;
+      execute: (...args: any[]) => Promise<any>;
+    }) => tools.set(tool.name, tool),
     sendMessage,
   } as unknown as ExtensionAPI);
   const emit = (type: string, fields: Record<string, unknown> = {}) => {
@@ -88,6 +105,7 @@ function setup(mode = "rpc") {
     ctx,
     emit,
     commands,
+    tools,
     sendMessage,
     notify,
     abort,
@@ -129,6 +147,50 @@ test.each(["interactive", "rpc"])(
     );
   },
 );
+
+test("cancellation during runtime directory preparation never admits an orphan task", async () => {
+  const { ctx, tools } = setup();
+  vi.spyOn(modelSetup, "approvedModels").mockReturnValue([
+    { provider: "test", model: "fake", thinking: ["off"] },
+  ]);
+  vi.spyOn(models, "loadCatalog").mockReturnValue({
+    version: 2,
+    methodVersion: 1,
+    generatedAt: "2026-01-01T00:00:00Z",
+    candidates: [
+      {
+        provider: "test",
+        model: "fake",
+        thinking: "off",
+        power: 6,
+        cost: 0.1,
+        score: 30,
+        source: "https://example.com/test",
+        retrievedAt: "2026-01-01T00:00:00Z",
+        rationale: "Test evidence",
+      },
+    ],
+  });
+  const directory = Promise.withResolvers<string>();
+  const prepare = vi
+    .spyOn(modelSetup, "workerDirectory")
+    .mockReturnValue(directory.promise);
+  const controller = new AbortController();
+  const pending = tools
+    .get("sub_task")!
+    .execute(
+      "call",
+      { level: 3, prompt: "brief" },
+      controller.signal,
+      () => {},
+      ctx,
+    );
+  expect(prepare).toHaveBeenCalledOnce();
+  controller.abort();
+  directory.resolve("/fixture/.pi/pi-sub/sessions");
+  expect(await pending).toMatchObject({ isError: true });
+  expect(fake.start).not.toHaveBeenCalled();
+});
 
 test("extension input neither sweeps failures nor reopens admission", async () => {
   const { emit, sendMessage } = setup();

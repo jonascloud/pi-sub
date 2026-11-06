@@ -24,10 +24,14 @@ async function eventually<T>(
   } while (Date.now() < deadline);
   throw last;
 }
-async function host(env: Record<string, string> = {}) {
+async function host(
+  env: Record<string, string> = {},
+  profile?: string,
+  research = true,
+) {
   const cwd = await mkdtemp(join(tmpdir(), "pi-sub-extension-"));
-  const agentDir = join(cwd, "agent");
-  await mkdir(agentDir);
+  const agentDir = profile ?? join(cwd, "agent");
+  await mkdir(agentDir, { recursive: true });
   await writeFile(
     join(agentDir, "settings.json"),
     JSON.stringify({
@@ -67,18 +71,21 @@ async function host(env: Record<string, string> = {}) {
         (command) => command.name === "sub:models",
       ),
     ).toBe(true);
-    expect(await client.prompt("/sub:models")).toBe("handled");
+    if (research) expect(await client.prompt("/sub:models")).toBe("handled");
     await eventually(async () => {
       const catalog = JSON.parse(
-        await readFile(join(cwd, ".pi/pi-sub/models.json"), "utf8"),
+        await readFile(join(agentDir, "pi-sub/models.json"), "utf8"),
       );
+      expect(catalog.version).toBe(2);
+      expect(catalog).not.toHaveProperty("approved");
+      expect(catalog.candidates.length).toBeGreaterThan(0);
       expect(
-        catalog.candidates.filter(
-          (candidate: { selected: boolean }) => candidate.selected,
+        catalog.candidates.every(
+          (candidate: object) => !("selected" in candidate),
         ),
-      ).toHaveLength(1);
+      ).toBe(true);
     });
-    return { client, marker, dispose };
+    return { client, marker, dispose, cwd, agentDir };
   } catch (error) {
     await dispose();
     throw error;
@@ -162,6 +169,41 @@ test("bootstraps, delegates, accepts and reports original child usage once", asy
   }
 }, 60000);
 
+test("two working directories share profile ratings and never load a local override or fallback", async () => {
+  const first = await host();
+  let second: Awaited<ReturnType<typeof host>> | undefined;
+  try {
+    second = await host({}, first.agentDir, false);
+    const local = join(second.cwd, ".pi/pi-sub/models.json");
+    await mkdir(join(second.cwd, ".pi/pi-sub"), { recursive: true });
+    await writeFile(local, "not a catalog");
+    await second.client.promptAndWait("integration:delegate", undefined, 20000);
+    expect(await latestResult(second.client)).toMatchObject({
+      outcome: "reply",
+    });
+    expect(
+      await readFile(join(second.cwd, ".pi/pi-sub/.gitignore"), "utf8"),
+    ).toBe("*\n");
+    const global = join(first.agentDir, "pi-sub/models.json");
+    await writeFile(local, await readFile(global));
+    await rm(global);
+    await second.client.promptAndWait(
+      "integration:probe-global",
+      undefined,
+      20000,
+    );
+    const result = (await second.client.getMessages()).findLast(
+      (message) =>
+        message.role === "toolResult" && message.toolName === "sub_task",
+    );
+    expect(result).toMatchObject({ isError: true });
+    expect(JSON.stringify(result)).toContain("run /sub:models");
+  } finally {
+    await second?.dispose();
+    await first.dispose();
+  }
+}, 60000);
+
 test("a real user prompt collects a final failure without a model cleanup call", async () => {
   const { client, dispose } = await host();
   const failed = nextEvent(client, (event) => {
@@ -240,6 +282,32 @@ test("RPC abort during native retry backoff interrupts the children", async () =
     expect(await latestResult(client)).toMatchObject({ status: "paused" });
   } finally {
     retry.dispose();
+    await dispose();
+  }
+}, 60000);
+
+test("a global reassessment cannot resume a retained execution below its minimum level", async () => {
+  const { client, marker, agentDir, dispose } = await host({
+    WORKER_TEST_SLOW_CHILD: "1",
+  });
+  try {
+    await client.promptAndWait("integration:pause", undefined, 20000);
+    await eventually(() => readFile(marker));
+    expect(await client.prompt("/sub:pause")).toBe("handled");
+    const path = join(agentDir, "pi-sub/models.json");
+    const catalog = JSON.parse(await readFile(path, "utf8"));
+    for (const candidate of catalog.candidates) candidate.power = 2;
+    await writeFile(path, JSON.stringify(catalog));
+    await client.promptAndWait("integration:continue", undefined, 20000);
+    const result = (await client.getMessages()).findLast(
+      (message) =>
+        message.role === "toolResult" && message.toolName === "sub_control",
+    );
+    expect(result).toMatchObject({ isError: true });
+    expect(JSON.stringify(result)).toContain("minimum level");
+    await client.promptAndWait("integration:inspect", undefined, 20000);
+    expect(await latestResult(client)).toMatchObject({ status: "paused" });
+  } finally {
     await dispose();
   }
 }, 60000);

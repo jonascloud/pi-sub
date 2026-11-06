@@ -27,11 +27,17 @@ The command starts a research subagent using that exact execution, without needi
 
 Research needs web/search tools configured in the child's normal Pi environment. It gathers existing comparable benchmark evidence; it does not run paid benchmark calls against candidate models. The research subagent itself uses your configured model and may incur normal usage costs.
 
-The [versioned assessment instructions](instructions/model-capabilities.md) define evidence, calibration and selection. They contain historical calibration anchors and a fixed comparison baseline, **not a bundled runtime model catalog**. Power is a reviewed estimate, not a success guarantee. Missing evidence must remain missing. Every approved thinking variant is retained in the proposal, even when excluded from routing.
+The [versioned assessment instructions](instructions/model-capabilities.md) define evidence and calibration. They contain historical calibration anchors and a fixed comparison baseline, **not a bundled runtime model catalog**. Power is a reviewed estimate, not a success guarantee. Missing evidence must remain missing. Every approved thinking variant is retained in the proposal, even when excluded from routing.
 
-A complete validated proposal atomically replaces `<cwd>/.pi/pi-sub/models.json`. Failed or interrupted research leaves the old catalog in place. Paused research can be continued; shutdown or an explicit stop cancels it. If approval changes during research, the proposal is refused. Run the same command after models, model scope or the methodology change. Ordinary delegation never researches or invents missing catalog values.
+Ratings live in **`<agent-dir>/pi-sub/models.json`**, normally `~/.pi/agent/pi-sub/models.json`. Pi's `PI_CODING_AGENT_DIR` selects a different profile. This is separate from native `settings.json` and `models.json`. There are **no project overrides or local fallbacks**; the previous project-local catalog is never loaded automatically.
 
-Generated evidence is local and subject to its original source terms. Keep it out of public repositories unless redistribution rights have been reviewed. Setup creates a local `.pi/pi-sub/.gitignore` before research so newly generated catalogs and sessions are ignored by default; it does not alter existing ignore files.
+A complete validated proposal updates only the reviewed provider/model/thinking tuples, preserving unrelated global ratings. Commits are atomic and locked across Pi processes. A negative reassessment replaces the old rating rather than silently retaining unsupported evidence. Invalid research, changed approval or cancellation before commit preserves existing ratings. Paused research can be continued; shutdown or an explicit stop cancels it. Ordinary delegation never researches or invents missing values.
+
+The global catalog stores assessments, not authorization or a selected model pool. Each delegation filters complete evidence through current Pi availability and scope, then picks the cheapest execution meeting the minimum level. An expensive variant remains usable when cheaper alternatives are not approved. The same authorization and minimum-strength checks apply before each retained task executes again.
+
+Generated evidence remains private and subject to its original source terms. Keep it out of public repositories unless redistribution rights have been reviewed. Catalog writes create `<agent-dir>/pi-sub/.gitignore`; task admission separately creates `<cwd>/.pi/pi-sub/.gitignore` for project-local session artifacts. Existing ignore files are never overwritten.
+
+When upgrading from a project-local version-1 catalog, explicitly validate and convert the trusted ratings to schema 2, removing historical `approved` and `selected` fields. Complete assessments remain usable even if formerly unselected. Do not automatically import catalogs from repositories. Schema version 2 retains assessment method 1 and its fixed scale; different methods are not merged.
 
 ## Parent tools
 
@@ -40,7 +46,7 @@ Generated evidence is local and subject to its original source terms. Keep it ou
 | `sub_task`    | Start a bounded task with required `level` (integer 1–10) and `prompt`; optional `description`. Returns its ID immediately.                                                                                                        |
 | `sub_message` | Send `{ id, message }`: stop active execution, wait for termination, then start a fresh process on the same session with the correction. Also updates queued work or answers/resumes a retained response.                          |
 | `sub_result`  | Inspect `{ id }` without removing it. Optional `wait` and timeout in seconds observe only. `finish: true` accepts a final reply and removes the task; its process has already exited. A small receipt supports repeated retrieval. |
-| `sub_control` | Explicit `{ action: "pause"                                                                                                                                                                                                        | "continue" | "stop", id? }`; omit ID to control all applicable tasks. |
+| `sub_control` | Explicit action `pause`, `continue` or `stop`, with optional `id`; omit it to control all applicable tasks.                                                                                                                        |
 
 ```text
 sub_task({ level: 3, prompt: "Inspect the authentication entry points without modifying files.", description: "Review auth" })

@@ -7,6 +7,10 @@ settings:
 importers:
 
   .:
+    dependencies:
+      proper-lockfile:
+        specifier: 4.1.2
+        version: 4.1.2
     devDependencies:
       '@earendil-works/pi-agent-core':
         specifier: 1.5.0
@@ -23,6 +27,9 @@ importers:
       '@types/node':
         specifier: ^22.15.3
         version: 22.20.5
+      '@types/proper-lockfile':
+        specifier: 4.1.4
+        version: 4.1.4
       prettier:
         specifier: ^3.9.10
         version: 3.9.10
@@ -357,6 +364,9 @@ packages:
 
   '@types/node@22.20.5':
     resolution: {integrity: sha512-U2+DNr+wSjpsTS/wZGYHq7GcwfuSmKiKvoPvK22zwTlRhU91yOniN4qRR5KhIjvif7ysw/dz/hKmfDH0Ris4aA==}
+
+  '@types/proper-lockfile@4.1.4':
+    resolution: {integrity: sha512-uo2ABllncSqg9F1D4nugVl9v93RmjxF6LJzQLMLDdPaXCUIDPeOJ21Gbqi43xNKzBi/WQ0Q0dICqufzQbMjipQ==}
 
   '@types/retry@0.12.0':
     resolution: {integrity: sha512-wWKOClTTiizcZhXnPY4wikVAwmdYHp8q6DmC+EJUzAMsycb7HB32Kh9RN4+0gExjmPmZSAQjgURXIGATPegAvA==}
@@ -1392,6 +1402,10 @@ snapshots:
   '@types/node@22.20.5':
     dependencies:
       undici-types: 6.21.0
+
+  '@types/proper-lockfile@4.1.4':
+    dependencies:
+      '@types/retry': 0.12.0
 
   '@types/retry@0.12.0': {}
 
