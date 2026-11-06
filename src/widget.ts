@@ -9,28 +9,21 @@ import {
   type Component,
   type TUI,
 } from "@earendil-works/pi-tui";
-import type { Coordinator, TaskView } from "./coordinator.ts";
+import type { Coordinator, Summary, TaskView } from "./coordinator.ts";
 
 type WidgetTheme = Pick<Theme, "fg" | "bold">;
-const active = (task: TaskView) =>
-  ["starting", "running", "pausing"].includes(task.status);
+const active = (task: TaskView) => task.status === "active";
 const clean = (text: string) =>
   stripTerminalSequences(text)
     .replace(/[\r\n\t\x00-\x1f\x7f]+/g, " ")
     .trim();
 const code = (task: TaskView) => {
-  if (task.status === "error" || task.error) return "err";
-  if (task.status === "running")
+  if (task.outcome === "error") return "err";
+  if (task.operation === "pausing") return "psg";
+  if (task.outcome === "stopped") return "stp";
+  if (task.status === "active")
     return clean(task.activity).slice(0, 3) || "thk";
-  return {
-    queued: "que",
-    starting: "thk",
-    ready: "rdy",
-    pausing: "psg",
-    paused: "pse",
-    error: "err",
-    closed: "stp",
-  }[task.status];
+  return { queued: "que", ready: "rdy", paused: "pse" }[task.status];
 };
 const time = (ms: number) => {
   const s = Math.floor(Math.max(0, ms) / 1000);
@@ -43,18 +36,16 @@ const tokenCount = (n: number) =>
 const pad = (s: string, n: number) =>
   " ".repeat(Math.max(0, n - visibleWidth(s))) + s;
 
-const collapsed = (t: TaskView) =>
-  t.collected && t.status === "closed" && !t.error;
 const priority = (t: TaskView) =>
-  t.error || t.status === "error"
+  t.outcome === "error"
     ? 0
     : t.status === "paused"
       ? 1
-      : t.status === "pausing"
+      : t.operation === "pausing"
         ? 2
         : 3;
 function select(tasks: readonly TaskView[], height: number) {
-  const rows = tasks.filter((t) => !collapsed(t));
+  const rows = tasks;
   const room = Math.max(0, Math.min(12, height) - 1);
   const capacity = rows.length > room && room > 1 ? room - 1 : room;
   const selected = new Set(
@@ -72,16 +63,13 @@ function select(tasks: readonly TaskView[], height: number) {
 }
 function counts(items: readonly TaskView[]): string[] {
   const statuses: [string, (t: TaskView) => boolean][] = [
-    ["err", (t) => !!t.error || t.status === "error"],
-    ["pse", (t) => !t.error && t.status === "paused"],
-    ["psg", (t) => !t.error && t.status === "pausing"],
-    ["rdy", (t) => !t.error && t.status === "ready"],
-    [
-      "run",
-      (t) => !t.error && (t.status === "running" || t.status === "starting"),
-    ],
-    ["que", (t) => !t.error && t.status === "queued"],
-    ["stp", (t) => !t.error && t.status === "closed" && !collapsed(t)],
+    ["err", (t) => code(t) === "err"],
+    ["pse", (t) => code(t) === "pse"],
+    ["psg", (t) => code(t) === "psg"],
+    ["rdy", (t) => code(t) === "rdy"],
+    ["run", (t) => active(t) && !["err", "psg", "stp"].includes(code(t))],
+    ["que", (t) => code(t) === "que"],
+    ["stp", (t) => code(t) === "stp"],
   ];
   return statuses.flatMap(([label, matches]) => {
     const n = items.filter(matches).length;
@@ -94,10 +82,16 @@ export function renderWidget(
   width: number,
   height: number,
   theme: WidgetTheme,
+  summary: Summary,
 ): string[] {
   width = Math.max(0, Math.floor(width));
   height = Math.max(0, Math.min(12, Math.floor(height)));
-  if (!width || !height || !tasks.length) return [];
+  if (
+    !width ||
+    !height ||
+    (!tasks.length && !summary.completed && !summary.tokens)
+  )
+    return [];
   const { shown, hidden, room } = select(tasks, height);
   const columns = [
     {
@@ -154,17 +148,15 @@ export function renderWidget(
       ),
     );
   }
-  const done = tasks.filter(collapsed).length;
-  const tokens = tasks.reduce((sum, t) => sum + t.tokens, 0);
+  const totals = summary.completed ? [`${summary.completed} done`] : [];
   const rootOnly = room === 0;
   const parts = rootOnly
-    ? [
-        ...counts(hidden),
-        ...(done ? [`${done} done`] : []),
-        tokenCount(tokens),
-        "pi-sub",
-      ]
-    : ["──┴─ pi-sub", ...(done ? [`${done} done`] : []), tokenCount(tokens)];
+    ? [...counts(hidden), ...totals, tokenCount(summary.tokens), "pi-sub"]
+    : [
+        tasks.length ? "──┴─ pi-sub" : "pi-sub",
+        ...totals,
+        tokenCount(summary.tokens),
+      ];
   let root = parts[0] ?? "pi-sub";
   for (const part of parts.slice(1)) {
     const next = `${root} · ${part}`;
@@ -211,7 +203,7 @@ function available(tui: TUI, component: Component, width: number): number {
 
 export function mountWidget(
   ui: ExtensionUIContext,
-  coordinator: Pick<Coordinator, "list" | "subscribe">,
+  coordinator: Pick<Coordinator, "list" | "summary" | "subscribe">,
 ): () => void {
   let disposed = false;
   let stop = () => {};
@@ -243,7 +235,13 @@ export function mountWidget(
           visible = height > 0 && width > 0;
           const tasks = coordinator.list();
           updateTimer(tasks);
-          return renderWidget(tasks, width, height, ui.theme);
+          return renderWidget(
+            tasks,
+            width,
+            height,
+            ui.theme,
+            coordinator.summary(),
+          );
         },
         invalidate() {},
         dispose() {

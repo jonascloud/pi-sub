@@ -19,6 +19,7 @@ export interface WorkerOptions {
 export type WorkerEvent =
   | JsonAgentSessionEvent
   | { type: "worker_error"; error: string }
+  | { type: "worker_state"; idle: boolean }
   | { type: "worker_queue_cleared"; steering: string[]; followUp: string[] };
 export interface WorkerReport {
   text: string;
@@ -27,7 +28,7 @@ export interface WorkerReport {
 }
 export interface Worker {
   start(): Promise<void>;
-  send(message: string): Promise<void>;
+  send(message: string): Promise<"started" | "queued">;
   pause(): Promise<{ steering: string[]; followUp: string[] }>;
   report(): Promise<WorkerReport>;
   close(): Promise<void>;
@@ -78,6 +79,9 @@ export function createWorker(options: WorkerOptions): Worker {
   let closing: Promise<void> | undefined;
   let heartbeat: ReturnType<typeof setTimeout> | undefined;
   let active = false;
+  let stateVersion = 0;
+  let settled = false;
+  let checking = Promise.resolve();
   let rejectInterrupted!: (error: Error) => void;
   const interrupted = new Promise<never>((_, reject) => {
     rejectInterrupted = reject;
@@ -110,7 +114,9 @@ export function createWorker(options: WorkerOptions): Worker {
     stopHeartbeat();
     emit({ type: "worker_error", error: failure.message });
     rejectInterrupted(failure);
-    void close();
+    void close().catch(() => {
+      /* The owner retries closure and retains the process slot on failure. */
+    });
   };
   const beat = () => {
     if (!active || closed || failure) return;
@@ -133,14 +139,47 @@ export function createWorker(options: WorkerOptions): Worker {
       return;
     }
     if (event.type === "agent_start") {
+      stateVersion++;
+      settled = false;
       if (!active) {
         active = true;
         beat();
       }
     }
-    if (event.type === "agent_settled") stopHeartbeat();
+    if (event.type === "agent_settled") {
+      stateVersion++;
+      settled = true;
+      void verifyState().catch(fail);
+    }
     emit(event);
   });
+  // Awaited extension hooks can reorder run events. Verify actual session state
+  // instead of treating a settlement hint as proof of quiescence.
+  function verifyState(): Promise<void> {
+    const verified = checking.then(async () => {
+      for (;;) {
+        const version = stateVersion;
+        const state = await guarded(client.getState());
+        if (closed || failure) throw failure ?? new Error("Worker is closed");
+        if (version !== stateVersion) continue;
+        sessionFile = state.sessionFile ?? sessionFile;
+        const idle =
+          settled &&
+          !state.isStreaming &&
+          !state.isCompacting &&
+          !state.pendingMessageCount;
+        if (idle) stopHeartbeat();
+        else if (!active) {
+          active = true;
+          beat();
+        }
+        emit({ type: "worker_state", idle });
+        return;
+      }
+    });
+    checking = verified.catch(() => {});
+    return verified;
+  }
   function close(): Promise<void> {
     if (closing) return closing;
     closed = true;
@@ -153,12 +192,18 @@ export function createWorker(options: WorkerOptions): Worker {
     closing = (async () => {
       if (starting) await starting.catch(() => {});
       await client.stop();
-    })();
+    })().catch((error) => {
+      closing = undefined;
+      throw error;
+    });
     return closing;
   }
-  async function failedReport(): Promise<WorkerReport> {
+  async function savedReport(): Promise<WorkerReport> {
     await close();
-    if (!sessionFile || !existsSync(sessionFile)) throw failure;
+    if (!sessionFile || !existsSync(sessionFile))
+      throw (
+        failure ?? new Error("Worker is closed; no persisted report available")
+      );
     const session = SessionManager.open(sessionFile);
     const usage = aggregateUsage(session.getEntries());
     const message = session
@@ -206,7 +251,7 @@ export function createWorker(options: WorkerOptions): Worker {
     },
     async send(message) {
       check();
-      // Let Pi choose atomically: start when idle, steer when busy (including compaction/retry).
+      // Pi atomically starts idle sessions or queues input in an existing run.
       const disposition = await guarded(
         client.prompt(message, undefined, "steer"),
       );
@@ -215,6 +260,11 @@ export function createWorker(options: WorkerOptions): Worker {
         throw new Error(
           "Worker input was handled without starting or queuing a run",
         );
+      // A start before ACK can belong to an older retry. Always obtain a fresh
+      // post-ACK snapshot, even when another verification is already in flight.
+      await verifyState();
+      check();
+      return disposition;
     },
     async pause() {
       check();
@@ -238,7 +288,7 @@ export function createWorker(options: WorkerOptions): Worker {
       }
     },
     async report() {
-      if (failure) return failedReport();
+      if (failure || closed) return savedReport();
       check();
       let snapshot;
       try {
@@ -251,10 +301,10 @@ export function createWorker(options: WorkerOptions): Worker {
         );
       } catch (error) {
         if (!closed) fail(error);
-        if (failure) return failedReport();
+        if (failure) return savedReport();
         throw error;
       }
-      if (failure) return failedReport();
+      if (failure) return savedReport();
       check();
       const [text, state, { entries }] = snapshot;
       if (state.isStreaming || state.isCompacting)

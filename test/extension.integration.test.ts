@@ -2,10 +2,29 @@ import { expect, test } from "vitest";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { RpcClient, getPackageDir } from "@earendil-works/pi-coding-agent";
+import {
+  RpcClient,
+  getPackageDir,
+  type JsonAgentSessionEvent,
+} from "@earendil-works/pi-coding-agent";
 
-/** Real parent Pi + real child Pi; only the model provider is synthetic. */
-test("loads the extension, bootstraps a catalog and attributes child usage exactly once", async () => {
+async function eventually<T>(
+  read: () => Promise<T>,
+  timeout = 15000,
+): Promise<T> {
+  const deadline = Date.now() + timeout;
+  let last: unknown;
+  do {
+    try {
+      return await read();
+    } catch (error) {
+      last = error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 30));
+  } while (Date.now() < deadline);
+  throw last;
+}
+async function host(env: Record<string, string> = {}) {
   const cwd = await mkdtemp(join(tmpdir(), "pi-sub-extension-"));
   const agentDir = join(cwd, "agent");
   await mkdir(agentDir);
@@ -13,8 +32,15 @@ test("loads the extension, bootstraps a catalog and attributes child usage exact
     join(agentDir, "settings.json"),
     JSON.stringify({
       extensions: [resolve("test/fixtures/provider.js"), resolve("index.ts")],
+      retry: {
+        enabled: true,
+        maxRetries: 2,
+        baseDelayMs: 10000,
+        maxDelayMs: 10000,
+      },
     }),
   );
+  const marker = join(cwd, "child-started");
   const client = new RpcClient({
     cliPath: join(getPackageDir(), "dist/cli.js"),
     cwd,
@@ -25,8 +51,14 @@ test("loads the extension, bootstraps a catalog and attributes child usage exact
       PI_CODING_AGENT_DIR: agentDir,
       PI_SUB_CHILD: "",
       WORKER_TEST_INTEGRATION: "1",
+      WORKER_TEST_CHILD_MARKER: marker,
+      ...env,
     },
   });
+  const dispose = async () => {
+    await client.stop();
+    await rm(cwd, { recursive: true, force: true });
+  };
   try {
     await client.start();
     await client.getState();
@@ -36,90 +68,197 @@ test("loads the extension, bootstraps a catalog and attributes child usage exact
       ),
     ).toBe(true);
     expect(await client.prompt("/sub:models")).toBe("handled");
-    const path = join(cwd, ".pi/pi-sub/models.json");
-    const deadline = Date.now() + 20000;
-    let catalog: { candidates: { selected: boolean }[] } | undefined;
-    while (Date.now() < deadline) {
-      try {
-        catalog = JSON.parse(await readFile(path, "utf8"));
-        break;
-      } catch {
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
-    }
-    expect(catalog, client.getStderr()).toBeDefined();
-    expect(
-      catalog!.candidates.filter((candidate) => candidate.selected),
-    ).toHaveLength(1);
+    await eventually(async () => {
+      const catalog = JSON.parse(
+        await readFile(join(cwd, ".pi/pi-sub/models.json"), "utf8"),
+      );
+      expect(
+        catalog.candidates.filter(
+          (candidate: { selected: boolean }) => candidate.selected,
+        ),
+      ).toHaveLength(1);
+    });
+    return { client, marker, dispose };
+  } catch (error) {
+    await dispose();
+    throw error;
+  }
+}
+function nextEvent(
+  client: RpcClient,
+  matches: (event: JsonAgentSessionEvent) => boolean,
+) {
+  const result = Promise.withResolvers<void>();
+  const timer = setTimeout(
+    () => result.reject(new Error("Expected native event did not arrive")),
+    15000,
+  );
+  const unsubscribe = client.onEvent((event) => {
+    if (matches(event)) result.resolve();
+  });
+  void result.promise.catch(() => {});
+  return {
+    promise: result.promise,
+    dispose: () => {
+      clearTimeout(timer);
+      unsubscribe();
+    },
+  };
+}
+async function latestResult(client: RpcClient) {
+  const result = (await client.getMessages()).findLast(
+    (message) =>
+      message.role === "toolResult" && message.toolName === "sub_result",
+  );
+  if (!result || result.role !== "toolResult")
+    throw new Error("Missing sub_result");
+  expect(result.isError).toBe(false);
+  return JSON.parse(result.content.find((part) => part.type === "text")!.text);
+}
 
+/** Real parent Pi + real child Pi; only the model provider is synthetic. */
+test("bootstraps, delegates, accepts and reports original child usage once", async () => {
+  const { client, dispose } = await host();
+  try {
     await client.promptAndWait("integration:delegate", undefined, 20000);
     const messages = await client.getMessages();
-    const results = messages.filter((message) => message.role === "toolResult");
     expect(
-      results.some(
+      messages.some(
         (message) =>
           message.role === "toolResult" &&
           message.toolName === "sub_task" &&
           !message.isError,
       ),
     ).toBe(true);
-    const final = results.find(
-      (message) =>
-        message.role === "toolResult" && message.toolName === "sub_result",
-    );
-    expect(final && final.role === "toolResult" && final.isError).toBe(false);
+    expect(await latestResult(client)).toMatchObject({ outcome: "reply" });
     const stats = await client.getSessionStats();
-    // One setup child + one task child, plus the parent's own synthetic responses.
-    expect(stats.cost).toBe(stats.assistantMessages * 10 + 20);
+    expect(stats.cost).toBe(stats.assistantMessages * 10 + 20); // setup + task
     expect(stats.tokens.input).toBe(stats.assistantMessages * 10 + 20);
-
     await client.promptAndWait("integration:repeat", undefined, 20000);
     const repeated = await client.getSessionStats();
     expect(repeated.cost).toBe(repeated.assistantMessages * 10 + 20);
 
-    const created = Promise.withResolvers<void>();
-    const timer = setTimeout(
-      () => created.reject(new Error("Parent did not create the child")),
-      10000,
+    const created = nextEvent(
+      client,
+      (event) =>
+        event.type === "tool_execution_end" && event.toolName === "sub_task",
     );
-    const unsubscribe = client.onEvent((event) => {
-      if (event.type === "tool_execution_end" && event.toolName === "sub_task")
-        created.resolve();
-    });
     try {
       await client.prompt("integration:pause");
       await created.promise;
       await client.abort();
     } finally {
-      clearTimeout(timer);
-      unsubscribe();
+      created.dispose();
     }
     await client.promptAndWait("integration:inspect", undefined, 20000);
-    const pausedResult = (await client.getMessages()).findLast(
-      (message) =>
-        message.role === "toolResult" && message.toolName === "sub_result",
-    );
-    if (!pausedResult || pausedResult.role !== "toolResult")
-      throw new Error("Missing paused response");
-    const paused = JSON.parse(
-      pausedResult.content.find((part) => part.type === "text")!.text,
-    );
-    expect(paused.status).toBe("paused"); // A new parent prompt did not resume the child.
+    expect(await latestResult(client)).toMatchObject({ status: "paused" });
     await client.promptAndWait("integration:continue", undefined, 20000);
     await client.promptAndWait("integration:accept", undefined, 20000);
-    const acceptedResult = (await client.getMessages()).findLast(
-      (message) =>
-        message.role === "toolResult" && message.toolName === "sub_result",
-    );
-    if (!acceptedResult || acceptedResult.role !== "toolResult")
-      throw new Error("Missing accepted response");
-    expect(
-      JSON.parse(
-        acceptedResult.content.find((part) => part.type === "text")!.text,
-      ),
-    ).toMatchObject({ status: "closed", collected: true });
+    const accepted = await latestResult(client);
+    expect(accepted).toMatchObject({ outcome: "reply" });
+    expect(accepted).not.toHaveProperty("status");
   } finally {
-    await client.stop();
-    await rm(cwd, { recursive: true, force: true });
+    await dispose();
+  }
+}, 60000);
+
+test("a real user prompt collects a final failure without a model cleanup call", async () => {
+  const { client, dispose } = await host();
+  const failed = nextEvent(client, (event) => {
+    const ui = event as unknown as {
+      type: string;
+      method?: string;
+      message?: string;
+    };
+    return (
+      ui.type === "extension_ui_request" &&
+      ui.method === "notify" &&
+      !!ui.message?.includes("fatal synthetic failure")
+    );
+  });
+  try {
+    await client.promptAndWait("integration:failure", undefined, 20000);
+    await failed.promise;
+    const before = await client.getMessages();
+    const count = before.filter(
+      (message) => message.role === "toolResult",
+    ).length;
+    expect((await client.getState()).isStreaming).toBe(false);
+    await client.promptAndWait("integration:failure-cleanup", undefined, 20000);
+    const after = await client.getMessages();
+    expect(
+      after.filter((message) => message.role === "toolResult"),
+    ).toHaveLength(count);
+    const notice = after.find(
+      (message) =>
+        message.role === "custom" && message.customType === "pi-sub:failures",
+    );
+    if (!notice || notice.role !== "custom")
+      throw new Error("Failure was not transferred into native parent history");
+    expect(notice.details).toEqual([
+      expect.objectContaining({
+        outcome: "error",
+        error: "fatal synthetic failure",
+        sessionFile: expect.stringMatching(/\.jsonl$/),
+      }),
+    ]);
+    const pending = await client.getSessionStats();
+    expect(pending.cost).toBe(pending.assistantMessages * 10 + 10); // only setup delivered so far
+    await client.promptAndWait("integration:failure-receipt", undefined, 20000);
+    expect(await latestResult(client)).toMatchObject({
+      outcome: "error",
+      error: "fatal synthetic failure",
+    });
+    const delivered = await client.getSessionStats();
+    expect(delivered.cost).toBe(delivered.assistantMessages * 10 + 20);
+    await client.promptAndWait("integration:failure-receipt", undefined, 20000);
+    const repeated = await client.getSessionStats();
+    expect(repeated.cost).toBe(repeated.assistantMessages * 10 + 20);
+    expect(
+      (await client.getMessages()).filter(
+        (message) =>
+          message.role === "custom" && message.customType === "pi-sub:failures",
+      ),
+    ).toHaveLength(1);
+  } finally {
+    failed.dispose();
+    await dispose();
+  }
+}, 60000);
+
+test("RPC abort during native retry backoff interrupts the children", async () => {
+  const { client, marker, dispose } = await host({
+    WORKER_TEST_SLOW_CHILD: "1",
+  });
+  const retry = nextEvent(client, (event) => event.type === "auto_retry_start");
+  try {
+    await client.prompt("integration:retry");
+    await retry.promise;
+    await eventually(() => readFile(marker));
+    await client.abort();
+    await client.promptAndWait("integration:inspect", undefined, 20000);
+    expect(await latestResult(client)).toMatchObject({ status: "paused" });
+  } finally {
+    retry.dispose();
+    await dispose();
+  }
+}, 60000);
+
+test("the idle RPC operator interrupt pauses children without calling the parent model", async () => {
+  const { client, marker, dispose } = await host({
+    WORKER_TEST_SLOW_CHILD: "1",
+  });
+  try {
+    await client.promptAndWait("integration:pause", undefined, 20000);
+    await eventually(() => readFile(marker));
+    const before = await client.getSessionStats();
+    expect(await client.prompt("/sub:pause")).toBe("handled");
+    expect((await client.getSessionStats()).assistantMessages).toBe(
+      before.assistantMessages,
+    );
+    await client.promptAndWait("integration:inspect", undefined, 20000);
+    expect(await latestResult(client)).toMatchObject({ status: "paused" });
+  } finally {
+    await dispose();
   }
 }, 60000);

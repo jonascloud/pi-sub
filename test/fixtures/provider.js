@@ -1,4 +1,5 @@
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai/utils/event-stream";
+import { writeFileSync } from "node:fs";
 
 function reply(context) {
   const messages = context.messages;
@@ -11,6 +12,12 @@ function reply(context) {
           .filter((part) => part.type === "text")
           .map((part) => part.text)
           .join("");
+  if (
+    process.env.WORKER_TEST_INTEGRATION &&
+    process.env.PI_SUB_CHILD === "1" &&
+    text === "integration:child-error"
+  )
+    return { error: "fatal synthetic failure" };
   if (
     process.env.WORKER_TEST_INTEGRATION &&
     process.env.PI_SUB_CHILD === "1" &&
@@ -50,14 +57,22 @@ function reply(context) {
       .slice(index + 1)
       .filter((message) => message.role === "toolResult");
     if (
-      (text === "integration:delegate" || text === "integration:pause") &&
+      [
+        "integration:delegate",
+        "integration:pause",
+        "integration:failure",
+        "integration:retry",
+      ].includes(text) &&
       !results.length
     )
       return {
         name: "sub_task",
         args: {
           level: 3,
-          prompt: "Return a test response.",
+          prompt:
+            text === "integration:failure"
+              ? "integration:child-error"
+              : "Return a test response.",
           description: "Test task",
         },
       };
@@ -66,6 +81,7 @@ function reply(context) {
         "integration:inspect",
         "integration:continue",
         "integration:accept",
+        "integration:failure-receipt",
       ].includes(text) &&
       !results.length
     ) {
@@ -88,6 +104,8 @@ function reply(context) {
             },
           };
     }
+    if (text === "integration:retry" && results.at(-1)?.toolName === "sub_task")
+      return { error: "429 rate limit test" };
     if (
       text === "integration:delegate" &&
       results.at(-1)?.toolName === "sub_task"
@@ -159,7 +177,21 @@ export default function (pi) {
         timestamp: Date.now(),
       };
       stream.push({ type: "start", partial: message });
-      setTimeout(() => {
+      const slow =
+        process.env.WORKER_TEST_SLOW_CHILD &&
+        process.env.PI_SUB_CHILD === "1" &&
+        !context.messages.some(
+          (message) =>
+            message.role === "user" &&
+            JSON.stringify(message.content).includes("Approved snapshot"),
+        );
+      if (slow && process.env.WORKER_TEST_CHILD_MARKER)
+        writeFileSync(process.env.WORKER_TEST_CHILD_MARKER, "running");
+      let finished = false;
+      const finish = () => {
+        if (finished) return;
+        finished = true;
+        options?.signal?.removeEventListener("abort", aborted);
         if (
           process.env.WORKER_TEST_CRASH ||
           (process.env.WORKER_TEST_CRASH_AFTER_RESPONSE &&
@@ -172,6 +204,13 @@ export default function (pi) {
           stream.push({ type: "error", reason: "aborted", error: message });
         } else {
           const output = reply(context);
+          if (output.error) {
+            message.stopReason = "error";
+            message.errorMessage = output.error;
+            stream.push({ type: "error", reason: "error", error: message });
+            stream.end();
+            return;
+          }
           if (output.name) {
             const toolCall = {
               type: "toolCall",
@@ -221,7 +260,16 @@ export default function (pi) {
           stream.push({ type: "done", reason: message.stopReason, message });
         }
         stream.end();
-      }, 300);
+      };
+      const timer = setTimeout(finish, slow ? 10000 : 300);
+      const aborted = () => {
+        clearTimeout(timer);
+        finish();
+      };
+      if (slow) {
+        options?.signal?.addEventListener("abort", aborted, { once: true });
+        if (options?.signal?.aborted) aborted();
+      }
       return stream;
     },
   });

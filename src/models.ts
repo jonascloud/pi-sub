@@ -270,10 +270,7 @@ export function describeLevels(
     }
   });
 }
-export function loadCatalog(
-  path: string,
-  _approved: readonly ApprovedModel[],
-): Catalog {
+export function loadCatalog(path: string): Catalog {
   let text: string;
   try {
     text = readFileSync(path, "utf8");

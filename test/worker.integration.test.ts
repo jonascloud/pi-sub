@@ -57,7 +57,8 @@ test("real CLI: handshake, events, native usage and continuing after abort", asy
   const events: string[] = [];
   worker.onEvent((e) => events.push(e.type));
   const done = settled(worker);
-  await worker.send("hello");
+  await expect(worker.send("hello")).resolves.toBe("started");
+  expect(events).toContain("agent_start");
   await done;
   const report = await worker.report();
   expect(report.text).toBe("fake response");
@@ -80,13 +81,13 @@ test("real CLI: handshake, events, native usage and continuing after abort", asy
     },
   });
   expect(events).toContain("message_update");
-  await worker.send("slow");
+  await expect(worker.send("slow")).resolves.toBe("started");
   await expect(worker.report()).rejects.toThrow("worker is active");
-  await worker.send("steer");
+  await expect(worker.send("steer")).resolves.toBe("queued");
   const cleared = await worker.pause();
   expect(cleared.steering).toContain("steer");
   const continued = settled(worker);
-  await worker.send("again");
+  await expect(worker.send("again")).resolves.toBe("started");
   await continued;
   const finalReport = await worker.report();
   expect(finalReport.text).toBe("fake response");
@@ -98,6 +99,7 @@ test("real CLI: handshake, events, native usage and continuing after abort", asy
     cost: { total: 30, totalFromProvider: true },
   });
   await Promise.all([worker.close(), worker.close()]);
+  expect(await worker.report()).toEqual(finalReport);
 }, 30000);
 test("handled input rejects and unsupported dialog fails the worker", async () => {
   const worker = await setup();

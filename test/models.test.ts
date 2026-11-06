@@ -120,7 +120,7 @@ describe("catalog", () => {
     const dir = await mkdtemp(join(tmpdir(), "models-"));
     try {
       const path = catalogPath(dir);
-      expect(() => loadCatalog(path, approved)).toThrow(/run \/sub:models/);
+      expect(() => loadCatalog(path)).toThrow(/run \/sub:models/);
       await saveCatalog(path, catalog);
       expect((await stat(path)).mode & 0o777).toBe(0o600);
       const before = await readFile(path, "utf8");
@@ -133,8 +133,8 @@ describe("catalog", () => {
         }),
       ).rejects.toThrow("approval revoked");
       expect(await readFile(path, "utf8")).toBe(before);
-      expect(loadCatalog(path, [])).toEqual(catalog);
-      expect(() => selectExecution(loadCatalog(path, []), 1, [])).toThrow();
+      expect(loadCatalog(path)).toEqual(catalog);
+      expect(() => selectExecution(loadCatalog(path), 1, [])).toThrow();
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

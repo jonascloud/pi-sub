@@ -52,6 +52,7 @@ class FakeWorker implements Worker {
   async send(message: string) {
     this.prompts.push(message);
     this.listener({ type: "agent_start" } as WorkerEvent);
+    return "started" as const;
   }
   async pause() {
     return { steering: [], followUp: [] };
@@ -76,7 +77,8 @@ class FakeWorker implements Worker {
         stopReason: "stop",
       },
     } as WorkerEvent);
-    this.listener({ type: "agent_settled" } as WorkerEvent);
+    this.listener({ type: "agent_settled", aborted: false });
+    this.listener({ type: "worker_state", idle: true });
   }
 }
 const fixtures: { cwd: string; coordinator: Coordinator }[] = [];
@@ -118,7 +120,12 @@ describe("model setup", () => {
     const result = await fixture.result;
     expect(JSON.parse(await readFile(result.path, "utf8"))).toEqual(catalog());
     expect(fixture.worker.closes).toBe(1);
-    expect(fixture.coordinator.get(fixture.id).collected).toBe(true);
+    expect(() => fixture.coordinator.get(fixture.id)).toThrow(
+      "Unknown live task",
+    );
+    expect(fixture.coordinator.inspect(fixture.id)).toMatchObject({
+      outcome: "reply",
+    });
   });
   it("preserves the old catalog when research output is invalid", async () => {
     const fixture = await begin();

@@ -7,7 +7,11 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { matchesKey, stripTerminalSequences } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { Coordinator, type TaskView } from "./src/coordinator.ts";
+import {
+  Coordinator,
+  type TaskView,
+  type TaskResult,
+} from "./src/coordinator.ts";
 import {
   catalogPath,
   describeLevels,
@@ -28,9 +32,8 @@ export default function piSub(pi: ExtensionAPI): void {
   let coordinator: Coordinator | undefined;
   let unmount: (() => void) | undefined;
   let detachInput: (() => void) | undefined;
-  let detachSignal: (() => void) | undefined;
-  let latchedSignal: AbortSignal | undefined;
-  let interrupted = false;
+  const signals = new WeakSet<AbortSignal>();
+  let runInterrupted = false;
   let dialogOpen = false;
   let settingUp = false;
   const lifetime = new AbortController();
@@ -48,6 +51,14 @@ export default function piSub(pi: ExtensionAPI): void {
       },
       onReady(task) {
         if (lifetime.signal.aborted || task.level === undefined) return;
+        if (task.outcome === "error") {
+          notify(
+            `Subagent ${task.id} failed: ${task.error}. It will be collected before the next user prompt.`,
+            "error",
+          );
+          return;
+        }
+        if (!coordinator?.runnable) return;
         const text = stripTerminalSequences(task.error ?? task.response);
         pi.sendMessage(
           {
@@ -58,9 +69,7 @@ export default function piSub(pi: ExtensionAPI): void {
               { maxBytes: 8000, maxLines: 100 },
             ).content,
           },
-          interrupted
-            ? { deliverAs: "nextTurn" }
-            : { deliverAs: "followUp", triggerTurn: true },
+          { deliverAs: "followUp", triggerTurn: true },
         );
       },
     }));
@@ -73,17 +82,61 @@ export default function piSub(pi: ExtensionAPI): void {
       );
     context = ctx;
   };
-  const pauseAll = () => {
-    interrupted = true;
-    void coordinator
-      ?.pauseAll()
+  const interrupt = () => {
+    if (lifetime.signal.aborted) return Promise.resolve();
+    runInterrupted = true;
+    const pending = manager()
+      .interrupt()
       .catch((error) =>
         notify(
           `Could not confirm subagent interruption: ${reason(error)}`,
           "error",
         ),
       );
+    return pending;
   };
+  const observe = (signal: AbortSignal | undefined, compaction = false) => {
+    if (!signal || signals.has(signal)) return;
+    signals.add(signal);
+    const aborted = () => {
+      if (compaction || !runInterrupted) interrupt();
+    };
+    signal.addEventListener("abort", aborted, { once: true });
+    if (signal.aborted) aborted();
+  };
+  const preparePrompt = () =>
+    manager().prompt((failures: TaskResult[]) => {
+      if (!failures.length) return;
+      pi.sendMessage(
+        {
+          customType: "pi-sub:failures",
+          display: true,
+          content: `Failed subagents were closed and removed before this user input. No cleanup tool call is needed. Decide only how to continue the work.\n${
+            truncateHead(
+              JSON.stringify(
+                failures.map((report) => ({
+                  ...report,
+                  response: truncateHead(report.response, {
+                    maxBytes: 1600,
+                    maxLines: 30,
+                  }).content,
+                  pendingInput: report.pendingInput?.map(
+                    (text) =>
+                      truncateHead(text, { maxBytes: 1600, maxLines: 30 })
+                        .content,
+                  ),
+                })),
+                null,
+                2,
+              ),
+              { maxBytes: 16000, maxLines: 160 },
+            ).content
+          }\nFull reports remain in message details and native session artifacts.`,
+          details: failures,
+        },
+        { triggerTurn: false },
+      );
+    });
   const authorizeTask = (task: TaskView, ctx: ExtensionContext) => {
     const execution = task.execution;
     if (
@@ -144,7 +197,10 @@ export default function piSub(pi: ExtensionAPI): void {
       detachInput?.();
       unmount = mountWidget(ctx.ui, manager());
       detachInput = ctx.ui.onTerminalInput((data) => {
-        if (!dialogOpen && matchesKey(data, "escape")) pauseAll();
+        if (!dialogOpen && matchesKey(data, "escape")) {
+          interrupt();
+          ctx.abort();
+        }
         return undefined;
       });
     }
@@ -155,27 +211,41 @@ export default function piSub(pi: ExtensionAPI): void {
   pi.on("ui_prompt_end", () => {
     dialogOpen = false;
   });
+  pi.on("input", async (event, ctx) => {
+    if (event.source === "extension") return;
+    context = ctx;
+    try {
+      if (!(await preparePrompt())) return { action: "handled" };
+    } catch (error) {
+      notify(`Could not prepare user input: ${reason(error)}`, "error");
+      return { action: "handled" };
+    }
+  });
   pi.on("turn_start", (_event, ctx) => {
     context = ctx;
-    if (ctx.signal === latchedSignal) return;
-    detachSignal?.();
-    latchedSignal = ctx.signal;
-    if (!ctx.signal) {
-      detachSignal = undefined;
-      return;
-    }
-    const signal = ctx.signal;
-    signal.addEventListener("abort", pauseAll, { once: true });
-    detachSignal = () => signal.removeEventListener("abort", pauseAll);
-    if (signal.aborted) pauseAll();
+    observe(ctx.signal);
+  });
+  pi.on("agent_start", (_event, ctx) => {
+    observe(ctx.signal);
+    if (manager().interrupted) ctx.abort();
+  });
+  pi.on("agent_settled", (event) => {
+    if (event.aborted && !runInterrupted) interrupt();
+  });
+  pi.on("session_before_compact", (event) => {
+    observe(event.signal, true);
   });
   pi.on("before_agent_start", (event, ctx) => {
     context = ctx;
-    if (event.messageType === "user") interrupted = false;
+    if (manager().interrupted) {
+      ctx.abort();
+      return;
+    }
+    runInterrupted = false;
     let table: string;
     try {
       const approved = approvedModels(ctx);
-      const catalog = loadCatalog(catalogPath(ctx.cwd), approved);
+      const catalog = loadCatalog(catalogPath(ctx.cwd));
       const self = catalog.candidates.find(
         (candidate) =>
           candidate.provider === ctx.model?.provider &&
@@ -194,11 +264,19 @@ export default function piSub(pi: ExtensionAPI): void {
     } catch (error) {
       table = reason(error);
     }
-    event.systemPromptOptions.sections.pi_sub = `Subagents are independent native Pi processes. Start bounded tasks with sub_task at the minimum sufficient level; count briefing, research, verification and integration overhead. All tasks are asynchronous. Ordinary replies can be questions: inspect before accepting a final result. Use sub_message for answers/corrections, sub_control for pause/continue/stop, and sub_result finish:true only to accept a final response and close its process. Parent interruption pauses children; a new user prompt does not resume them. No child UI dialogs, custom roles or conversation inheritance.\nReference cost is weighted USD per AA Intelligence Index v5.0.1 task including thinking and cache, not a task-cost forecast or subscription price. The 1× baseline is fixed independently of approvals.\nCurrent routing (rechecked on admission; not a reservation):\n${table}`;
+    event.systemPromptOptions.sections.pi_sub = `Subagents are independent native Pi processes. Start bounded tasks with sub_task at the minimum sufficient level; count briefing, research, verification and integration overhead. All tasks are asynchronous. Ordinary replies can be questions: inspect before accepting a final result. Use sub_message for answers/corrections, sub_control for pause/continue/stop, and sub_result finish:true only to accept a final response and close its process. Parent interruption pauses children; a new user prompt does not resume them. No child UI dialogs, custom roles or conversation inheritance.\nReference cost is weighted USD per AA Intelligence Index v5.0.1 task including thinking and cache, not a task-cost forecast or subscription price. The 1× baseline is fixed independently of approvals.\nFinal errors are automatically closed, delivered and removed before the next real user prompt, without a cleanup tool call.\nOpen subagents: ${JSON.stringify(
+      manager()
+        .list()
+        .map((task) => ({
+          id: task.id,
+          description: task.description,
+          status: task.status,
+          outcome: task.outcome,
+        })),
+    )}\nCurrent routing (rechecked on admission; not a reservation):\n${table}`;
   });
   pi.on("session_shutdown", async () => {
     lifetime.abort();
-    detachSignal?.();
     detachInput?.();
     unmount?.();
     await coordinator?.dispose();
@@ -214,19 +292,29 @@ export default function piSub(pi: ExtensionAPI): void {
           throw new Error(
             "Model setup is already running; inspect or stop its subagent first.",
           );
-        if (!ctx.model)
+        const model = ctx.model;
+        if (!model)
           throw new Error("Select the setup model with /model first.");
         const thinking = ctx.thinkingLevel ?? "off";
-        if (!getSupportedThinkingLevels(ctx.model).includes(thinking))
+        if (!getSupportedThinkingLevels(model).includes(thinking))
           throw new Error("Unsupported setup thinking level.");
         settingUp = true;
+        try {
+          if (!(await preparePrompt())) {
+            settingUp = false;
+            return;
+          }
+        } catch (error) {
+          settingUp = false;
+          throw error;
+        }
         void setupModels({
           coordinator: manager(),
           cwd: ctx.cwd,
           worker: {
             cwd: ctx.cwd,
-            provider: ctx.model.provider,
-            model: ctx.model.id,
+            provider: model.provider,
+            model: model.id,
             thinking,
             name: "pi-sub model setup",
             sessionDir: workerDirectory(ctx.cwd),
@@ -269,27 +357,38 @@ export default function piSub(pi: ExtensionAPI): void {
           if (action === "pause") {
             if (id) await manager().pause(id);
             else {
-              interrupted = true;
-              await manager().pauseAll();
+              const pending = interrupt();
+              ctx.abort();
+              await pending;
             }
           }
           if (action === "continue") {
+            if (!(await preparePrompt())) return;
             const tasks = id
               ? [manager().get(id)]
               : manager()
                   .list()
                   .filter((task) => task.status === "paused");
             for (const task of tasks) authorized(task.id, ctx);
-            interrupted = false;
             for (const task of tasks) await manager().continue(task.id);
           }
           if (action === "stop") {
-            if (id) await manager().stop(id);
-            else
-              await Promise.all(
-                manager()
-                  .list()
-                  .map((task) => manager().stop(task.id)),
+            const results = await Promise.all(
+              (id
+                ? [id]
+                : manager()
+                    .list()
+                    .map((task) => task.id)
+              ).map((taskId) => manager().stop(taskId)),
+            );
+            if (results.length)
+              pi.sendMessage(
+                {
+                  customType: "pi-sub:stopped",
+                  display: true,
+                  content: JSON.stringify(results, null, 2),
+                },
+                { triggerTurn: false },
               );
           }
         } catch (error) {
@@ -321,7 +420,7 @@ export default function piSub(pi: ExtensionAPI): void {
           signal?.throwIfAborted();
           const approved = approvedModels(ctx);
           const execution = selectExecution(
-            loadCatalog(catalogPath(ctx.cwd), approved),
+            loadCatalog(catalogPath(ctx.cwd)),
             args.level,
             approved,
           );
@@ -376,7 +475,7 @@ export default function piSub(pi: ExtensionAPI): void {
       exposure: "model-only",
       executionMode: "sequential",
       description:
-        "Read a task response without closing it. Optional wait observes only; timeout or wait interruption does not itself stop the child. finish:true accepts a final ready/error result, captures usage and closes its process. Large output is truncated; the native session file retains it.",
+        "Read a task response without closing it. Optional wait observes only; timeout or wait interruption does not itself stop the child. finish:true accepts a final response, closes its process and removes the live task. Final errors are automatically collected before the next user prompt. Large output is truncated; the native session file retains it.",
       parameters: Type.Object(
         {
           id: Type.String(),
@@ -389,9 +488,9 @@ export default function piSub(pi: ExtensionAPI): void {
       async execute(_call, args, signal, _update, ctx) {
         try {
           checkContext(ctx);
-          const task: TaskView = args.wait
+          const task = args.wait
             ? await manager().wait(args.id, signal, (args.timeout ?? 30) * 1000)
-            : manager().get(args.id);
+            : manager().inspect(args.id);
           return response(
             args.finish ? await manager().collect(task.id) : task,
           );
@@ -420,6 +519,8 @@ export default function piSub(pi: ExtensionAPI): void {
         try {
           checkContext(ctx);
           signal?.throwIfAborted();
+          if (args.action === "stop" && args.id)
+            return response(await manager().stop(args.id));
           const tasks = args.id
             ? [manager().get(args.id)]
             : manager()
@@ -430,16 +531,17 @@ export default function piSub(pi: ExtensionAPI): void {
                 );
           if (args.action === "continue")
             for (const task of tasks) authorized(task.id, ctx);
-          await Promise.all(
-            tasks.map((task) =>
-              args.action === "pause"
-                ? manager().pause(task.id)
-                : args.action === "continue"
-                  ? manager().continue(task.id)
-                  : manager().stop(task.id),
+          const results = await Promise.all(
+            tasks.map(async (task) =>
+              args.action === "stop"
+                ? manager().stop(task.id)
+                : (await (args.action === "pause"
+                    ? manager().pause(task.id)
+                    : manager().continue(task.id)),
+                  manager().get(task.id)),
             ),
           );
-          return response(tasks.map((task) => manager().get(task.id)));
+          return response(results);
         } catch (error) {
           return response(reason(error), true);
         }

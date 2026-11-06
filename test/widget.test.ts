@@ -5,7 +5,7 @@ import type {
   Theme,
 } from "@earendil-works/pi-coding-agent";
 import type { Component, TUI } from "@earendil-works/pi-tui";
-import type { TaskView } from "../src/coordinator.ts";
+import type { Summary, TaskView } from "../src/coordinator.ts";
 import { mountWidget, renderWidget } from "../src/widget.ts";
 
 const theme = {
@@ -17,18 +17,24 @@ const task = (overrides: Partial<TaskView> = {}): TaskView => ({
   description: "Investigate",
   level: 7,
   execution: { provider: "p", model: "m", thinking: "off" },
-  status: "running",
+  status: "active",
   turns: 7,
   toolUses: 3,
   tokens: 21,
   elapsedMs: 65000,
   response: "",
   activity: "thk",
-  collected: false,
   ...overrides,
 });
-const render = (tasks: TaskView[], width = 80, height = 12) =>
-  renderWidget(tasks, width, height, theme);
+const render = (
+  tasks: TaskView[],
+  width = 80,
+  height = 12,
+  summary: Summary = {
+    completed: 0,
+    tokens: tasks.reduce((n, t) => n + t.tokens, 0),
+  },
+) => renderWidget(tasks, width, height, theme, summary);
 
 describe("widget rendering", () => {
   it("uses a bottom-rooted tree and aligned, expanding metadata", () => {
@@ -79,30 +85,72 @@ describe("widget rendering", () => {
         expect(stripTerminalSequences(lines[0]!)).toBe("thk".slice(0, width));
     }
   });
-  it("prioritizes attention while retaining input order and never hides collected errors", () => {
+  it("prioritizes errors and paused tasks while retaining newest input order", () => {
     const tasks = [
       task({ description: "new run" }),
       task({ description: "paused", status: "paused" }),
       task({
         description: "failed",
-        status: "closed",
-        collected: true,
+        status: "ready",
+        outcome: "error",
         error: "failed badly",
       }),
       task({ description: "old run" }),
-      task({ status: "closed", collected: true, tokens: 100 }),
+      task({ description: "oldest run" }),
     ];
     const rows = render(tasks, 80, 4);
     expect(rows[0]).toContain("paused");
     expect(rows[1]).toContain("failed");
     expect(rows[1]).toContain("err");
-    expect(rows[2]).toContain("+2 run 2");
-    expect(rows[3]).toContain("1 done");
-    expect(rows[3]).toContain("184 token");
+    expect(rows[2]).toContain("+3 run 3");
+    expect(rows[3]).toContain("105 token");
     expect(rows[3]).not.toContain("run");
   });
+  it("keeps archive totals after live tasks are removed without retaining failed rows", () => {
+    const failed = task({
+      status: "ready",
+      outcome: "error",
+      error: "broken",
+      description: "Failed identity",
+    });
+    expect(render([failed]).join("\n")).toContain("err");
+    const summary = { completed: 3, tokens: 12000 };
+    const rows = render([], 100, 12, summary);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toContain("3 done");
+    expect(rows[0]).not.toContain("failed");
+    expect(rows[0]).not.toContain("stopped");
+    expect(rows[0]).toContain("12.0k token");
+    expect(rows.join("\n")).not.toContain("Failed identity");
+    expect(rows.join("\n")).not.toContain("broken");
+    expect(render([])).toEqual([]);
+  });
+  it("selects newest ordinary rows and does not repeat tokens or models in rows", () => {
+    const rows = render(
+      [
+        task({ description: "Newest" }),
+        task({ description: "Middle" }),
+        task({ description: "Oldest" }),
+      ],
+      100,
+      3,
+    );
+    expect(rows[0]).toContain("Newest");
+    expect(rows[1]).toContain("+2");
+    expect(rows[0]).not.toContain("token");
+    expect(rows[0]).not.toContain("model");
+  });
+  it("shows paused and reply states", () => {
+    expect(render([task({ status: "paused" })])[0]).toContain("pse");
+    expect(render([task({ status: "ready", outcome: "reply" })])[0]).toContain(
+      "rdy",
+    );
+  });
   it("puts root-only urgent state before brand and tokens", () => {
-    const tasks = [task(), task({ status: "error", error: "oops" })];
+    const tasks = [
+      task(),
+      task({ status: "ready", outcome: "error", error: "oops" }),
+    ];
     expect(stripTerminalSequences(render(tasks, 3, 1)[0]!)).toBe("err");
     expect(render(tasks, 40, 1)[0]!.startsWith("err 1")).toBe(true);
   });
@@ -116,6 +164,7 @@ it("polls only visible active rows, reserves space below, resumes and cleans up"
   const unsubscribe = vi.fn();
   const coordinator = {
     list: () => tasks,
+    summary: () => ({ completed: 0, tokens: 21 }),
     subscribe: (fn: () => void) => {
       listener = fn;
       return unsubscribe;
@@ -161,6 +210,25 @@ it("polls only visible active rows, reserves space below, resumes and cleans up"
   (tui.terminal as { rows: number }).rows = 20;
   component.render(80);
   expect(vi.getTimerCount()).toBe(1);
+  tasks = [task({ operation: "pausing" })];
+  listener();
+  expect(component.render(80)[0]).toContain("psg");
+  expect(vi.getTimerCount()).toBe(1);
+  requestRender.mockClear();
+  vi.advanceTimersByTime(700);
+  expect(requestRender).toHaveBeenCalledOnce();
+  tasks = [task({ status: "ready", outcome: "reply" })];
+  listener();
+  expect(vi.getTimerCount()).toBe(0);
+  tasks = [task({ status: "paused" }), task(), task()];
+  (tui.terminal as { rows: number }).rows = 6;
+  component.render(80); // one task row plus overflow and root; active row is hidden
+  listener();
+  expect(vi.getTimerCount()).toBe(0);
+  tasks = [task()];
+  listener();
+  component.render(0);
+  expect(vi.getTimerCount()).toBe(0);
   cleanup();
   expect(vi.getTimerCount()).toBe(0);
   expect(unsubscribe).toHaveBeenCalledOnce();

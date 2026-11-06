@@ -99,8 +99,12 @@ export async function setupModels(
   let response = "";
   try {
     const task = await options.coordinator.wait(id, options.signal);
-    if (task.status !== "ready")
-      throw new Error(task.error ?? `Setup stopped (${task.status}).`);
+    if (
+      !("status" in task) ||
+      task.status !== "ready" ||
+      task.outcome !== "reply"
+    )
+      throw new Error(task.error ?? "Setup stopped or failed.");
     response = task.response;
     const catalog = parseCatalog(response, approved);
     if (!catalog.candidates.some((candidate) => candidate.selected))
@@ -120,7 +124,12 @@ export async function setupModels(
     await saveCatalog(path, catalog, verify);
     return { id, catalog, path };
   } catch (error) {
-    await options.coordinator.stop(id).catch(() => {});
+    try {
+      if (options.coordinator.get(id).outcome !== "error")
+        await options.coordinator.stop(id);
+    } catch {
+      /* shutdown or prompt cleanup already removed the task */
+    }
     const reason = error instanceof Error ? error.message : String(error);
     throw new Error(
       `${reason}${response ? `\nResearch response: ${response.slice(0, 1600)}` : ""}\nPrevious catalog was not replaced.`,

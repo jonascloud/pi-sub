@@ -6,7 +6,7 @@ Status: Accepted
 
 Build a small coordinator around native Pi RPC subprocesses, using the exported `RpcClient`. Pi owns sessions, conversation history, tools, compaction and retries. The coordinator owns level-based execution selection, child lifecycle, concurrency and compact progress presentation.
 
-All work is asynchronous. Waiting observes an existing task; it is not a separate foreground execution mode. Use Pi's events and inspection methods, including `agent_settled` for quiescence, rather than rebuilding an agent loop.
+All work is asynchronous. Waiting observes an existing task; it is not a separate foreground execution mode. Use Pi's events and inspection methods for execution boundaries rather than rebuilding an agent loop. Untagged events are hints; combine settlement observations with fresh native state checks as described in [the lifecycle decision](0002-process-lifetime-and-interruption.md).
 
 ## Rationale and consequences
 
