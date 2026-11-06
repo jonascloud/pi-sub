@@ -178,6 +178,48 @@ test("child guard rejects a switched assignment journal through public session c
   }
 });
 
+test("child guard rejects a substituted journal identity even at the same path", () => {
+  vi.stubEnv("PI_SUB_CHILD", "1");
+  vi.stubEnv("PI_SUB_EXPECTED_PROVIDER", "test");
+  vi.stubEnv("PI_SUB_EXPECTED_MODEL", "fake");
+  vi.stubEnv("PI_SUB_EXPECTED_THINKING", "off");
+  vi.stubEnv("PI_SUB_EXPECTED_SESSION_FILE", "/expected/task.jsonl");
+  vi.stubEnv("PI_SUB_EXPECTED_SESSION_ID", "original");
+  const diagnostic = vi.spyOn(console, "error").mockImplementation(() => {});
+  try {
+    const handlers = new Map<
+      string,
+      (event: unknown, ctx: ExtensionContext) => unknown
+    >();
+    childGuard({
+      on: (
+        name: string,
+        handler: (event: unknown, ctx: ExtensionContext) => unknown,
+      ) => handlers.set(name, handler),
+    } as unknown as ExtensionAPI);
+    let sessionId = "original";
+    const abort = vi.fn();
+    const ctx = {
+      model: { provider: "test", id: "fake" },
+      thinkingLevel: "off",
+      abort,
+      sessionManager: {
+        getSessionFile: () => "/expected/task.jsonl",
+        getSessionId: () => sessionId,
+      },
+    } as unknown as ExtensionContext;
+    handlers.get("session_start")!({}, ctx);
+    expect(abort).not.toHaveBeenCalled();
+    sessionId = "substituted";
+    handlers.get("before_agent_start")!({}, ctx);
+    expect(abort).toHaveBeenCalledOnce();
+    expect(diagnostic).toHaveBeenCalledWith("Worker session identity mismatch");
+  } finally {
+    diagnostic.mockRestore();
+    vi.unstubAllEnvs();
+  }
+});
+
 test("stop before run prevents spawning; stop is idempotent", async () => {
   const { worker, session } = await setup(`process.exit(99)`);
   await Promise.all([worker.stop(), worker.stop()]);
@@ -306,7 +348,7 @@ setInterval(()=>{},1000);
   expect(report).toMatchObject({
     error: "Invalid native JSON output",
     interrupted: false,
-    inputPersisted: true,
+    inputPersisted: false,
     text: "new response",
   });
 }, 10000);
@@ -377,6 +419,73 @@ test("continuous draining bounds diagnostics without deadlocking", async () => {
   expect(report.error).toMatch(/42/);
   expect(report.error!.length).toBeLessThan(17000);
 });
+
+test.each([false, true])(
+  "a streamed user event without a saved entry never proves persistence (stop=%s)",
+  async (stop) => {
+    const { worker } = await setup(`
+emit({type:'message_end',message:user});
+${stop ? "setInterval(()=>{},1000);" : "process.exitCode=1;"}
+`);
+    const observed = nextEvent(worker, "message_end");
+    const running = worker.run("hello");
+    await observed;
+    if (stop) await worker.stop();
+    expect(await running).toMatchObject({
+      inputPersisted: false,
+      interrupted: stop,
+    });
+  },
+);
+
+test("a journal lost during interruption is an error, not a fresh paused task", async () => {
+  const { worker, session } = await setup(`
+append(entry('u',user)); emit({type:'message_end',message:user});
+emit({type:'agent_start'}); setInterval(()=>{},1000);
+`);
+  await writeFile(
+    session,
+    JSON.stringify({ type: "session", version: 3, id: "session" }) + "\n",
+  );
+  const started = nextEvent(worker);
+  const running = worker.run("hello");
+  await started;
+  await rm(session);
+  await worker.stop();
+  expect(await running).toMatchObject({
+    error: "Native session file is missing",
+    interrupted: true,
+    inputPersisted: false,
+    sessionId: "session",
+  });
+});
+
+test.each(["missing", "replaced"])(
+  "an expected %s journal fails preflight without spawning or replacing usage",
+  async (kind) => {
+    const { session, config } = await setup("process.exit(99)");
+    if (kind === "replaced")
+      await writeFile(
+        session,
+        JSON.stringify({ type: "session", version: 3, id: "other" }) + "\n",
+      );
+    const worker = createWorker(config, session, "expected");
+    workers.push(worker);
+    const spawned = vi.mocked(spawn).mock.calls.length;
+    expect(await worker.run("hello")).toMatchObject({
+      error:
+        kind === "missing"
+          ? "Native session file is missing"
+          : "Native session identity changed",
+      inputPersisted: false,
+    });
+    expect(await worker.stop()).toBeUndefined();
+    expect(vi.mocked(spawn).mock.calls.length).toBe(spawned);
+    if (kind === "missing")
+      await expect(readFile(session)).rejects.toMatchObject({ code: "ENOENT" });
+    else expect(await readFile(session, "utf8")).toContain('"other"');
+  },
+);
 
 test("a new saved user entry proves persistence even when output is lost", async () => {
   const { worker } = await setup(

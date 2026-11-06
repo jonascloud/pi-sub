@@ -78,11 +78,13 @@ function setup(maxWorkers = 1, beforeStart?: (task: TaskView) => void) {
   const workers: Fake[] = [];
   const sessions = new Map<string, Usage>();
   const onReady = vi.fn();
-  const factory = vi.fn((_options: WorkerOptions, sessionFile: string) => {
-    const worker = new Fake(sessionFile, sessions);
-    workers.push(worker);
-    return worker;
-  });
+  const factory = vi.fn(
+    (_options: WorkerOptions, sessionFile: string, _sessionId?: string) => {
+      const worker = new Fake(sessionFile, sessions);
+      workers.push(worker);
+      return worker;
+    },
+  );
   const c = new Coordinator({
     maxWorkers,
     createWorker: factory,
@@ -254,6 +256,48 @@ describe("one session, fresh execution processes", () => {
     workers[1]!.close();
     await tick();
     workers[2]!.close();
+    await tick();
+    await c.dispose();
+  });
+});
+
+describe("journal expectations across executions", () => {
+  it("retains the journal identity and the last usage when continuation preflight fails", async () => {
+    const { c, workers, start, factory } = setup();
+    const id = start();
+    expect(factory.mock.calls[0]![2]).toBeUndefined();
+    workers[0]!.close({ sessionId: "native-session", usage: usage(25) });
+    await tick();
+    await c.message(id, "continue with this correction");
+    expect(factory.mock.calls[1]![2]).toBe("native-session");
+    workers[1]!.close({
+      sessionId: undefined,
+      usage: undefined,
+      text: "",
+      error: "Native session file is missing",
+      inputPersisted: false,
+    });
+    await tick();
+    expect(c.get(id)).toMatchObject({
+      outcome: "error",
+      tokens: 25,
+      pendingInput: ["continue with this correction"],
+    });
+    await c.collect(id);
+    expect(c.drainUsage()).toEqual(usage(25));
+    await c.dispose();
+  });
+
+  it("allows a fresh start after interruption before any journal was created", async () => {
+    const { c, workers, start, factory } = setup();
+    const id = start();
+    const pausing = c.pause(id);
+    workers[0]!.close({ interrupted: true, inputPersisted: false });
+    await pausing;
+    await c.continue(id);
+    expect(factory.mock.calls[1]![2]).toBeUndefined();
+    expect(workers[1]!.run).toHaveBeenCalledExactlyOnceWith("brief");
+    workers[1]!.close({ sessionId: "created-on-retry" });
     await tick();
     await c.dispose();
   });

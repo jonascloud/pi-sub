@@ -34,6 +34,8 @@ export interface WorkerReport {
   // Exact prompt evidence only. Native input transformations may make this
   // unprovable; interrupted/failed executions then conservatively replay input.
   inputPersisted: boolean;
+  /** Native journal identity retained across fresh execution processes. */
+  sessionId?: string;
 }
 export interface Worker {
   /** Resolves after drained process close, or without spawning on preflight failure. */
@@ -53,6 +55,7 @@ const killGrace = 2000;
 export function createWorker(
   options: WorkerOptions,
   sessionFile: string,
+  expectedSessionId?: string,
 ): Worker {
   const listeners = new Set<(event: WorkerEvent) => void>();
   let execution: Promise<WorkerReport> | undefined;
@@ -71,6 +74,7 @@ export function createWorker(
       failure ??= message;
     };
     const before = await readSession(sessionFile);
+    let sessionId = before.id;
     const previousIds = new Set(before.entries.map((entry) => entry.id));
     const report = (usage?: Usage): WorkerReport => ({
       text:
@@ -83,10 +87,20 @@ export function createWorker(
       ...(failure ? { error: failure } : {}),
       interrupted: stopRequested,
       inputPersisted,
+      ...(sessionId ? { sessionId } : {}),
     });
-    // Do not let the native loader silently replace a damaged saved session.
-    if (before.error) {
-      fail(before.error);
+    // Only a genuinely new task may start without a journal. Never let the
+    // native loader silently replace lost, substituted or damaged history.
+    if (
+      before.error ||
+      (expectedSessionId && before.id !== expectedSessionId)
+    ) {
+      fail(
+        before.error ??
+          (before.missing
+            ? "Native session file is missing"
+            : "Native session identity changed"),
+      );
       // A damaged preflight ledger is not a replacement cumulative snapshot.
       // The coordinator keeps its last confirmed snapshot; no new work ran.
       return report();
@@ -130,6 +144,7 @@ export function createWorker(
             PI_SUB_EXPECTED_MODEL: options.model,
             PI_SUB_EXPECTED_THINKING: options.thinking,
             PI_SUB_EXPECTED_SESSION_FILE: resolve(options.cwd, sessionFile),
+            PI_SUB_EXPECTED_SESSION_ID: sessionId ?? "",
           },
           stdio: ["pipe", "pipe", "pipe"],
         },
@@ -159,7 +174,8 @@ export function createWorker(
             throw new Error("Expected JSON event object");
           if (event.type === "session") return;
           if (event.type === "message_end") {
-            if (matchesInput(event.message, prompt)) inputPersisted = true;
+            // Native message events precede journal writes: progress is not
+            // persistence evidence, even for an exact copy of the input.
             if (event.message.role === "assistant") {
               if (!validAssistant(event.message))
                 throw new Error("Invalid assistant message");
@@ -298,10 +314,19 @@ export function createWorker(
 
     const saved = await readSession(sessionFile);
     if (saved.error) fail(saved.error);
-    if (saved.missing && !stopRequested) fail("Native session file is missing");
+    if (saved.missing && (sessionId || !stopRequested))
+      fail("Native session file is missing");
+    if (sessionId && saved.id && saved.id !== sessionId)
+      fail("Native session identity changed");
+    sessionId ??= saved.id;
     for (const entry of saved.entries) {
       if (previousIds.has(entry.id) || entry.type !== "message") continue;
-      if (matchesInput(entry.message, prompt)) inputPersisted = true;
+      if (
+        !saved.error &&
+        saved.id === sessionId &&
+        matchesInput(entry.message, prompt)
+      )
+        inputPersisted = true;
       if (entry.message.role === "assistant") lastAssistant = entry.message;
     }
     if (!stopRequested) {
@@ -349,6 +374,7 @@ export function createWorker(
 /** Read-only inspection; unlike SessionManager.open this cannot repair/rewrite files. */
 async function readSession(file: string): Promise<{
   entries: SessionEntry[];
+  id?: string;
   missing?: boolean;
   error?: string;
 }> {
@@ -364,7 +390,7 @@ async function readSession(file: string): Promise<{
     };
   }
   const entries: SessionEntry[] = [];
-  let header = false;
+  let header: string | undefined;
   const parsed = parseSessionEntries(contents);
   // The native parser deliberately skips malformed JSON. Detect that loss
   // separately, without repairing the file or reconstructing native entries.
@@ -375,7 +401,7 @@ async function readSession(file: string): Promise<{
       if (!header) {
         if (value?.type !== "session" || typeof value.id !== "string")
           throw new Error("Missing session header");
-        header = true;
+        header = value.id;
       } else {
         if (
           !value ||
@@ -403,6 +429,7 @@ async function readSession(file: string): Promise<{
   }
   return {
     entries,
+    id: header,
     ...(!header || corrupt ? { error: "Corrupt native session file" } : {}),
   };
 }

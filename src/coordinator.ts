@@ -61,6 +61,7 @@ type Task = {
   run?: Execution;
   take?: Promise<TaskResult>;
   usage?: Usage;
+  sessionId?: string;
   elapsed: number;
   activeSince?: number;
 };
@@ -80,14 +81,14 @@ export class Coordinator {
   private epoch = 0;
   private interruption?: Promise<void>;
   private max: number;
-  private factory: (options: WorkerOptions, sessionFile: string) => Worker;
+  private factory: typeof createWorker;
   private beforeStart?: (task: TaskView) => void;
   private onReady?: (task: TaskView) => void;
 
   constructor(
     options: {
       maxWorkers?: number;
-      createWorker?: (options: WorkerOptions, sessionFile: string) => Worker;
+      createWorker?: typeof createWorker;
       beforeStart?: (task: TaskView) => void;
       onReady?: (task: TaskView) => void;
     } = {},
@@ -266,7 +267,7 @@ export class Coordinator {
       if (!t) return;
       try {
         this.beforeStart?.(this.view(t));
-        const worker = this.factory(t.options, t.data.sessionFile);
+        const worker = this.factory(t.options, t.data.sessionFile, t.sessionId);
         const finished = Promise.withResolvers<void>();
         const run: Execution = {
           worker,
@@ -368,6 +369,7 @@ export class Coordinator {
     if (t.run !== run) return;
     t.run = undefined;
     t.data.response = report.text || t.data.response;
+    t.sessionId ??= report.sessionId;
     if (report.usage) {
       // Whole-session snapshots replace both billing and displayed totals.
       t.usage = report.usage;

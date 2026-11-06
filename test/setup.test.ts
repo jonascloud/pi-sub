@@ -2,6 +2,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import { mkdtemp, readFile, rm, mkdir, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
+import { execFileSync } from "node:child_process";
 import type { Model } from "@earendil-works/pi-ai";
 import { lock } from "proper-lockfile";
 import { Coordinator } from "../src/coordinator.ts";
@@ -312,6 +313,35 @@ it("reserves open before prepare and initializes ignored runtime storage", async
     "sessions/\n",
   );
 });
+it.each(["", "# custom rules\n*.tmp", "sessions/\n!sessions/\n"])(
+  "protects journals even with an existing insufficient ignore file: %j",
+  async (contents) => {
+    const f = await begin();
+    execFileSync("git", ["init", "--quiet", f.cwd]);
+    const directory = join(f.cwd, ".pi/pi-sub");
+    await mkdir(directory, { recursive: true });
+    await writeFile(join(directory, ".gitignore"), contents);
+    const [sessions] = await Promise.all(
+      Array.from({ length: 4 }, () => workerDirectory(f.cwd)),
+    );
+    await mkdir(sessions!, { recursive: true });
+    await writeFile(join(sessions!, "private.jsonl"), "private task history");
+    expect(
+      execFileSync(
+        "git",
+        ["check-ignore", "--", ".pi/pi-sub/sessions/private.jsonl"],
+        { cwd: f.cwd },
+      )
+        .toString()
+        .trim(),
+    ).toBe(".pi/pi-sub/sessions/private.jsonl");
+    const ignored = await readFile(join(directory, ".gitignore"), "utf8");
+    expect(ignored.startsWith(contents)).toBe(true);
+    await workerDirectory(f.cwd);
+    expect(await readFile(join(directory, ".gitignore"), "utf8")).toBe(ignored);
+  },
+);
+
 it("refines using a fresh execution in the same session, rejecting stale acceptance", async () => {
   const f = await begin();
   await f.open();

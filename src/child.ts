@@ -16,6 +16,9 @@ export default function childGuard(pi: ExtensionAPI) {
     const actualSession = ctx.sessionManager.getSessionFile();
     if (!expectedSession || actualSession !== expectedSession)
       blocked ??= `Worker session mismatch: expected ${expectedSession}, got ${actualSession}`;
+    const expectedId = process.env.PI_SUB_EXPECTED_SESSION_ID;
+    if (expectedId && ctx.sessionManager.getSessionId() !== expectedId)
+      blocked ??= "Worker session identity mismatch";
     if (blocked) {
       console.error(blocked);
       // Never await abort from an active hook: abort waits for this run to finish.

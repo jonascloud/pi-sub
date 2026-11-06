@@ -1,7 +1,10 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import {
+  withFileMutationQueue,
+  type ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 import type { Coordinator } from "./coordinator.ts";
 import {
   ladderPath,
@@ -473,11 +476,23 @@ export class ModelSetup {
 export async function workerDirectory(cwd: string): Promise<string> {
   const directory = join(cwd, ".pi", "pi-sub");
   await mkdir(directory, { recursive: true, mode: 0o700 });
-  await writeFile(join(directory, ".gitignore"), "*\n", {
-    flag: "wx",
-    mode: 0o600,
-  }).catch((error) => {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  const path = join(directory, ".gitignore");
+  await withFileMutationQueue(path, async () => {
+    const file = await open(path, "a+", 0o600);
+    try {
+      const contents = await file.readFile("utf8");
+      // A final directory rule also overrides earlier negations. Preserve any
+      // operator rules; do not assume that an existing file protects sessions.
+      const last = contents
+        .split(/\r?\n/)
+        .findLast((line) => line && !line.startsWith("#"));
+      if (!["*", "/*", "sessions/", "/sessions/"].includes(last ?? ""))
+        await file.appendFile(
+          `${contents && !contents.endsWith("\n") ? "\n" : ""}${contents ? "/sessions/" : "*"}\n`,
+        );
+    } finally {
+      await file.close();
+    }
   });
   return join(directory, "sessions");
 }

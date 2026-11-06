@@ -2,7 +2,9 @@ import { afterEach, expect, test } from "vitest";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { getPackageDir } from "@earendil-works/pi-coding-agent";
+import { Coordinator } from "../src/coordinator.ts";
 import {
   createWorker,
   type Worker,
@@ -30,8 +32,12 @@ async function setup(env: Record<string, string> = {}) {
     env: { PI_CODING_AGENT_DIR: join(dir, "agent"), ...env },
     args: ["--no-extensions", "-e", resolve("test/fixtures/provider.js")],
   };
-  const make = (overrides: Partial<WorkerOptions> = {}) => {
-    const worker = createWorker({ ...options, ...overrides }, session);
+  const make = (overrides: Partial<WorkerOptions> = {}, sessionId?: string) => {
+    const worker = createWorker(
+      { ...options, ...overrides },
+      session,
+      sessionId,
+    );
     workers.push(worker);
     return worker;
   };
@@ -97,6 +103,95 @@ test("native CLI: a new process continues the same saved question/answer context
   expect(JSON.stringify(messages)).toContain("What is your response?");
   expect(JSON.stringify(messages)).toContain("fake response");
 }, 30000);
+
+test("native continuation refuses a deleted journal and keeps prior task usage", async () => {
+  const { options, dir } = await setup();
+  const coordinator = new Coordinator();
+  try {
+    const id = coordinator.start({
+      prompt: "Keep this original instruction.",
+      description: "journal integrity",
+      level: 1,
+      worker: { ...options, sessionDir: join(dir, "sessions") },
+    });
+    const first = await coordinator.wait(id, undefined, 15000);
+    expect(first.tokens).toBe(16);
+    await rm(first.sessionFile);
+    await coordinator.message(
+      id,
+      "Continue without losing the original instruction.",
+    );
+    expect(await coordinator.wait(id, undefined, 15000)).toMatchObject({
+      outcome: "error",
+      error: "Native session file is missing",
+      tokens: 16,
+      pendingInput: ["Continue without losing the original instruction."],
+    });
+    await expect(readFile(first.sessionFile)).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await coordinator.collect(id);
+    expect(coordinator.drainUsage()?.totalTokens).toBe(16);
+  } finally {
+    await coordinator.dispose();
+  }
+}, 20000);
+
+test("the native child refuses history lost between parent preflight and CLI startup", async () => {
+  const { make, dir } = await setup();
+  const first = await make().run("Original persisted instruction.");
+  expect(first.error).toBeUndefined();
+  const wrapper = join(dir, "delete-before-load.mjs");
+  const marker = join(dir, "provider-called");
+  await writeFile(
+    wrapper,
+    `import {unlinkSync} from 'node:fs';
+unlinkSync(process.env.PI_SUB_EXPECTED_SESSION_FILE);
+await import(${JSON.stringify(pathToFileURL(join(getPackageDir(), "dist/cli.js")).href)});`,
+  );
+  const report = await make(
+    {
+      cliPath: wrapper,
+      env: {
+        PI_CODING_AGENT_DIR: join(dir, "agent"),
+        WORKER_TEST_SLOW_CHILD: "1",
+        WORKER_TEST_CHILD_MARKER: marker,
+      },
+    },
+    first.sessionId,
+  ).run("Must not execute against empty history.");
+  expect(report.error).toMatch(/session identity|session file/);
+  await expect(readFile(marker)).rejects.toMatchObject({ code: "ENOENT" });
+}, 15000);
+
+test("native user message events do not acknowledge an input whose journal append fails", async () => {
+  const { make, session, dir, options } = await setup();
+  const first = await make().run("Original persisted instruction.");
+  expect(first.error).toBeUndefined();
+  const extension = join(dir, "fail-append.ts");
+  await writeFile(
+    extension,
+    `import {renameSync, mkdirSync} from 'node:fs';
+export default pi => pi.on('message_end', (event, ctx) => {
+  if (event.message.role !== 'user') return;
+  const file = ctx.sessionManager.getSessionFile();
+  renameSync(file, file + '.saved');
+  mkdirSync(file); // The subsequent native append must fail, including when tests run as root.
+});`,
+  );
+  const report = await make(
+    { args: [...options.args!, "-e", extension] },
+    first.sessionId,
+  ).run("Unwritten correction.");
+  expect(report).toMatchObject({
+    inputPersisted: false,
+    error: expect.stringContaining("EISDIR"),
+    usage: { totalTokens: 16 },
+  });
+  expect(await readFile(session + ".saved", "utf8")).not.toContain(
+    "Unwritten correction.",
+  );
+}, 20000);
 
 test("native JSON can exit zero on provider error; report still fails", async () => {
   const { make } = await setup({ WORKER_TEST_INTEGRATION: "1" });
