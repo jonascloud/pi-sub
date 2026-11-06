@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
+import { addUsage } from "./usage.ts";
 import type { Usage } from "@earendil-works/pi-ai";
 import {
   createWorker,
@@ -72,7 +73,7 @@ const message = (error: unknown) =>
 export class Coordinator {
   private tasks = new Map<string, Task>();
   private receipts = new Map<string, TaskResult>();
-  private usage: Usage[] = [];
+  private usage?: Usage;
   private totals: Summary = { completed: 0, tokens: 0 };
   private listeners = new Set<() => void>();
   private disposed = false;
@@ -276,6 +277,9 @@ export class Coordinator {
           unsubscribe: () => {},
         };
         void run.done.catch(() => {});
+        // Subscribe before transferring input or owning an execution. A failed
+        // subscription cannot leave a run that was never started occupying a slot.
+        run.unsubscribe = worker.onEvent((event) => this.event(t, run, event));
         t.pending = [];
         t.run = run;
         t.outcome = undefined;
@@ -283,7 +287,6 @@ export class Coordinator {
         t.activity = "";
         t.data.response = "";
         delete t.data.error;
-        run.unsubscribe = worker.onEvent((event) => this.event(t, run, event));
         this.status(t, "active");
         void (async () => {
           let report: WorkerReport;
@@ -484,7 +487,7 @@ export class Coordinator {
     const result = this.result(t);
     if (this.tasks.delete(t.data.id)) {
       this.receipts.set(result.id, structuredClone(result));
-      if (t.usage) this.usage.push(t.usage);
+      if (t.usage) this.usage = addUsage(this.usage, t.usage);
       this.totals.tokens += result.tokens;
       if (result.outcome === "reply") this.totals.completed++;
       this.emit();
@@ -597,39 +600,8 @@ export class Coordinator {
     });
   }
   drainUsage(): Usage | undefined {
-    let result: Usage | undefined;
-    for (const value of this.usage.splice(0)) {
-      if (!result) {
-        result = structuredClone(value);
-        continue;
-      }
-      for (const key of [
-        "input",
-        "output",
-        "cacheRead",
-        "cacheWrite",
-        "totalTokens",
-        "cacheWrite1h",
-        "reasoning",
-      ] as const)
-        if (value[key] !== undefined)
-          result[key] = (result[key] ?? 0) + value[key];
-      for (const key of [
-        "input",
-        "output",
-        "cacheRead",
-        "cacheWrite",
-        "total",
-      ] as const)
-        result.cost[key] += value.cost[key];
-      if (
-        result.cost.totalFromProvider !== undefined ||
-        value.cost.totalFromProvider !== undefined
-      )
-        result.cost.totalFromProvider =
-          result.cost.totalFromProvider === true &&
-          value.cost.totalFromProvider === true;
-    }
+    const result = this.usage;
+    this.usage = undefined;
     return result;
   }
   async dispose(): Promise<void> {

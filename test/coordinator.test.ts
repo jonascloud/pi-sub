@@ -547,6 +547,67 @@ describe("final reports and receipts", () => {
 });
 
 describe("admission and shutdown", () => {
+  it("keeps input and releases admission when event subscription throws", async () => {
+    const { c, workers, start, factory } = setup();
+    const original = factory.getMockImplementation()!;
+    factory.mockImplementationOnce((...args) => {
+      const worker = original(...args);
+      worker.onEvent = () => {
+        throw new Error("subscription failed");
+      };
+      return worker;
+    });
+    const id = start("keep this input");
+    expect(c.get(id)).toMatchObject({
+      status: "ready",
+      outcome: "error",
+      pendingInput: ["keep this input"],
+    });
+    expect(workers[0]!.run).not.toHaveBeenCalled();
+    const next = start("next");
+    expect(c.get(next).status).toBe("active");
+    expect(await c.collect(id)).toMatchObject({
+      outcome: "error",
+      error: "subscription failed",
+    });
+    workers[1]!.close();
+    await tick();
+    await c.dispose();
+  });
+
+  it("aggregates archived usage once and drains independently", async () => {
+    const { c, workers, start } = setup();
+    const a = start("a");
+    workers[0]!.close({
+      usage: {
+        ...usage(2),
+        reasoning: 3,
+        cost: { ...usage(2).cost, totalFromProvider: true },
+      },
+    });
+    await tick();
+    await c.collect(a);
+    await c.collect(a);
+    const b = start("b");
+    workers[1]!.close({
+      usage: {
+        ...usage(4),
+        cacheWrite1h: 5,
+        cost: { ...usage(4).cost, totalFromProvider: false },
+      },
+    });
+    await tick();
+    await c.collect(b);
+    expect(c.drainUsage()).toMatchObject({
+      totalTokens: 6,
+      reasoning: 3,
+      cacheWrite1h: 5,
+      cost: { total: 6, totalFromProvider: false },
+    });
+    expect(c.drainUsage()).toBeUndefined();
+    await c.dispose();
+  });
+
   it("rechecks authorization on queued admission, answers and resume", async () => {
     let approved = true;
     const beforeStart = vi.fn(() => {

@@ -138,6 +138,7 @@ process.stdin.on('end', () => {
 });
 
 test("child guard rejects a switched assignment journal through public session context", () => {
+  vi.stubEnv("PI_SUB_EXPECTED_SESSION_ID", "");
   vi.stubEnv("PI_SUB_CHILD", "1");
   vi.stubEnv("PI_SUB_EXPECTED_PROVIDER", "test");
   vi.stubEnv("PI_SUB_EXPECTED_MODEL", "fake");
@@ -584,9 +585,57 @@ fs.appendFileSync(file,'{broken}\\n');
   );
   expect(await worker.run("hello")).toMatchObject({
     error: "Corrupt native session file",
-    usage: { totalTokens: 32, cost: { total: 20 } },
+    usage: { totalTokens: 16, cost: { total: 10 } },
   });
 });
+
+test.each([
+  [
+    "foreign identity",
+    `fs.writeFileSync(file,JSON.stringify({type:'session',version:3,id:'foreign'})+'\\n'); append(entry('old',assistant)); append(entry('new',assistant));`,
+    "Native session identity changed",
+  ],
+  [
+    "changed entry",
+    `assistant.usage.totalTokens=999; append(entry('old',assistant));`,
+    "Corrupt native session file",
+  ],
+  [
+    "replaced entry",
+    `fs.writeFileSync(file,JSON.stringify({type:'session',version:3,id:'session'})+'\\n'); assistant.usage.totalTokens=999; append(entry('old',assistant)); append(entry('new',assistant));`,
+    "Native session entry changed",
+  ],
+  [
+    "corrupt collision",
+    `fs.writeFileSync(file,JSON.stringify({type:'session',version:3,id:'session'})+'\\n'); assistant.usage.totalTokens=999; append(entry('old',assistant)); append(entry('new',assistant)); fs.appendFileSync(file,'{broken}\\n');`,
+    "Corrupt native session file",
+  ],
+])(
+  "untrusted final journal (%s) keeps only confirmed usage",
+  async (_name, body, error) => {
+    const { worker, session } = await setup(body);
+    await writeFile(
+      session,
+      [
+        { type: "session", version: 3, id: "session" },
+        {
+          type: "message",
+          id: "old",
+          message: {
+            role: "assistant",
+            content: [],
+            stopReason: "stop",
+            usage,
+          },
+        },
+      ]
+        .map((value) => JSON.stringify(value))
+        .join("\n") + "\n",
+    );
+    const report = await worker.run("hello");
+    expect(report).toMatchObject({ error, usage, inputPersisted: false });
+  },
+);
 
 test("a damaged preflight ledger is not offered as a smaller replacement snapshot", async () => {
   const { worker, session } = await setup("");

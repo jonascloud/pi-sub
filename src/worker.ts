@@ -11,6 +11,7 @@ import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
+import { addUsage } from "./usage.ts";
 
 export interface WorkerOptions {
   cwd: string;
@@ -75,7 +76,7 @@ export function createWorker(
     };
     const before = await readSession(sessionFile);
     let sessionId = before.id;
-    const previousIds = new Set(before.entries.map((entry) => entry.id));
+    const entries = new Map(before.entries.map((entry) => [entry.id, entry]));
     const report = (usage?: Usage): WorkerReport => ({
       text:
         lastAssistant?.content
@@ -319,14 +320,19 @@ export function createWorker(
     if (sessionId && saved.id && saved.id !== sessionId)
       fail("Native session identity changed");
     sessionId ??= saved.id;
-    for (const entry of saved.entries) {
-      if (previousIds.has(entry.id) || entry.type !== "message") continue;
-      if (
-        !saved.error &&
-        saved.id === sessionId &&
-        matchesInput(entry.message, prompt)
-      )
-        inputPersisted = true;
+    // A damaged or foreign snapshot is not evidence for any of its records.
+    // Even a valid snapshot must not replace an already confirmed entry.
+    const changed = saved.entries.some((entry) => {
+      const previous = entries.get(entry.id);
+      return previous && JSON.stringify(previous) !== JSON.stringify(entry);
+    });
+    if (changed && !saved.error && saved.id === sessionId)
+      fail("Native session entry changed");
+    const trusted =
+      !saved.error && !saved.missing && saved.id === sessionId && !changed;
+    for (const entry of trusted ? saved.entries : []) {
+      if (entries.has(entry.id) || entry.type !== "message") continue;
+      if (matchesInput(entry.message, prompt)) inputPersisted = true;
       if (entry.message.role === "assistant") lastAssistant = entry.message;
     }
     if (!stopRequested) {
@@ -339,10 +345,11 @@ export function createWorker(
           `${lastAssistant.errorMessage || `Native response ended with ${lastAssistant.stopReason}`}${stderr.trim() ? `: ${stderr.trim()}` : ""}`,
         );
     }
-    // Keep previously confirmed native records if a failed write truncates the
-    // journal. Native entry IDs deduplicate the two read-only snapshots.
-    const entries = new Map(before.entries.map((entry) => [entry.id, entry]));
-    for (const entry of saved.entries) entries.set(entry.id, entry);
+    // Retain confirmed records even if the final read is unusable. No partial
+    // records from a corrupt snapshot can establish their own provenance.
+    if (trusted)
+      for (const entry of saved.entries)
+        if (!entries.has(entry.id)) entries.set(entry.id, entry);
     return report(aggregateUsage(entries.values()));
   }
 
@@ -390,6 +397,7 @@ async function readSession(file: string): Promise<{
     };
   }
   const entries: SessionEntry[] = [];
+  const ids = new Set<string>();
   let header: string | undefined;
   const parsed = parseSessionEntries(contents);
   // The native parser deliberately skips malformed JSON. Detect that loss
@@ -418,6 +426,8 @@ async function readSession(file: string): Promise<{
         )
           throw new Error("Invalid assistant message");
         const entry = value as SessionEntry;
+        if (ids.has(entry.id)) throw new Error("Duplicate session entry");
+        ids.add(entry.id);
         const usage = entryUsage(entry);
         if (usage !== undefined && !validUsage(usage))
           throw new Error("Invalid usage");
@@ -505,35 +515,7 @@ function aggregateUsage(entries: Iterable<SessionEntry>): Usage | undefined {
   for (const entry of entries) {
     const value = entryUsage(entry);
     if (!value) continue;
-    if (!usage) {
-      usage = { ...value, cost: { ...value.cost } };
-      continue;
-    }
-    for (const key of [
-      "input",
-      "output",
-      "cacheRead",
-      "cacheWrite",
-      "totalTokens",
-    ] as const)
-      usage[key] += value[key];
-    for (const key of ["reasoning", "cacheWrite1h"] as const)
-      if (value[key] !== undefined) usage[key] = (usage[key] ?? 0) + value[key];
-    for (const key of [
-      "input",
-      "output",
-      "cacheRead",
-      "cacheWrite",
-      "total",
-    ] as const)
-      usage.cost[key] += value.cost[key];
-    if (
-      usage.cost.totalFromProvider !== undefined ||
-      value.cost.totalFromProvider !== undefined
-    )
-      usage.cost.totalFromProvider =
-        usage.cost.totalFromProvider === true &&
-        value.cost.totalFromProvider === true;
+    usage = addUsage(usage, value);
   }
   return usage;
 }
