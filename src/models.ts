@@ -124,12 +124,13 @@ export function loadLadder(path: string): Ladder {
   }
 }
 
+/** Resolve only after publication; returned cleanup warnings do not undo the save. */
 export async function saveLadder(
   path: string,
   ladder: Ladder,
   expectedSource: string | undefined,
   beforeCommit?: () => void,
-): Promise<void> {
+): Promise<unknown[]> {
   const source = formatLadder(ladder);
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
   const release = await lock(path, {
@@ -143,6 +144,10 @@ export async function saveLadder(
         "Model ladder changed; run /sub:models again before replacing it",
       );
   };
+  let committed = false;
+  let failure: unknown;
+  let failed = false;
+  const cleanupWarnings: unknown[] = [];
   try {
     verifySource();
     // Serialize cooperative saves so they cannot append duplicate ignore rules.
@@ -150,7 +155,10 @@ export async function saveLadder(
     try {
       const contents = await ignore.readFile("utf8");
       const rule = `/${basename(path).replace(/[\\*?\[\]#! ]/g, "\\$&")}`;
-      if (!contents.split(/\r?\n/).includes(rule))
+      const last = contents
+        .split(/\r?\n/)
+        .findLast((line) => line && !line.startsWith("#"));
+      if (last !== rule)
         await ignore.appendFile(
           `${contents && !contents.endsWith("\n") ? "\n" : ""}${rule}\n`,
           "utf8",
@@ -169,15 +177,35 @@ export async function saveLadder(
     beforeCommit?.();
     // Cancellation/authorization verification and publication must not yield.
     renameSync(temp, path);
+    committed = true;
+  } catch (error) {
+    failed = true;
+    failure = error;
   } finally {
+    if (!committed) {
+      try {
+        await unlink(temp);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT")
+          cleanupWarnings.push(error);
+      }
+    }
     try {
-      await unlink(temp).catch((error: NodeJS.ErrnoException) => {
-        if (error.code !== "ENOENT") throw error;
-      });
-    } finally {
       await release();
+    } catch (error) {
+      cleanupWarnings.push(error);
     }
   }
+  if (failed) {
+    if (cleanupWarnings.length)
+      throw new AggregateError(
+        [failure, ...cleanupWarnings],
+        "Model ladder save and cleanup failed",
+        { cause: failure },
+      );
+    throw failure;
+  }
+  return cleanupWarnings;
 }
 
 export function selectExecution(

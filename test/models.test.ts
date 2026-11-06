@@ -11,6 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { execFileSync, spawn } from "node:child_process";
+import * as lockfile from "proper-lockfile";
 import {
   type AvailableModel,
   type Ladder,
@@ -24,6 +25,11 @@ import {
   selectExecution,
   validateLadder,
 } from "../src/models.ts";
+
+vi.mock("proper-lockfile", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("proper-lockfile")>();
+  return { ...actual, lock: vi.fn(actual.lock) };
+});
 
 let dir: string;
 const ladder: Ladder = {
@@ -225,6 +231,65 @@ describe("model ladder", () => {
     expect(await readFile(ignore, "utf8")).toBe(
       "custom\n# keep this\n/pi-sub-config.json\n",
     );
+  });
+
+  it("appends a final ignore rule after a negation and does not duplicate it", async () => {
+    const path = ladderPath();
+    await mkdir(dirname(path), { recursive: true });
+    const ignore = join(dirname(path), ".gitignore");
+    const original = "/pi-sub-config.json\n!/pi-sub-config.json\n# keep";
+    await writeFile(ignore, original);
+    execFileSync("git", ["init", "-q", dirname(path)]);
+    await saveLadder(path, ladder, undefined);
+    expect(await readFile(ignore, "utf8")).toBe(
+      `${original}\n/pi-sub-config.json\n`,
+    );
+    expect(
+      execFileSync("git", ["check-ignore", "--", "pi-sub-config.json"], {
+        cwd: dirname(path),
+        encoding: "utf8",
+      }).trim(),
+    ).toBe("pi-sub-config.json");
+    await saveLadder(path, {}, readLadderSource(path));
+    expect(await readFile(ignore, "utf8")).toBe(
+      `${original}\n/pi-sub-config.json\n`,
+    );
+  });
+
+  it("returns cleanup warnings after publication but preserves pre-commit failures", async () => {
+    const original = (
+      await vi.importActual<typeof import("proper-lockfile")>("proper-lockfile")
+    ).lock;
+    const spy = vi
+      .spyOn(lockfile, "lock")
+      .mockImplementation(async (...args) => {
+        const release = await original(...args);
+        return async () => {
+          await release();
+          throw new Error("release failed");
+        };
+      });
+    try {
+      const path = ladderPath();
+      expect(await saveLadder(path, ladder, undefined)).toEqual([
+        expect.objectContaining({ message: "release failed" }),
+      ]);
+      expect(loadLadder(path)).toEqual(ladder);
+      await expect(
+        saveLadder(path, {}, readLadderSource(path), () => {
+          throw new Error("cancelled");
+        }),
+      ).rejects.toMatchObject({
+        cause: expect.objectContaining({ message: "cancelled" }),
+        errors: [
+          expect.objectContaining({ message: "cancelled" }),
+          expect.objectContaining({ message: "release failed" }),
+        ],
+      });
+      expect(loadLadder(path)).toEqual(ladder);
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it("rejects stale tokens, manual edits and deletion without merging", async () => {

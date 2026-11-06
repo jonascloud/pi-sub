@@ -442,9 +442,10 @@ export class ModelSetup {
     };
     this.state = { ...this.state, phase: "saving" };
     this.emit();
+    let cleanupWarnings: unknown[];
     try {
       verify();
-      await saveLadder(s.path, draft, s.source, verify);
+      cleanupWarnings = await saveLadder(s.path, draft, s.source, verify);
     } catch (error) {
       await this.fail(s, error);
       throw error;
@@ -452,6 +453,13 @@ export class ModelSetup {
     // Publication is final, including when cancel runs during post-commit cleanup.
     this.notify(() => this.options.onSaved(s.path));
     this.close(s);
+    for (const warning of cleanupWarnings)
+      this.notify(() =>
+        this.options.onReport({
+          content: `Model ladder saved, but cleanup failed: ${reason(warning)}`,
+          details: { id, path: s.path },
+        }),
+      );
     try {
       await this.options.coordinator.collect(id);
     } catch {

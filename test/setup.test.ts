@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { execFileSync } from "node:child_process";
 import type { Model } from "@earendil-works/pi-ai";
 import { lock } from "proper-lockfile";
+import * as lockfile from "proper-lockfile";
 import { Coordinator } from "../src/coordinator.ts";
 import { ladderPath, type AvailableModel, type Ladder } from "../src/models.ts";
 import { ModelSetup, availableModels, workerDirectory } from "../src/setup.ts";
@@ -14,6 +15,11 @@ import type {
   WorkerEvent,
   WorkerReport,
 } from "../src/worker.ts";
+vi.mock("proper-lockfile", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("proper-lockfile")>();
+  return { ...actual, lock: vi.fn(actual.lock) };
+});
+
 const available: AvailableModel[] = [
   { provider: "test", model: "fake", thinking: ["off"] },
 ];
@@ -173,6 +179,37 @@ it("returns before research ends and writes only after explicit revision-bound a
   expect(f.onSaved).toHaveBeenCalledOnce();
   expect(f.setup.active).toBe(false);
   expect(f.coordinator.inspect(id)).toMatchObject({ outcome: "reply" });
+});
+it("reports a cleanup warning without undoing a committed acceptance", async () => {
+  const f = await begin();
+  await f.open();
+  await review(f);
+  const id = f.id;
+  const original = (
+    await vi.importActual<typeof import("proper-lockfile")>("proper-lockfile")
+  ).lock;
+  const spy = vi.spyOn(lockfile, "lock").mockImplementation(async (...args) => {
+    const release = await original(...args);
+    return async () => {
+      await release();
+      throw new Error("release failed");
+    };
+  });
+  try {
+    await expect(
+      f.setup.accept(f.setup.view!.revision),
+    ).resolves.toBeUndefined();
+    expect(JSON.parse(await readFile(ladderPath(), "utf8"))).toEqual(ladder);
+    expect(f.onSaved).toHaveBeenCalledOnce();
+    expect(f.setup.active).toBe(false);
+    expect(f.onReport).toHaveBeenLastCalledWith({
+      content: "Model ladder saved, but cleanup failed: release failed",
+      details: { id, path: ladderPath() },
+    });
+    expect(f.coordinator.inspect(id)).toMatchObject({ outcome: "reply" });
+  } finally {
+    spy.mockRestore();
+  }
 });
 it("reserves and cancels the human model choice without starting research or saving", async () => {
   const choice = Promise.withResolvers<AvailableModel[] | undefined>();
