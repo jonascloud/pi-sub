@@ -296,8 +296,12 @@ it("polls only visible active rows, reserves space below, resumes and cleans up"
   expect(component.render(80)[0]).toContain("psg");
   expect(vi.getTimerCount()).toBe(1);
   requestRender.mockClear();
-  vi.advanceTimersByTime(700);
+  vi.advanceTimersByTime(999);
+  expect(requestRender).not.toHaveBeenCalled();
+  vi.advanceTimersByTime(1);
   expect(requestRender).toHaveBeenCalledOnce();
+  vi.advanceTimersByTime(1000);
+  expect(requestRender).toHaveBeenCalledTimes(2);
   tasks = [task({ status: "ready", outcome: "reply" })];
   listener();
   expect(vi.getTimerCount()).toBe(0);

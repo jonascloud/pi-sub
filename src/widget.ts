@@ -242,7 +242,7 @@ export function mountWidget(
         const { shown } = select(tasks, height);
         const needsTimer = visible && shown.some(active);
         if (needsTimer && !timer)
-          timer = setInterval(() => tui.requestRender(), 700);
+          timer = setInterval(() => tui.requestRender(), 1000);
         if (!needsTimer && timer) {
           clearInterval(timer);
           timer = undefined;
