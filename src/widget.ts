@@ -110,7 +110,10 @@ export function renderWidget(
   if (
     !width ||
     !height ||
-    (!tasks.length && !summary.completed && !summary.tokens)
+    (!tasks.length &&
+      !summary.completed &&
+      !summary.inputTokens &&
+      !summary.outputTokens)
   )
     return [];
   // Reserve six columns on roomy terminals, reclaiming them below 46 columns.

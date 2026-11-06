@@ -33,7 +33,6 @@ const render = (
   height = 12,
   summary: Summary = {
     completed: 0,
-    tokens: tasks.reduce((n, t) => n + t.tokens, 0),
     inputTokens: tasks.reduce((n, t) => n + t.tokens, 0),
     outputTokens: 0,
   },
@@ -50,7 +49,6 @@ describe("widget rendering", () => {
     (inputTokens, outputTokens, expected) => {
       const rows = render([], 100, 12, {
         completed: 1,
-        tokens: inputTokens + outputTokens,
         inputTokens,
         outputTokens,
       });
@@ -126,7 +124,7 @@ describe("widget rendering", () => {
         120,
         12,
         { ...theme, fg },
-        { completed: 0, tokens: 21, inputTokens: 21, outputTokens: 0 },
+        { completed: 0, inputTokens: 21, outputTokens: 0 },
       );
       const dimmed = fg.mock.calls
         .filter(([color]) => color === "dim")
@@ -139,7 +137,7 @@ describe("widget rendering", () => {
       120,
       12,
       { ...theme, fg },
-      { completed: 0, tokens: 21, inputTokens: 21, outputTokens: 0 },
+      { completed: 0, inputTokens: 21, outputTokens: 0 },
     );
     expect(fg.mock.calls.some(([color]) => color === "dim")).toBe(false);
   });
@@ -203,7 +201,6 @@ describe("widget rendering", () => {
     expect(render([failed]).join("\n")).toContain("err");
     const summary = {
       completed: 3,
-      tokens: 12000,
       inputTokens: 10000,
       outputTokens: 2000,
     };
@@ -311,7 +308,6 @@ it("polls only visible active rows, reserves space below, resumes and cleans up"
     list: () => tasks,
     summary: () => ({
       completed: 0,
-      tokens: 21,
       inputTokens: 21,
       outputTokens: 0,
     }),

@@ -16,18 +16,18 @@ const options: WorkerOptions = {
   name: "test",
 };
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
-const usage = (tokens: number): Usage => ({
-  input: tokens,
-  output: 0,
-  cacheRead: 0,
+const usage = (input: number, output = 0, cacheRead = 0): Usage => ({
+  input,
+  output,
+  cacheRead,
   cacheWrite: 0,
-  totalTokens: tokens,
+  totalTokens: input + output + cacheRead,
   cost: {
-    input: tokens,
-    output: 0,
-    cacheRead: 0,
+    input,
+    output,
+    cacheRead,
     cacheWrite: 0,
-    total: tokens,
+    total: input + output + cacheRead,
   },
 });
 
@@ -359,116 +359,32 @@ describe("input ownership at close", () => {
 
 describe("final reports and receipts", () => {
   it.each(["collect", "stop", "failure"] as const)(
-    "preserves separate input/output counts through streaming, continuation and %s",
+    "preserves cumulative display and bills once on %s",
     async (take) => {
       const { c, workers, start } = setup();
       const id = start();
-      const snapshot = (
-        input: number,
-        output: number,
-        cacheRead: number,
-      ): Usage => ({
-        ...usage(input + output + cacheRead),
-        input,
-        output,
-        cacheRead,
-      });
-      const stream = (worker: Fake, value: Usage) =>
-        worker.emit({
-          type: "message_end",
-          message: {
-            role: "assistant",
-            api: "openai-completions",
-            provider: "p",
-            model: "m",
-            content: [],
-            stopReason: "stop",
-            usage: value,
-            timestamp: 0,
-          },
-        });
-      expect(c.summary()).toMatchObject({
-        tokens: 0,
-        inputTokens: 0,
-        outputTokens: 0,
-      });
-      stream(workers[0]!, snapshot(10, 2, 88));
-      expect(c.summary()).toMatchObject({
-        tokens: 100,
-        inputTokens: 10,
-        outputTokens: 2,
-      });
-      workers[0]!.close({ usage: snapshot(12, 3, 185) });
-      await tick();
-      expect(c.summary()).toMatchObject({
-        tokens: 200,
-        inputTokens: 12,
-        outputTokens: 3,
-      });
-
-      await c.message(id, "next");
-      stream(workers[1]!, snapshot(5, 4, 41));
-      expect(c.summary()).toMatchObject({
-        tokens: 250,
-        inputTokens: 17,
-        outputTokens: 7,
-      });
-      workers[1]!.close({
-        usage: snapshot(20, 10, 270),
-        ...(take === "failure" ? { error: "failed" } : {}),
-      });
-      await tick();
-      expect(c.summary()).toMatchObject({
-        tokens: 300,
-        inputTokens: 20,
-        outputTokens: 10,
-      });
-      if (take === "collect") await c.collect(id);
-      else if (take === "stop") await c.stop(id);
-      else await c.prompt();
-      c.drainUsage();
-      await c.collect(id); // Receipt retrieval and billing drains do not change display totals.
-      expect(c.summary()).toMatchObject({
-        tokens: 300,
-        inputTokens: 20,
-        outputTokens: 10,
-      });
-
-      const next = start("another task");
-      workers[2]!.close({ usage: snapshot(7, 8, 5) });
-      await tick();
-      await c.collect(next);
-      expect(c.summary()).toMatchObject({
-        tokens: 320,
-        inputTokens: 27,
-        outputTokens: 18,
-      });
-      await c.dispose();
-    },
-  );
-
-  it.each(["collect", "failure"] as const)(
-    "replaces cumulative usage and reports it once on %s",
-    async (take) => {
-      const { c, workers, start } = setup();
-      const id = start();
-      workers[0]!.close({ usage: usage(10) });
+      workers[0]!.close({ usage: usage(8, 2) });
       await tick();
       expect(c.drainUsage()).toBeUndefined();
       await c.message(id, "next");
       workers[1]!.close({
-        usage: usage(25),
+        usage: usage(12, 3, 10),
         ...(take === "failure" ? { error: "failed" } : {}),
       });
       await tick();
       if (take === "collect") await c.collect(id);
+      else if (take === "stop") await c.stop(id);
       else await c.prompt();
-      expect(c.drainUsage()).toEqual(usage(25));
+      expect(c.drainUsage()).toEqual(usage(12, 3, 10));
       await c.collect(id);
       await c.stop(id);
       await c.prompt();
       expect(c.drainUsage()).toBeUndefined();
-      expect(c.summary().completed).toBe(take === "collect" ? 1 : 0);
+      expect(c.summary()).toEqual({
+        completed: take === "collect" ? 1 : 0,
+        inputTokens: 12,
+        outputTokens: 3,
+      });
       const receipt = c.inspect(id);
       expect(receipt).not.toHaveProperty("worker");
       expect(receipt).not.toHaveProperty("run");
@@ -506,16 +422,43 @@ describe("final reports and receipts", () => {
     await c.dispose();
   });
 
-  it("reconciles displayed tokens with the whole-session snapshot, including non-streamed usage", async () => {
+  it("reconciles streamed counts with saved session usage across continuations", async () => {
     const { c, workers, start } = setup();
     const id = start();
-    workers[0]!.close({ usage: usage(25) });
+    const stream = (worker: Fake, value: Usage) =>
+      worker.emit({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          api: "openai-completions",
+          provider: "p",
+          model: "m",
+          content: [],
+          stopReason: "stop",
+          usage: value,
+          timestamp: 0,
+        },
+      });
+    stream(workers[0]!, usage(10, 2, 88));
+    expect(c.summary()).toMatchObject({ inputTokens: 10, outputTokens: 2 });
+    workers[0]!.close({ usage: usage(12, 3, 185) });
     await tick();
-    expect(c.get(id).tokens).toBe(25);
-    expect(c.summary().tokens).toBe(25);
-    expect((await c.collect(id)).tokens).toBe(25);
-    expect(c.summary().tokens).toBe(25);
-    expect(c.drainUsage()?.totalTokens).toBe(25);
+    expect(c.get(id).tokens).toBe(200);
+
+    await c.message(id, "next");
+    stream(workers[1]!, usage(5, 4, 41));
+    expect(c.summary()).toMatchObject({ inputTokens: 17, outputTokens: 7 });
+    workers[1]!.close({ usage: usage(20, 10, 270) });
+    await tick();
+    expect(c.summary()).toMatchObject({ inputTokens: 20, outputTokens: 10 });
+    expect((await c.collect(id)).tokens).toBe(300);
+    expect(c.drainUsage()).toEqual(usage(20, 10, 270));
+
+    const next = start("another task");
+    workers[2]!.close({ usage: usage(7, 8, 5) });
+    await tick();
+    await c.collect(next);
+    expect(c.summary()).toMatchObject({ inputTokens: 27, outputTokens: 18 });
     await c.dispose();
   });
 

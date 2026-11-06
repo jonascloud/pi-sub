@@ -40,7 +40,6 @@ export interface TaskResult extends TaskData {
 }
 export interface Summary {
   completed: number;
-  tokens: number;
   inputTokens: number;
   outputTokens: number;
 }
@@ -80,7 +79,6 @@ export class Coordinator {
   private usage?: Usage;
   private totals: Summary = {
     completed: 0,
-    tokens: 0,
     inputTokens: 0,
     outputTokens: 0,
   };
@@ -206,7 +204,6 @@ export class Coordinator {
   summary(): Summary {
     const summary = { ...this.totals };
     for (const t of this.tasks.values()) {
-      summary.tokens += t.data.tokens;
       summary.inputTokens += t.inputTokens;
       summary.outputTokens += t.outputTokens;
     }
@@ -504,7 +501,6 @@ export class Coordinator {
     if (this.tasks.delete(t.data.id)) {
       this.receipts.set(result.id, structuredClone(result));
       if (t.usage) this.usage = addUsage(this.usage, t.usage);
-      this.totals.tokens += result.tokens;
       this.totals.inputTokens += t.inputTokens;
       this.totals.outputTokens += t.outputTokens;
       if (result.outcome === "reply") this.totals.completed++;
