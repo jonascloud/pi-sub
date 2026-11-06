@@ -200,7 +200,7 @@ export class ModelSetup {
         description: "Review model ladder",
         level: undefined,
         worker: { ...worker, sessionDir },
-        prompt: `${instructions}\n\nApproved variants (research only):\n${JSON.stringify(s.approved)}\n\nCurrent ladder:\n${JSON.stringify(s.current ?? null)}\n${currentError ? `Current ladder is malformed; propose an explicit repair. ${currentError}\n` : ""}\nReturn only proposal JSON with exactly {"ladder": <complete ladder>, "comparison": <nonempty human comparison>}. Do not write configuration files.`,
+        prompt: `${instructions}\n\nApproved variants (research only):\n${JSON.stringify(s.approved)}\n\nCurrent ladder:\n${JSON.stringify(s.current ?? null)}\n${currentError ? `Current ladder is malformed; propose an explicit repair. ${currentError}\n` : ""}`,
       });
       this.state = {
         phase: "working",

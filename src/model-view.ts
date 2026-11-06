@@ -22,10 +22,12 @@ export function renderModelSelection(
     view.phase === "review"
       ? `DRAFT ${view.revision} — not saved`
       : view.phase === "saving"
-        ? "Saving confirmed ladder"
+        ? "Saving"
         : view.paused
-          ? "Paused — send a refinement to resume"
-          : "Working — no configuration changed";
+          ? "Paused · saved ladder"
+          : view.id
+            ? "Researching · saved ladder"
+            : "Preparing";
   const lines = [`Model selection · ${phase} · AA reference USD/task`];
   const content: string[] = [];
   if (view.currentError)
@@ -45,28 +47,30 @@ export function renderModelSelection(
       continue;
     }
     const change = !view.draft
-      ? " · saved at start"
+      ? ""
       : !previous
         ? " · new"
         : entry.model !== previous.model || entry.cost !== previous.cost
           ? " · changed"
-          : " · unchanged";
+          : "";
     content.push(
       `lvl ${level}  ${clean(entry.model)} · ${cost(entry.cost)}${change}`,
     );
   }
   if (view.draft && !Object.keys(view.draft).length)
     content.push("Empty draft — delegation disabled if accepted.");
-  else if (!levels.length)
-    content.push(
-      view.phase === "working"
-        ? "Preparing a proposal. The saved ladder remains active."
-        : "Empty ladder — delegation disabled.",
-    );
+  else if (!levels.length && view.phase !== "working")
+    content.push("Empty ladder — delegation disabled.");
   const footer =
     view.phase === "saving"
-      ? "Saving… /sub:models cancel stops only an uncommitted save."
-      : "Type a refinement, accept or cancel · /sub:models cancel";
+      ? "cancel before commit"
+      : view.phase === "review"
+        ? "Refine by prompt · accept · cancel"
+        : !view.id
+          ? "cancel"
+          : view.paused
+            ? "Refine to resume · cancel"
+            : "Refine by prompt · cancel";
   if (height === 1) return [truncateToWidth(lines[0]!, width)];
   const room = Math.max(0, height - 2);
   if (content.length <= room) lines.push(...content);

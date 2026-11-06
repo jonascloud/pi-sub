@@ -7,6 +7,7 @@ import type { TaskResult, TaskView } from "../src/coordinator.ts";
 import piSub from "../index.ts";
 import * as models from "../src/models.ts";
 import * as modelSetup from "../src/setup.ts";
+import { SUBAGENT_GUIDANCE } from "../src/messages.ts";
 
 const fake = vi.hoisted(() => ({
   interrupted: false,
@@ -33,6 +34,7 @@ vi.mock("../src/coordinator.ts", () => ({
     start = fake.start;
     get = () => ({ id: "new-task" });
     drainUsage = () => undefined;
+    list = () => [];
     subscribe = () => () => {};
   },
 }));
@@ -66,7 +68,7 @@ function setup(mode = "rpc") {
   >();
   const tools = new Map<
     string,
-    { execute: (...args: any[]) => Promise<any> }
+    { description: string; execute: (...args: any[]) => Promise<any> }
   >();
   const sendMessage = vi.fn();
   const notify = vi.fn();
@@ -92,8 +94,10 @@ function setup(mode = "rpc") {
       handlers.set(name, handler),
     registerCommand: (name: string, command: any) =>
       commands.set(name, command),
+    registerMessageRenderer: vi.fn(),
     registerTool: (tool: {
       name: string;
+      description: string;
       execute: (...args: any[]) => Promise<any>;
     }) => tools.set(tool.name, tool),
     sendMessage,
@@ -144,7 +148,7 @@ test.each(["interactive", "rpc"])(
       expect.objectContaining({
         customType: "pi-sub:failures",
         details: [failure],
-        content: expect.stringContaining("No cleanup tool call is needed"),
+        content: expect.stringContaining("Collected failures:"),
       }),
       { triggerTurn: false },
     );
@@ -248,6 +252,32 @@ test("a custom notification cannot restart an interrupted parent", () => {
   expect(fake.prompt).not.toHaveBeenCalled();
 });
 
+test("one stable guidance section is replaced, not appended as repeated chat instructions", () => {
+  const { ctx, emit, sendMessage, tools } = setup();
+  Object.assign(ctx, {
+    model: { provider: "test", id: "fake" },
+    thinkingLevel: "off",
+  });
+  vi.spyOn(modelSetup, "approvedModels").mockReturnValue([
+    { provider: "test", model: "fake", thinking: ["off"] },
+  ]);
+  vi.spyOn(models, "loadLadder").mockReturnValue({
+    "6": { model: "test/fake:off", cost: 0.1 },
+  });
+  const systemPromptOptions = { sections: { pi_sub: "old section" } };
+  emit("before_agent_start", { systemPromptOptions });
+  const first = systemPromptOptions.sections.pi_sub;
+  emit("before_agent_start", { systemPromptOptions });
+  expect(systemPromptOptions.sections.pi_sub).toBe(first);
+  expect(first.split(SUBAGENT_GUIDANCE)).toHaveLength(2);
+  expect(first).toContain("1–6: test/fake:off");
+  expect(sendMessage).not.toHaveBeenCalled();
+  expect(
+    [...tools.values()].reduce((n, tool) => n + tool.description.length, 0),
+  ).toBeLessThan(500);
+  expect(tools.get("sub_result")!.description).toContain("finish:true");
+});
+
 test("model setup reserves admission before awaiting user-input cleanup", async () => {
   const { commands, ctx, notify } = setup();
   Object.assign(ctx, {
@@ -259,10 +289,7 @@ test("model setup reserves admission before awaiting user-input cleanup", async 
   const first = commands.get("sub:models")!.handler("", ctx);
   await commands.get("sub:models")!.handler("", ctx);
   expect(fake.prompt).toHaveBeenCalledOnce();
-  expect(notify).toHaveBeenCalledWith(
-    expect.stringContaining("already open"),
-    "info",
-  );
+  expect(notify).not.toHaveBeenCalled(); // Redisplay the existing panel without a second explanation.
   preparation.resolve(false);
   await first;
 });

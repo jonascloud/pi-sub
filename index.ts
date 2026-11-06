@@ -18,7 +18,6 @@ import {
 } from "./src/coordinator.ts";
 import {
   ladderPath,
-  describeLevels,
   loadLadder,
   parseReference,
   selectExecution,
@@ -31,6 +30,13 @@ import {
 } from "./src/setup.ts";
 import { renderModelSelection } from "./src/model-view.ts";
 import { mountWidget, availableWidgetHeight } from "./src/widget.ts";
+import {
+  SUBAGENT_GUIDANCE,
+  failureSummary,
+  replyNotification,
+  renderReply,
+  routingSummary,
+} from "./src/messages.ts";
 
 const reason = (error: unknown) =>
   error instanceof Error ? error.message : String(error);
@@ -38,6 +44,7 @@ const reason = (error: unknown) =>
 export default function piSub(pi: ExtensionAPI): void {
   // Children load normal Pi resources, but must not recursively install their coordinator.
   if (process.env.PI_SUB_CHILD === "1") return;
+  pi.registerMessageRenderer("pi-sub:response", renderReply);
   let context: ExtensionContext | undefined;
   let coordinator: Coordinator | undefined;
   let unmount: (() => void) | undefined;
@@ -64,25 +71,14 @@ export default function piSub(pi: ExtensionAPI): void {
       onReady(task) {
         if (lifetime.signal.aborted || task.level === undefined) return;
         if (task.outcome === "error") {
-          notify(
-            `Subagent ${task.id} failed: ${task.error}. It will be collected before the next user prompt.`,
-            "error",
-          );
+          notify(`${task.description} (${task.id}): ${task.error}`, "error");
           return;
         }
         if (!coordinator?.runnable) return;
-        const text = stripTerminalSequences(task.error ?? task.response);
-        pi.sendMessage(
-          {
-            customType: "pi-sub:response",
-            display: true,
-            content: truncateHead(
-              `Subagent ${task.id} (${task.description}) has a response:\n${text}\n\nThis may be a question, not a final result. Use sub_message to answer or sub_result with finish:true to accept and remove the task.`,
-              { maxBytes: 8000, maxLines: 100 },
-            ).content,
-          },
-          { deliverAs: "followUp", triggerTurn: !selection?.active },
-        );
+        pi.sendMessage(replyNotification(task), {
+          deliverAs: "followUp",
+          triggerTurn: !selection?.active,
+        });
       },
     }));
   const checkContext = (ctx: ExtensionContext) => {
@@ -121,27 +117,7 @@ export default function piSub(pi: ExtensionAPI): void {
         {
           customType: "pi-sub:failures",
           display: true,
-          content: `Failed subagents were closed and removed before this user input. No cleanup tool call is needed. Decide only how to continue the work.\n${
-            truncateHead(
-              JSON.stringify(
-                failures.map((report) => ({
-                  ...report,
-                  response: truncateHead(report.response, {
-                    maxBytes: 1600,
-                    maxLines: 30,
-                  }).content,
-                  pendingInput: report.pendingInput?.map(
-                    (text) =>
-                      truncateHead(text, { maxBytes: 1600, maxLines: 30 })
-                        .content,
-                  ),
-                })),
-                null,
-                2,
-              ),
-              { maxBytes: 16000, maxLines: 160 },
-            ).content
-          }\nFull reports remain in message details and native session artifacts.`,
+          content: failureSummary(failures),
           details: failures,
         },
         { triggerTurn: false },
@@ -264,7 +240,7 @@ export default function piSub(pi: ExtensionAPI): void {
       onReport: reportSelection,
       onSaved: (path) =>
         reportSelection({
-          content: `Global model ladder saved: ${path}. No benchmark or cost ranking is used at dispatch.`,
+          content: `Model ladder saved: ${path}`,
         }),
     }));
   const cancelSelection = async () => {
@@ -275,7 +251,7 @@ export default function piSub(pi: ExtensionAPI): void {
     // Invalidate publication immediately, not after unrelated input preparation.
     await setup.cancel();
     reportSelection({
-      content: `Model selection ${shown?.revision ?? ""} closed. The saved ladder remains active.`,
+      content: `Model selection ${shown?.revision ?? ""} closed.`,
     });
   };
 
@@ -310,7 +286,7 @@ export default function piSub(pi: ExtensionAPI): void {
         await selection!.cancel(); // Close the publication gate before asynchronous preparation.
         if (await preparePrompt())
           reportSelection({
-            content: `Model selection ${shown?.revision ?? ""} closed. The saved ladder remains active.`,
+            content: `Model selection ${shown?.revision ?? ""} closed.`,
           });
         return { action: "handled" };
       }
@@ -395,18 +371,13 @@ export default function piSub(pi: ExtensionAPI): void {
         })
         .map(([level]) => Number(level));
       table =
-        `Your operator-configured ladder strength: ${self.length ? Math.max(...self) + "/10" : "unknown"}.\n` +
-        describeLevels(ladder, approved)
-          .map((row) =>
-            row.execution
-              ? `lvl ${row.level}: rung ${row.execution.power}, ${row.execution.provider}/${row.execution.model}:${row.execution.thinking}, reference USD/task ${row.execution.cost === null ? "unknown" : row.execution.cost}`
-              : `lvl ${row.level}: unavailable`,
-          )
-          .join("\n");
+        `Your configured strength: ${self.length ? Math.max(...self) + "/10" : "unknown"}.\n` +
+        "Ladder · reference USD/AA task, not actual price or quota:\n" +
+        routingSummary(ladder, approved);
     } catch (error) {
       table = reason(error);
     }
-    event.systemPromptOptions.sections.pi_sub = `A subagent is a task with a native Pi session. Each execution uses a fresh short-lived Pi process; ready and paused tasks hold no process. Start bounded tasks with sub_task at the minimum sufficient level; count briefing, research, verification and integration overhead. All tasks are asynchronous. Ordinary replies can be questions: inspect before accepting a final result. Use sub_message for answers/corrections, sub_control for pause/continue/stop, and sub_result finish:true only to accept a final response and remove the task. Redirecting active work interrupts its process, waits for exit and starts a new process on the same session with the correction. Parent interruption pauses children; a new user prompt does not resume them. No child UI dialogs, custom roles or conversation inheritance.\nThe user-confirmed ladder is authoritative. Take the first available, approved rung at or above the requested level; never rank by reference cost or invent alternatives. Reference costs are informational AA Intelligence Index v5.0.1 USD/task including thinking/cache, not live task cost or Codex quota. Model selection drafts are never active until explicit operator acceptance.\nFinal errors are automatically closed, delivered and removed before the next real user prompt, without a cleanup tool call.\nOpen subagents: ${JSON.stringify(
+    event.systemPromptOptions.sections.pi_sub = `${SUBAGENT_GUIDANCE}\n\nOpen tasks (snapshot): ${JSON.stringify(
       manager()
         .list()
         .map((task) => ({
@@ -415,7 +386,7 @@ export default function piSub(pi: ExtensionAPI): void {
           status: task.status,
           outcome: task.outcome,
         })),
-    )}\nCurrent routing (rechecked on admission; not a reservation):\n${table}`;
+    )}\n\n${table}`;
   });
   pi.on("session_shutdown", async () => {
     lifetime.abort();
@@ -454,9 +425,6 @@ export default function piSub(pi: ExtensionAPI): void {
           );
         if (selection?.active) {
           refreshSelection(selection.view);
-          notify(
-            "Model selection is already open. Type a refinement, accept or cancel.",
-          );
           return;
         }
         const model = ctx.model;
@@ -536,12 +504,14 @@ export default function piSub(pi: ExtensionAPI): void {
       exposure: "model-only",
       executionMode: "sequential",
       description:
-        "Start an asynchronous task with its own native Pi session. Uses the first currently approved, available rung in the user-confirmed global model ladder at or above the required level. Costs never reorder it. Level is a minimum, never an inferred default.",
+        "Start an asynchronous, self-contained task at the required minimum level.",
       parameters: Type.Object(
         {
           level: Type.Number({ minimum: 1, maximum: 10, multipleOf: 1 }),
           prompt: Type.String({ minLength: 1 }),
-          description: Type.Optional(Type.String()),
+          description: Type.Optional(
+            Type.String({ description: "Short task label." }),
+          ),
         },
         { additionalProperties: false },
       ),
@@ -583,7 +553,7 @@ export default function piSub(pi: ExtensionAPI): void {
       exposure: "model-only",
       executionMode: "sequential",
       description:
-        "Answer or redirect a task in its native session. Active execution is interrupted and fully terminated before a fresh process receives the correction. Paused work resumes only explicitly; ordinary replies are not automatically final results.",
+        "Send an answer or correction. Interrupts active work; explicitly resumes paused tasks.",
       parameters: Type.Object(
         { id: Type.String(), message: Type.String({ minLength: 1 }) },
         { additionalProperties: false },
@@ -608,12 +578,18 @@ export default function piSub(pi: ExtensionAPI): void {
       exposure: "model-only",
       executionMode: "sequential",
       description:
-        "Inspect a task without removing it. Optional wait observes execution completion, not semantic task completion. Timeout never stops work. finish:true accepts a final response and removes the task; its process has already exited. Final errors are collected automatically before the next user prompt. Full history remains in the native session.",
+        "Read or wait for a response. finish:true accepts/removes a ready response; a timeout only ends the wait.",
       parameters: Type.Object(
         {
           id: Type.String(),
           wait: Type.Optional(Type.Boolean()),
-          timeout: Type.Optional(Type.Number({ minimum: 0, maximum: 3600 })),
+          timeout: Type.Optional(
+            Type.Number({
+              minimum: 0,
+              maximum: 3600,
+              description: "Wait timeout in seconds; default 30.",
+            }),
+          ),
           finish: Type.Optional(Type.Boolean()),
         },
         { additionalProperties: false },
@@ -640,7 +616,7 @@ export default function piSub(pi: ExtensionAPI): void {
       exposure: "model-only",
       executionMode: "sequential",
       description:
-        "Explicitly pause, continue or stop one subagent by ID. Omitting the ID controls all applicable tasks. Continue does not change the task or its model.",
+        "Pause, continue or stop tasks; omit id for all applicable tasks. Stopping never rolls back side effects.",
       parameters: Type.Object(
         {
           id: Type.Optional(Type.String()),

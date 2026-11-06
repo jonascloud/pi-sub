@@ -24,8 +24,8 @@ describe("model selection panel", () => {
     expect(lines).toContain("test/new:low · $0.2 · changed");
     expect(lines).toContain("test/new:medium · unknown · new");
     expect(lines).toContain("test/old:high · removed");
-    expect(lines).toContain("accept or cancel");
-    expect(lines).toContain("/sub:models cancel");
+    expect(lines).toContain("accept · cancel");
+    expect(lines).not.toContain("unchanged");
   });
   it("shows preparation, pause, publication and repair explicitly", () => {
     expect(
@@ -33,13 +33,13 @@ describe("model selection panel", () => {
         { phase: "working", revision: 1, paused: false },
         120,
       ).join("\n"),
-    ).toContain("saved ladder remains active");
+    ).toContain("Preparing");
     expect(
       renderModelSelection({ ...view, phase: "working", paused: true }, 120)[0],
     ).toContain("Paused");
     expect(
       renderModelSelection({ ...view, phase: "saving" }, 120).join("\n"),
-    ).toContain("Saving confirmed ladder");
+    ).toContain("Saving");
     expect(
       renderModelSelection({ ...view, currentError: "invalid JSON" }, 120).join(
         "\n",
