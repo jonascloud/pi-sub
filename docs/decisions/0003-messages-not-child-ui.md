@@ -14,6 +14,8 @@ Native JSON/print execution has no interactive UI. Its public defaults return `f
 
 Keep operating guidance in one stable system-prompt section and operation-specific tool contracts. Replace that section when context changes rather than appending tutorials to replies. Notifications carry identity and new information only. TUI reply previews are compact and expandable without reducing the model-visible delivery. The parent uses routine reports internally and does not acknowledge historical deliveries again.
 
+Ready tasks are the reply inbox, not a second queue of frozen reports. At native turn boundaries, batch the current unannounced replies into one persisted custom message. Complete tool returns suppress redundant announcements before the next request, while native history prevents repeated announcements of truncated reports. Natural continuation satisfies the batch's continuation request; it does not add a second turn. Coalesce idle arrivals once per event-loop turn, without polling or a debounce delay. Interruptions suppress wakeups, and model selection may display reports without starting the parent. Bounded overflow stays eligible at the next boundary. Delivery remains reply-specific and separate from task acceptance.
+
 State-dependent actions and consequential warnings remain visible where needed: an uncommitted draft is not active, empty selection disables delegation, and cancellation cannot undo publication. Persistent controls are not repeated chat messages. Dynamic routing facts are grouped rather than repeating identical choices for every level.
 
 ## Native views

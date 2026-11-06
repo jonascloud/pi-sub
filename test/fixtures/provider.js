@@ -1,5 +1,6 @@
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai/utils/event-stream";
-import { writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { basename, join } from "node:path";
 
 function reply(context) {
   const messages = context.messages;
@@ -71,9 +72,30 @@ function reply(context) {
     const results = messages
       .slice(index + 1)
       .filter((message) => message.role === "toolResult");
+    if (text === "integration:batch" && !results.length)
+      return {
+        calls: [
+          ...["First review", "Second review"].map((description) => ({
+            name: "sub_task",
+            args: {
+              level: 3,
+              prompt: "Return a test response.",
+              description,
+            },
+          })),
+          {
+            name: "bash",
+            args: {
+              command: "while [ ! -f parent-release ]; do sleep 0.05; done",
+              timeout: 20,
+            },
+          },
+        ],
+      };
     if (
       [
         "integration:delegate",
+        "integration:read-via-wait",
         "integration:notify",
         "integration:probe-global",
         "integration:pause",
@@ -130,7 +152,7 @@ function reply(context) {
     if (text === "integration:retry" && results.at(-1)?.toolName === "sub_task")
       return { error: "429 rate limit test" };
     if (
-      text === "integration:delegate" &&
+      ["integration:delegate", "integration:read-via-wait"].includes(text) &&
       results.at(-1)?.toolName === "sub_task"
     ) {
       const task = JSON.parse(
@@ -138,7 +160,12 @@ function reply(context) {
       );
       return {
         name: "sub_result",
-        args: { id: task.id, wait: true, timeout: 15, finish: true },
+        args: {
+          id: task.id,
+          wait: true,
+          timeout: 15,
+          finish: text === "integration:delegate",
+        },
       };
     }
     if (text === "integration:repeat" && !results.length) {
@@ -156,6 +183,15 @@ function reply(context) {
 }
 
 export default function (pi) {
+  if (process.env.PI_SUB_CHILD === "1" && process.env.WORKER_TEST_CHILD_PIDS)
+    pi.on("session_start", (_event, ctx) => {
+      const directory = join(ctx.cwd, "child-pids");
+      mkdirSync(directory, { recursive: true });
+      writeFileSync(
+        join(directory, basename(ctx.sessionManager.getSessionFile())),
+        String(process.pid),
+      );
+    });
   const definition = {
     baseUrl: "http://localhost",
     apiKey: "test",
@@ -235,32 +271,35 @@ export default function (pi) {
             stream.end();
             return;
           }
-          if (output.name) {
-            const toolCall = {
-              type: "toolCall",
-              id: `call-${Date.now()}`,
-              name: output.name,
-              arguments: output.args,
-            };
-            message.content.push(toolCall);
+          if (output.name || output.calls) {
             message.stopReason = "toolUse";
-            stream.push({
-              type: "toolcall_start",
-              contentIndex: 0,
-              partial: message,
-            });
-            stream.push({
-              type: "toolcall_delta",
-              contentIndex: 0,
-              delta: JSON.stringify(output.args),
-              partial: message,
-            });
-            stream.push({
-              type: "toolcall_end",
-              contentIndex: 0,
-              toolCall,
-              partial: message,
-            });
+            for (const call of output.calls ?? [output]) {
+              const contentIndex = message.content.length;
+              const toolCall = {
+                type: "toolCall",
+                id: `call-${Date.now()}-${contentIndex}`,
+                name: call.name,
+                arguments: call.args,
+              };
+              message.content.push(toolCall);
+              stream.push({
+                type: "toolcall_start",
+                contentIndex,
+                partial: message,
+              });
+              stream.push({
+                type: "toolcall_delta",
+                contentIndex,
+                delta: JSON.stringify(call.args),
+                partial: message,
+              });
+              stream.push({
+                type: "toolcall_end",
+                contentIndex,
+                toolCall,
+                partial: message,
+              });
+            }
           } else {
             message.content.push({ type: "text", text: output.text });
             stream.push({

@@ -1,5 +1,12 @@
 import { expect, test } from "vitest";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  mkdtemp,
+  mkdir,
+  readFile,
+  readdir,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
@@ -166,8 +173,8 @@ test("native reply delivery keeps the task and its session available for follow-
           (message) =>
             message.role === "custom" &&
             message.customType === "pi-sub:response" &&
-            (message.details as { reply?: { id: string } })?.reply?.id !==
-              previous,
+            (message.details as { replies: { reply: { id: string } }[] })
+              .replies[0]?.reply.id !== previous,
         );
         expect(index).toBeGreaterThanOrEqual(0);
         // The native parent has made a request containing the notification.
@@ -178,11 +185,15 @@ test("native reply delivery keeps the task and its session available for follow-
         ).toBe(true);
         const message = messages[index]!;
         if (message.role !== "custom") throw new Error("No reply notification");
-        return message.details as {
-          id: string;
-          sessionFile: string;
-          reply: { id: string; delivered: boolean };
-        };
+        return (
+          message.details as {
+            replies: {
+              id: string;
+              sessionFile: string;
+              reply: { id: string; delivered: boolean };
+            }[];
+          }
+        ).replies[0]!;
       });
     await client.promptAndWait("integration:notify", undefined, 20000);
     const first = await delivered();
@@ -206,6 +217,132 @@ test("native reply delivery keeps the task and its session available for follow-
       reply: { id: next.reply.id, delivered: true },
     });
   } finally {
+    await dispose();
+  }
+}, 40000);
+
+test("a complete tool delivery needs no acceptance call and causes no delayed notification", async () => {
+  const { client, agentDir, dispose } = await host({}, undefined, false);
+  try {
+    await writeFile(
+      join(agentDir, "pi-sub-config.json"),
+      JSON.stringify({
+        "6": { model: "worker-test/fake:off", cost: 0.1 },
+      }),
+    );
+    await client.promptAndWait("integration:read-via-wait", undefined, 20000);
+    const messages = await client.getMessages();
+    expect(
+      messages.filter((message) => message.role === "assistant"),
+    ).toHaveLength(3);
+    expect(
+      messages.filter(
+        (message) =>
+          message.role === "custom" && message.customType === "pi-sub:response",
+      ),
+    ).toHaveLength(0);
+    expect(await latestResult(client)).toMatchObject({
+      status: "ready",
+      outcome: "reply",
+    });
+    await client.promptAndWait("integration:inspect", undefined, 20000);
+    expect(await latestResult(client)).toMatchObject({
+      status: "ready",
+      outcome: "reply",
+      reply: { delivered: true },
+    });
+    expect(
+      (await client.getMessages()).filter(
+        (message) =>
+          message.role === "custom" && message.customType === "pi-sub:response",
+      ),
+    ).toHaveLength(0);
+  } finally {
+    await dispose();
+  }
+}, 30000);
+
+test("native turn boundaries batch concurrent replies into the already required next request", async () => {
+  const { client, cwd, agentDir, dispose } = await host(
+    { WORKER_TEST_CHILD_PIDS: "1" },
+    undefined,
+    false,
+  );
+  const gate = nextEvent(
+    client,
+    (event) =>
+      event.type === "tool_execution_start" && event.toolName === "bash",
+  );
+  try {
+    await writeFile(
+      join(agentDir, "pi-sub-config.json"),
+      JSON.stringify({
+        "6": { model: "worker-test/fake:off", cost: 0.1 },
+      }),
+    );
+    const settled = nextEvent(
+      client,
+      (event) => event.type === "agent_settled",
+    );
+    try {
+      await client.prompt("integration:batch");
+      await gate.promise;
+      // Keep a real parent tool open until both child processes have exited.
+      // Replies must not be sent as follow-ups while this turn is still active.
+      await eventually(async () => {
+        const files = await readdir(join(cwd, "child-pids"));
+        expect(files).toHaveLength(2);
+        for (const file of files) {
+          const pid = Number(
+            await readFile(join(cwd, "child-pids", file), "utf8"),
+          );
+          expect(() => process.kill(pid, 0)).toThrow();
+          expect(
+            await readFile(join(cwd, ".pi/pi-sub/sessions", file), "utf8"),
+          ).toContain("fake response");
+        }
+      });
+      expect(
+        (await client.getMessages()).filter(
+          (message) =>
+            message.role === "custom" &&
+            message.customType === "pi-sub:response",
+        ),
+      ).toHaveLength(0);
+      await writeFile(join(cwd, "parent-release"), "continue");
+      await settled.promise;
+    } finally {
+      settled.dispose();
+    }
+    const messages = await client.getMessages();
+    const batches = messages.filter(
+      (message) =>
+        message.role === "custom" && message.customType === "pi-sub:response",
+    );
+    expect(batches).toHaveLength(1);
+    if (batches[0]!.role !== "custom") throw Error("Missing native batch");
+    expect(
+      (
+        batches[0]!.details as { replies: { description: string }[] }
+      ).replies.map((reply) => reply.description),
+    ).toEqual(["First review", "Second review"]);
+    // The tool-calling request and its natural continuation, not a third acknowledgement turn.
+    expect(
+      messages.filter((message) => message.role === "assistant"),
+    ).toHaveLength(2);
+    await client.promptAndWait("integration:inspect", undefined, 20000);
+    expect(await latestResult(client)).toMatchObject({
+      status: "ready",
+      reply: { delivered: true },
+    });
+    expect(
+      (await client.getMessages()).filter(
+        (message) =>
+          message.role === "custom" && message.customType === "pi-sub:response",
+      ),
+    ).toHaveLength(1);
+  } finally {
+    gate.dispose();
     await dispose();
   }
 }, 40000);

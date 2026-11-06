@@ -8,11 +8,18 @@ import type { TaskResult, TaskView } from "../src/coordinator.ts";
 import piSub from "../index.ts";
 import * as models from "../src/models.ts";
 import * as modelSetup from "../src/setup.ts";
-import { SUBAGENT_GUIDANCE, replyNotification } from "../src/messages.ts";
+import {
+  SUBAGENT_GUIDANCE,
+  replyNotification,
+  replyBatch,
+} from "../src/messages.ts";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 
 const fake = vi.hoisted(() => ({
   interrupted: false,
   runnable: true,
+  idle: true,
+  tasks: [] as TaskView[],
   prompt:
     vi.fn<(deliver: (failures: TaskResult[]) => void) => Promise<boolean>>(),
   interrupt: vi.fn<() => Promise<void>>(),
@@ -39,13 +46,15 @@ vi.mock("../src/coordinator.ts", () => ({
     markDelivered = fake.markDelivered;
     get = () => ({ id: "new-task" });
     drainUsage = () => undefined;
-    list = () => [];
+    list = () => [...fake.tasks].reverse();
     subscribe = () => () => {};
+    dispose = async () => {};
   },
 }));
 vi.mock("../src/widget.ts", () => ({ mountWidget: () => () => {} }));
 
-afterEach(() => {
+afterEach(async () => {
+  await flushReplies();
   vi.unstubAllEnvs();
   vi.restoreAllMocks();
 });
@@ -54,9 +63,16 @@ beforeEach(() => {
   vi.stubEnv("PI_SUB_CHILD", "");
   fake.interrupted = false;
   fake.runnable = true;
+  fake.idle = true;
+  fake.tasks = [];
   fake.start.mockReset().mockReturnValue("new-task");
   fake.stop.mockReset();
-  fake.markDelivered.mockReset();
+  fake.markDelivered.mockReset().mockImplementation((id, replyId) => {
+    const task = fake.tasks.find(
+      (task) => task.id === id && task.reply?.id === replyId,
+    );
+    if (task?.reply) task.reply.delivered = true;
+  });
   fake.prompt.mockReset().mockResolvedValue(true);
   fake.interrupt.mockReset().mockImplementation(async () => {
     fake.interrupted = true;
@@ -80,7 +96,10 @@ function setup(mode = "rpc") {
       execute: (...args: any[]) => Promise<any>;
     }
   >();
-  const sendMessage = vi.fn();
+  const messages: AgentMessage[] = [];
+  const sendMessage = vi.fn((message) => {
+    messages.push({ ...message, role: "custom", timestamp: 0 });
+  });
   const registerMessageRenderer = vi.fn();
   const notify = vi.fn();
   const abort = vi.fn();
@@ -89,6 +108,16 @@ function setup(mode = "rpc") {
     mode,
     hasUI: true,
     abort,
+    isIdle: () => fake.idle,
+    sessionManager: {
+      getBranch: () =>
+        messages.flatMap((message, index) =>
+          message.role === "custom"
+            ? [{ ...message, type: "custom_message", id: String(index) }]
+            : [],
+        ),
+      buildSessionProjection: () => ({ messages }),
+    },
     isProjectTrusted: () => true,
     ui: {
       notify,
@@ -116,7 +145,21 @@ function setup(mode = "rpc") {
   const emit = (type: string, fields: Record<string, unknown> = {}) => {
     const handler = handlers.get(type);
     if (!handler) throw new Error(`No handler for ${type}`);
-    return handler({ type, ...fields }, ctx);
+    return handler(
+      {
+        type,
+        ...(["turn_end", "agent_before_settle"].includes(type)
+          ? {
+              entries: [],
+              continue: false,
+              outcome: "completed",
+              context: { contextMessages: messages, pendingMessages: [] },
+            }
+          : {}),
+        ...fields,
+      },
+      ctx,
+    );
   };
   emit("session_start");
   return {
@@ -128,6 +171,11 @@ function setup(mode = "rpc") {
     notify,
     abort,
     registerMessageRenderer,
+    messages,
+    ready(task: TaskView) {
+      fake.tasks = [...fake.tasks.filter((old) => old.id !== task.id), task];
+      fake.onReady!(task);
+    },
     key: (data: string) => terminalInput!(data),
   };
 }
@@ -576,7 +624,7 @@ test("terminal errors notify the human, never trigger the parent LLM", () => {
 });
 
 test("background replies cannot wake a second parent model turn while human selection is open", async () => {
-  const { commands, ctx, sendMessage } = setup();
+  const { commands, ctx, emit, sendMessage, ready } = setup();
   Object.assign(ctx, {
     model: { provider: "test", id: "fake", reasoning: false },
     thinkingLevel: "off",
@@ -593,8 +641,9 @@ test("background replies cannot wake a second parent model turn while human sele
   });
   await commands.get("sub:models")!.handler("", ctx);
   sendMessage.mockClear();
-  fake.onReady!({
+  ready({
     ...failure,
+    reply: { id: "background", delivered: false },
     level: 1,
     status: "ready",
     activity: "",
@@ -602,14 +651,22 @@ test("background replies cannot wake a second parent model turn while human sele
     error: undefined,
     response: "Question?",
   });
+  await flushReplies();
   expect(sendMessage).toHaveBeenCalledWith(
     expect.objectContaining({ customType: "pi-sub:response" }),
-    { deliverAs: "followUp", triggerTurn: false },
+    { triggerTurn: false },
   );
+  fake.idle = false;
+  ready(readyReply("during-selection"));
+  expect(emit("turn_end").continue).toBe(false);
+  expect(emit("turn_end", { continue: true }).continue).toBe(true); // Do not undo another handler's continuation.
 });
 
-test("queuing a notification is not delivery; only complete parent context messages count", () => {
-  const { emit, sendMessage } = setup();
+const flushReplies = () =>
+  new Promise<void>((resolve) => setImmediate(resolve));
+
+test("announcing a batch is not delivery; only complete parent context messages count", async () => {
+  const { emit, sendMessage, ready } = setup();
   emit("agent_start");
   const reply: TaskView = {
     ...failure,
@@ -621,7 +678,8 @@ test("queuing a notification is not delivery; only complete parent context messa
     activity: "",
     reply: { id: "reply-1", delivered: false },
   };
-  fake.onReady!(reply);
+  ready(reply);
+  await flushReplies();
   expect(sendMessage).toHaveBeenCalledOnce();
   expect(fake.markDelivered).not.toHaveBeenCalled();
   emit("context", { messages: [] });
@@ -636,8 +694,8 @@ test("queuing a notification is not delivery; only complete parent context messa
   );
 });
 
-test("ordinary ready replies trigger a follow-up only while runnable", () => {
-  const { emit, sendMessage } = setup();
+test("ordinary ready replies wake an idle parent only while runnable", async () => {
+  const { emit, sendMessage, ready } = setup();
   emit("agent_start");
   const reply: TaskView = {
     ...failure,
@@ -647,17 +705,223 @@ test("ordinary ready replies trigger a follow-up only while runnable", () => {
     status: "ready",
     level: 1,
     activity: "",
+    reply: { id: "idle-reply", delivered: false },
   };
   fake.runnable = false;
-  fake.onReady!(reply);
+  ready(reply);
+  await flushReplies();
   expect(sendMessage).not.toHaveBeenCalled();
   fake.runnable = true;
-  fake.onReady!(reply);
+  ready(reply);
+  await flushReplies();
   expect(sendMessage).toHaveBeenCalledExactlyOnceWith(
     expect.objectContaining({
       customType: "pi-sub:response",
       content: expect.stringContaining("Question?"),
     }),
-    { deliverAs: "followUp", triggerTurn: true },
+    { triggerTurn: true },
   );
+});
+
+const readyReply = (id: string): TaskView => ({
+  ...failure,
+  id,
+  description: id,
+  error: undefined,
+  response: `Answer from ${id}`,
+  level: 1,
+  status: "ready",
+  outcome: "reply",
+  activity: "",
+  reply: { id: `${id}-reply`, delivered: false },
+});
+
+test("same-cycle idle replies form one batch and one wakeup, not queued follow-ups", async () => {
+  const { emit, ready, sendMessage, messages } = setup();
+  emit("agent_start");
+  ready(readyReply("a"));
+  ready(readyReply("b"));
+  expect(sendMessage).not.toHaveBeenCalled();
+  await flushReplies();
+  expect(sendMessage).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining({
+      details: {
+        replies: [
+          expect.objectContaining({ id: "a" }),
+          expect.objectContaining({ id: "b" }),
+        ],
+      },
+    }),
+    { triggerTurn: true },
+  );
+  expect(fake.markDelivered).not.toHaveBeenCalled();
+  emit("agent_settled", { aborted: false });
+  await flushReplies();
+  expect(sendMessage).toHaveBeenCalledOnce(); // Native history remembers the announcement.
+  emit("context", { messages });
+  expect(fake.markDelivered).toHaveBeenCalledTimes(2);
+});
+
+test("active replies join the next safe boundary, preserving other drafts and one continuation", async () => {
+  const { emit, ready, sendMessage } = setup();
+  emit("agent_start");
+  fake.idle = false;
+  ready(readyReply("a"));
+  ready(readyReply("b"));
+  await flushReplies();
+  expect(sendMessage).not.toHaveBeenCalled();
+  const previous = { type: "custom", customType: "other", data: true };
+  const result = emit("turn_end", { entries: [previous], continue: true });
+  expect(result.continue).toBe(true);
+  expect(result.entries).toHaveLength(2);
+  expect(result.entries[0]).toBe(previous);
+  expect(result.entries[1]).toMatchObject({
+    type: "custom_message",
+    details: { replies: [{ id: "a" }, { id: "b" }] },
+  });
+  expect(fake.markDelivered).not.toHaveBeenCalled();
+  expect(sendMessage).not.toHaveBeenCalled();
+});
+
+test("a complete same-turn tool return suppresses its notification without accepting it", () => {
+  const { emit, ready } = setup();
+  emit("agent_start");
+  fake.idle = false;
+  const a = readyReply("a"),
+    b = readyReply("b");
+  ready(a);
+  ready(b);
+  const message: AgentMessage = {
+    role: "toolResult",
+    toolName: "sub_result",
+    toolCallId: "read-a",
+    timestamp: 0,
+    isError: false,
+    details: JSON.parse(JSON.stringify(a)),
+    content: [{ type: "text", text: JSON.stringify(a) }],
+  };
+  const result = emit("turn_end", {
+    context: { contextMessages: [message], pendingMessages: [] },
+  });
+  expect(result.entries[0].details.replies).toHaveLength(1);
+  expect(result.entries[0].details.replies[0].id).toBe("b");
+  expect(fake.tasks).toHaveLength(2);
+  expect(fake.markDelivered).not.toHaveBeenCalled();
+  emit("context", { messages: [message] });
+  expect(a.reply!.delivered).toBe(true);
+});
+
+test("flushes use current identities and omit accepted, stopped and superseded replies", async () => {
+  const { emit, ready, sendMessage } = setup();
+  emit("agent_start");
+  ready(readyReply("accepted"));
+  ready(readyReply("stopped"));
+  ready(readyReply("changed"));
+  const next = {
+    ...readyReply("changed"),
+    response: "Successor",
+    reply: { id: "successor", delivered: false },
+  };
+  fake.tasks = [next];
+  await flushReplies();
+  expect(sendMessage).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining({
+      details: {
+        replies: [
+          expect.objectContaining({
+            id: "changed",
+            response: "Successor",
+            reply: { id: "successor", delivered: false },
+          }),
+        ],
+      },
+    }),
+    { triggerTurn: true },
+  );
+});
+
+test("interruption retains unannounced replies and cannot wake the parent", async () => {
+  const { emit, ready, sendMessage } = setup();
+  emit("agent_start");
+  ready(readyReply("a"));
+  emit("agent_settled", { aborted: true });
+  await flushReplies();
+  expect(sendMessage).not.toHaveBeenCalled();
+  expect(emit("turn_end")).toBeUndefined();
+  fake.runnable = true;
+  fake.interrupted = false;
+  expect(emit("turn_end").entries[0].details.replies[0].id).toBe("a");
+});
+
+test("late replies can join the settlement boundary and truncated announcements are not repeated", async () => {
+  const { emit, ready, sendMessage } = setup();
+  emit("agent_start");
+  fake.idle = false;
+  expect(emit("turn_end")).toBeUndefined();
+  const a = { ...readyReply("a"), response: "x".repeat(20000) };
+  ready(a);
+  const result = emit("agent_before_settle");
+  expect(result.continue).toBe(true);
+  const notification = {
+    ...replyBatch([a])!,
+    role: "custom" as const,
+    timestamp: 0,
+  };
+  expect(
+    emit("turn_end", {
+      context: { contextMessages: [notification], pendingMessages: [] },
+    }),
+  ).toBeUndefined();
+  emit("context", { messages: [notification] });
+  expect(a.reply!.delivered).toBe(false);
+  await flushReplies();
+  expect(sendMessage).not.toHaveBeenCalled();
+});
+
+test("input preparation retries replies that arrived while admission was temporarily closed", async () => {
+  const { emit, ready, sendMessage } = setup();
+  emit("agent_start");
+  fake.prompt.mockImplementation(async () => {
+    fake.runnable = false;
+    ready(readyReply("during-preparation"));
+    fake.runnable = true;
+    return true;
+  });
+  await emit("input", { source: "rpc", text: "next user prompt" });
+  await flushReplies();
+  expect(sendMessage).toHaveBeenCalledOnce();
+});
+
+test("a boundary proposal neither acknowledges nor dequeues replies before native commit", () => {
+  const { emit, ready, messages } = setup();
+  emit("agent_start");
+  fake.idle = false;
+  ready(readyReply("a"));
+  const proposed = emit("turn_end");
+  expect(emit("turn_end")).toEqual(proposed); // A dropped proposal can be retried.
+  messages.push({ ...proposed.entries[0], role: "custom", timestamp: 0 });
+  expect(emit("agent_before_settle")).toBeUndefined();
+  expect(fake.markDelivered).not.toHaveBeenCalled();
+});
+
+test.each(["error", "aborted"])(
+  "a %s boundary does not request reply continuation",
+  (outcome) => {
+    const { emit, ready, ctx } = setup();
+    emit("agent_start");
+    fake.idle = false;
+    ready(readyReply("a"));
+    expect(emit("turn_end", { outcome })).toBeUndefined();
+    Object.assign(ctx, { signal: AbortSignal.abort() });
+    expect(emit("turn_end")).toBeUndefined();
+  },
+);
+
+test("shutdown cancels a scheduled idle flush", async () => {
+  const { emit, ready, sendMessage } = setup();
+  emit("agent_start");
+  ready(readyReply("a"));
+  await emit("session_shutdown");
+  await flushReplies();
+  expect(sendMessage).not.toHaveBeenCalled();
 });

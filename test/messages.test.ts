@@ -5,6 +5,8 @@ import {
   SUBAGENT_GUIDANCE,
   failureSummary,
   replyNotification,
+  replyBatch,
+  announcedReplies,
   deliveredReplies,
   renderReply,
   renderFailures,
@@ -83,6 +85,87 @@ test("only complete native reply notifications acknowledge their exact reply", (
     const clipped = replyNotification({ ...ready, response });
     expect(clipped.content).toContain("[Truncated; use sub_result");
     expect(deliveredReplies({ ...message, ...clipped })).toEqual([]);
+  }
+});
+
+test("batches acknowledge each complete answer, not clipped neighbours", () => {
+  const a = { ...task, reply: { id: "reply-a", delivered: false } };
+  const b = {
+    ...a,
+    id: "task-b",
+    response: "line\n".repeat(110),
+    reply: { id: "reply-b", delivered: false },
+  };
+  const c = { ...a, id: "task-c", reply: { id: "reply-c", delivered: false } };
+  const batch = replyBatch([a, b, c])!;
+  const message = { ...batch, role: "custom" as const, timestamp: 0 };
+  expect(batch.details.replies).toHaveLength(3);
+  expect(announcedReplies(batch)).toEqual([
+    { id: a.id, replyId: "reply-a" },
+    { id: b.id, replyId: "reply-b" },
+    { id: c.id, replyId: "reply-c" },
+  ]);
+  expect(deliveredReplies(message)).toEqual([
+    { id: a.id, replyId: "reply-a" },
+    { id: c.id, replyId: "reply-c" },
+  ]);
+  expect(
+    deliveredReplies({ ...message, content: replyNotification(a).content }),
+  ).toEqual([{ id: a.id, replyId: "reply-a" }]);
+  expect(deliveredReplies({ ...message, content: "Only a preview" })).toEqual(
+    [],
+  );
+  expect(announcedReplies({ ...batch, customType: "unrelated" })).toEqual([]);
+  expect(announcedReplies(replyNotification(a))).toEqual([
+    { id: a.id, replyId: "reply-a" },
+  ]);
+});
+
+test("batches are bounded without losing the full reports or silently dropping later replies", () => {
+  const tasks = Array.from({ length: 10 }, (_, n) => ({
+    ...task,
+    id: `task-${n}`,
+    response: "line of results\n".repeat(200),
+    reply: { id: `reply-${n}`, delivered: false },
+  }));
+  const batch = replyBatch(tasks)!;
+  expect(batch.details.replies.length).toBeGreaterThan(1);
+  expect(batch.details.replies.length).toBeLessThan(tasks.length);
+  expect(Buffer.byteLength(batch.content, "utf8")).toBeLessThanOrEqual(24000);
+  expect(batch.content.split("\n").length).toBeLessThanOrEqual(300);
+  expect(batch.details.replies[0]!.response).toBe(tasks[0]!.response);
+  const remaining = tasks.slice(batch.details.replies.length);
+  expect(replyBatch(remaining)!.details.replies[0]!.id).toBe(remaining[0]!.id);
+  expect(replyBatch([])).toBeUndefined();
+});
+
+test("batch previews and expansions render every reply without duplicating answer JSON", () => {
+  const batch = replyBatch([
+    task,
+    {
+      ...task,
+      id: "second",
+      description: "Other review",
+      response: "Other answer",
+    },
+  ])!;
+  const message = { ...batch, role: "custom" as const, timestamp: 0 };
+  for (const expanded of [false, true]) {
+    const component = renderReply(
+      message,
+      { expanded, outputPad: 1 } as Parameters<typeof renderReply>[1],
+      theme,
+    )!;
+    const rendered = component.render(120).join("\n");
+    expect(rendered).toContain("Review changes");
+    expect(rendered).toContain("Other review");
+    expect(rendered).toContain("Other answer");
+    expect(rendered).not.toContain('"response":');
+    if (expanded) expect(rendered).toContain("Important detail.");
+    else expect(component.render(120)).toHaveLength(4);
+    for (const width of [0, 1, 20, 80])
+      for (const line of component.render(width))
+        expect(visibleWidth(line)).toBeLessThanOrEqual(width);
   }
 });
 

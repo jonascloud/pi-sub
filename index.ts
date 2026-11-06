@@ -1,9 +1,12 @@
 import { getSupportedThinkingLevels, StringEnum } from "@earendil-works/pi-ai";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import {
   defineTool,
   truncateHead,
   type ExtensionAPI,
   type ExtensionContext,
+  type AgentBeforeSettleEvent,
+  type TurnEndEvent,
 } from "@earendil-works/pi-coding-agent";
 import {
   matchesKey,
@@ -35,7 +38,8 @@ import { mountWidget, availableWidgetHeight } from "./src/widget.ts";
 import {
   SUBAGENT_GUIDANCE,
   failureSummary,
-  replyNotification,
+  replyBatch,
+  announcedReplies,
   deliveredReplies,
   renderReply,
   renderFailures,
@@ -63,6 +67,63 @@ export default function piSub(pi: ExtensionAPI): void {
   let dialogOpen = false;
   let selection: ModelSetup | undefined;
   const lifetime = new AbortController();
+  let idleDelivery: ReturnType<typeof setImmediate> | undefined;
+
+  // The tasks are the inbox. Native history records announcements; complete
+  // context delivery acknowledges replies separately, without accepting tasks.
+  const pendingReplies = (ctx: ExtensionContext, messages?: AgentMessage[]) => {
+    if (lifetime.signal.aborted || !coordinator?.runnable) return [];
+    const replies = coordinator
+      .list()
+      .reverse()
+      .filter(
+        (task) =>
+          task.level !== undefined &&
+          task.status === "ready" &&
+          task.outcome === "reply" &&
+          task.reply &&
+          !task.reply.delivered,
+      );
+    if (!replies.length) return [];
+    const covered = new Set<string>();
+    for (const entry of ctx.sessionManager.getBranch())
+      if (entry.type === "custom_message")
+        for (const reply of announcedReplies(entry)) covered.add(reply.replyId);
+    for (const message of messages ??
+      ctx.sessionManager.buildSessionProjection().messages) {
+      if (message.role === "custom")
+        for (const reply of announcedReplies(message))
+          covered.add(reply.replyId);
+      for (const reply of deliveredReplies(message)) covered.add(reply.replyId);
+    }
+    return replies.filter((task) => !covered.has(task.reply!.id));
+  };
+  const scheduleReplies = () => {
+    if (idleDelivery || lifetime.signal.aborted || !coordinator?.runnable)
+      return;
+    // Coalesce this event-loop turn; never debounce, poll or queue a follow-up
+    // behind an active parent that may read or supersede these replies itself.
+    idleDelivery = setImmediate(() => {
+      idleDelivery = undefined;
+      const ctx = context;
+      if (
+        !ctx?.isIdle() ||
+        dialogOpen ||
+        lifetime.signal.aborted ||
+        !coordinator?.runnable
+      )
+        return;
+      try {
+        const batch = replyBatch(pendingReplies(ctx));
+        if (batch) pi.sendMessage(batch, { triggerTurn: !selection?.active });
+      } catch (error) {
+        notify(
+          `Could not deliver subagent responses: ${reason(error)}`,
+          "error",
+        );
+      }
+    });
+  };
 
   const notify = (text: string, type: "info" | "error" = "info") => {
     text = stripTerminalSequences(text).replace(
@@ -86,11 +147,7 @@ export default function piSub(pi: ExtensionAPI): void {
           notify(`${task.description} · failed\n${task.error}`, "error");
           return;
         }
-        if (!coordinator?.runnable) return;
-        pi.sendMessage(replyNotification(task), {
-          deliverAs: "followUp",
-          triggerTurn: !selection?.active,
-        });
+        scheduleReplies();
       },
     }));
   const checkContext = (ctx: ExtensionContext) => {
@@ -123,8 +180,8 @@ export default function piSub(pi: ExtensionAPI): void {
     signal.addEventListener("abort", aborted, { once: true });
     if (signal.aborted) aborted();
   };
-  const preparePrompt = () =>
-    manager().prompt((failures: TaskResult[]) => {
+  const preparePrompt = async () => {
+    const prepared = await manager().prompt((failures: TaskResult[]) => {
       if (!failures.length) return;
       pi.sendMessage(
         {
@@ -136,6 +193,9 @@ export default function piSub(pi: ExtensionAPI): void {
         { triggerTurn: false },
       );
     });
+    if (prepared) scheduleReplies();
+    return prepared;
+  };
   const authorizeTask = (task: TaskView, ctx: ExtensionContext) => {
     const execution = task.execution;
     if (
@@ -287,6 +347,7 @@ export default function piSub(pi: ExtensionAPI): void {
   });
   pi.on("ui_prompt_end", () => {
     dialogOpen = false;
+    scheduleReplies();
   });
   pi.on("input", async (event, ctx) => {
     if (event.source !== "interactive" && event.source !== "rpc") return;
@@ -347,14 +408,40 @@ export default function piSub(pi: ExtensionAPI): void {
       return { action: "handled" };
     }
   });
-  // sendMessage only queues a follow-up. A context hook sees the messages
-  // actually handed to the parent, including tool returns and idle deliveries.
+  // Only complete model-visible context acknowledges a reply. Announcements
+  // and boundary proposals alone must not collapse its outstanding widget row.
   pi.on("context", (event) => {
     if (lifetime.signal.aborted || !coordinator) return;
     for (const message of event.messages)
       for (const reply of deliveredReplies(message))
         coordinator.markDelivered(reply.id, reply.replyId);
   });
+  const deliverAtBoundary = (
+    event: TurnEndEvent | AgentBeforeSettleEvent,
+    ctx: ExtensionContext,
+  ) => {
+    context = ctx;
+    if (event.outcome !== "completed" || ctx.signal?.aborted || dialogOpen)
+      return;
+    const batch = replyBatch(
+      pendingReplies(ctx, [
+        ...event.context.contextMessages,
+        ...event.context.pendingMessages,
+      ]),
+    );
+    if (!batch) return;
+    return {
+      entries: [
+        ...event.entries,
+        { type: "custom_message" as const, ...batch },
+      ],
+      // Natural tool/queue continuation satisfies this request; Pi does not add
+      // another turn on top of it. Selection may store reports but never wake us.
+      continue: event.continue || !selection?.active,
+    };
+  };
+  pi.on("turn_end", deliverAtBoundary);
+  pi.on("agent_before_settle", deliverAtBoundary);
   pi.on("turn_start", (_event, ctx) => {
     context = ctx;
     observe(ctx.signal);
@@ -363,8 +450,11 @@ export default function piSub(pi: ExtensionAPI): void {
     observe(ctx.signal);
     if (manager().interrupted) ctx.abort();
   });
-  pi.on("agent_settled", (event) => {
-    if (event.aborted && !runInterrupted) interrupt();
+  pi.on("agent_settled", (event, ctx) => {
+    context = ctx;
+    if (event.aborted) {
+      if (!runInterrupted) interrupt();
+    } else scheduleReplies(); // Includes replies arriving after the final boundary.
   });
   pi.on("session_before_compact", (event) => {
     observe(event.signal, true);
@@ -411,6 +501,7 @@ export default function piSub(pi: ExtensionAPI): void {
   });
   pi.on("session_shutdown", async () => {
     lifetime.abort();
+    if (idleDelivery) clearImmediate(idleDelivery);
     selection?.dispose();
     detachInput?.();
     unmount?.();
