@@ -28,6 +28,7 @@ async function host(
   env: Record<string, string> = {},
   profile?: string,
   research = true,
+  accept = true,
 ) {
   const cwd = await mkdtemp(join(tmpdir(), "pi-sub-extension-"));
   const agentDir = profile ?? join(cwd, "agent");
@@ -55,6 +56,7 @@ async function host(
       PI_CODING_AGENT_DIR: agentDir,
       PI_SUB_CHILD: "",
       WORKER_TEST_INTEGRATION: "1",
+      WORKER_TEST_READONLY_RESEARCH: "1",
       WORKER_TEST_CHILD_MARKER: marker,
       ...env,
     },
@@ -71,25 +73,50 @@ async function host(
         (command) => command.name === "sub:models",
       ),
     ).toBe(true);
-    if (research) expect(await client.prompt("/sub:models")).toBe("handled");
-    await eventually(async () => {
-      const catalog = JSON.parse(
-        await readFile(join(agentDir, "pi-sub/models.json"), "utf8"),
-      );
-      expect(catalog.version).toBe(2);
-      expect(catalog).not.toHaveProperty("approved");
-      expect(catalog.candidates.length).toBeGreaterThan(0);
-      expect(
-        catalog.candidates.every(
-          (candidate: object) => !("selected" in candidate),
-        ),
-      ).toBe(true);
-    });
+    if (research) {
+      expect(await client.prompt("/sub:models")).toBe("handled");
+      await proposal(client, "6");
+      await expect(
+        readFile(join(agentDir, "pi-sub/models.json")),
+      ).rejects.toMatchObject({ code: "ENOENT" });
+      if (accept) expect(await client.prompt("accept")).toBe("handled");
+    }
+    if (!research || accept)
+      await eventually(async () => {
+        const ladder = JSON.parse(
+          await readFile(join(agentDir, "pi-sub/models.json"), "utf8"),
+        );
+        expect(ladder["6"]).toEqual({
+          model: "worker-test/fake:off",
+          cost: 0.1,
+        });
+        expect(Object.keys(ladder)).toEqual(["6"]);
+      });
     return { client, marker, dispose, cwd, agentDir };
   } catch (error) {
     await dispose();
     throw error;
   }
+}
+async function proposal(client: RpcClient, rung: string) {
+  return eventually(async () => {
+    const message = (await client.getMessages()).findLast((message) => {
+      if (message.role !== "custom" || message.customType !== "pi-sub:models")
+        return false;
+      const details = message.details as {
+        proposal?: { ladder?: Record<string, unknown> };
+      };
+      return !!details?.proposal?.ladder?.[rung];
+    });
+    if (!message || message.role !== "custom") throw Error("No draft proposal");
+    return message.details as {
+      task: { id: string; sessionFile: string };
+      proposal: {
+        ladder: Record<string, { model: string; cost: number | null }>;
+        comparison: string;
+      };
+    };
+  });
 }
 function nextEvent(
   client: RpcClient,
@@ -169,7 +196,109 @@ test("bootstraps, delegates, accepts and reports original child usage once", asy
   }
 }, 60000);
 
-test("two working directories share profile ratings and never load a local override or fallback", async () => {
+test("proposal and prompt refinements remain drafts until explicit acceptance", async () => {
+  const { client, agentDir, dispose } = await host({}, undefined, true, false);
+  try {
+    const first = await proposal(client, "6");
+    const before = await client.getSessionStats();
+    expect(before.assistantMessages).toBe(0);
+    expect(await client.prompt("integration:refine-proposal")).toBe("handled");
+    const revised = await proposal(client, "7");
+    expect(revised.task.id).toBe(first.task.id);
+    expect(revised.task.sessionFile).toBe(first.task.sessionFile);
+    expect((await client.getSessionStats()).assistantMessages).toBe(0);
+    const path = join(agentDir, "pi-sub/models.json");
+    await expect(readFile(path)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await client.prompt("accept")).toBe("handled");
+    await eventually(async () =>
+      expect(JSON.parse(await readFile(path, "utf8"))).toEqual({
+        "7": { model: "worker-test/fake:off", cost: 0.2 },
+      }),
+    );
+    expect((await readFile(path, "utf8")).trim().split("\n")).toHaveLength(3);
+    await client.promptAndWait("integration:delegate", undefined, 20000);
+    expect(await latestResult(client)).toMatchObject({ outcome: "reply" });
+    const stats = await client.getSessionStats();
+    expect(stats.cost).toBe(stats.assistantMessages * 10 + 30); // Two research executions + one delegated task, once.
+  } finally {
+    await dispose();
+  }
+}, 60000);
+
+test("cancelling a revised proposal preserves the saved ladder and exits refinement mode", async () => {
+  const { client, agentDir, dispose } = await host();
+  try {
+    const path = join(agentDir, "pi-sub/models.json"),
+      before = await readFile(path, "utf8");
+    expect(await client.prompt("/sub:models")).toBe("handled");
+    await client.prompt("integration:refine-proposal");
+    await proposal(client, "7");
+    expect(await client.prompt("cancel")).toBe("handled");
+    expect(await readFile(path, "utf8")).toBe(before);
+    const count = (await client.getSessionStats()).assistantMessages;
+    await client.promptAndWait(
+      "A normal parent question after cancellation",
+      undefined,
+      20000,
+    );
+    expect((await client.getSessionStats()).assistantMessages).toBe(count + 1);
+  } finally {
+    await dispose();
+  }
+}, 60000);
+
+test("extension-generated slash commands cannot impersonate user acceptance", async () => {
+  const { client, agentDir, dispose } = await host({}, undefined, true, false);
+  const refused = nextEvent(client, (event) => {
+    const ui = event as unknown as {
+      type: string;
+      method?: string;
+      message?: string;
+    };
+    return (
+      ui.type === "extension_ui_request" &&
+      ui.method === "notify" &&
+      !!ui.message?.includes("Type accept in the normal prompt")
+    );
+  });
+  try {
+    expect(await client.prompt("/extension-accept")).toBe("handled");
+    await refused.promise;
+    await expect(
+      readFile(join(agentDir, "pi-sub/models.json")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await client.prompt("accept")).toBe("handled");
+    expect(
+      JSON.parse(await readFile(join(agentDir, "pi-sub/models.json"), "utf8")),
+    ).toHaveProperty("6");
+  } finally {
+    refused.dispose();
+    await dispose();
+  }
+}, 60000);
+
+test("acceptance never clobbers a config edited while its proposal was open", async () => {
+  const { client, agentDir, dispose } = await host({}, undefined, true, false);
+  try {
+    const path = join(agentDir, "pi-sub/models.json"),
+      manual = JSON.stringify({
+        "9": { model: "worker-test/fake:off", cost: 9 },
+      });
+    await mkdir(join(agentDir, "pi-sub"), { recursive: true });
+    await writeFile(path, manual);
+    expect(await client.prompt("accept")).toBe("handled");
+    expect(await readFile(path, "utf8")).toBe(manual);
+    await eventually(async () =>
+      expect(JSON.stringify(await client.getMessages())).toContain(
+        "Model ladder changed",
+      ),
+    );
+  } finally {
+    await dispose();
+  }
+}, 60000);
+
+test("two working directories share the confirmed ladder and never load a local override or fallback", async () => {
   const first = await host();
   let second: Awaited<ReturnType<typeof host>> | undefined;
   try {
@@ -286,7 +415,7 @@ test("RPC abort during native retry backoff interrupts the children", async () =
   }
 }, 60000);
 
-test("a global reassessment cannot resume a retained execution below its minimum level", async () => {
+test("a manual ladder edit cannot resume a retained execution below its minimum level", async () => {
   const { client, marker, agentDir, dispose } = await host({
     WORKER_TEST_SLOW_CHILD: "1",
   });
@@ -295,9 +424,8 @@ test("a global reassessment cannot resume a retained execution below its minimum
     await eventually(() => readFile(marker));
     expect(await client.prompt("/sub:pause")).toBe("handled");
     const path = join(agentDir, "pi-sub/models.json");
-    const catalog = JSON.parse(await readFile(path, "utf8"));
-    for (const candidate of catalog.candidates) candidate.power = 2;
-    await writeFile(path, JSON.stringify(catalog));
+    const ladder = JSON.parse(await readFile(path, "utf8"));
+    await writeFile(path, JSON.stringify({ "2": ladder["6"] }));
     await client.promptAndWait("integration:continue", undefined, 20000);
     const result = (await client.getMessages()).findLast(
       (message) =>

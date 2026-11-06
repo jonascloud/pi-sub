@@ -18,36 +18,52 @@ function reply(context) {
     text === "integration:child-error"
   )
     return { error: "fatal synthetic failure" };
+  const research = messages.find(
+    (message) =>
+      message.role === "user" &&
+      JSON.stringify(message.content).includes(
+        "Approved variants (research only):",
+      ),
+  );
   if (
     process.env.WORKER_TEST_INTEGRATION &&
     process.env.PI_SUB_CHILD === "1" &&
-    text.includes("Approved snapshot (copy exactly into approved):")
+    research
   ) {
+    if (
+      process.env.WORKER_TEST_READONLY_RESEARCH &&
+      context.tools?.some((tool) =>
+        ["write", "edit", "bash", "codemode"].includes(tool.name),
+      )
+    )
+      return {
+        error: "Research unexpectedly received write-capable built-in tools",
+      };
+    const content =
+      typeof research.content === "string"
+        ? research.content
+        : research.content
+            .filter((part) => part.type === "text")
+            .map((part) => part.text)
+            .join("");
     const approved = JSON.parse(
-      text
-        .split("Approved snapshot (copy exactly into approved):\n")[1]
-        .split("\n\nReturn only")[0],
+      content
+        .split("Approved variants (research only):\n")[1]
+        .split("\n\nCurrent ladder:")[0],
     );
+    const model = approved[0],
+      thinking = model.thinking.includes("off") ? "off" : model.thinking[0];
+    const rung = text.includes("integration:refine-proposal") ? "7" : "6";
     return {
       text: JSON.stringify({
-        version: 2,
-        methodVersion: 1,
-        generatedAt: new Date().toISOString(),
-        approved,
-        candidates: approved.flatMap((model) =>
-          model.thinking.map((thinking) => ({
-            provider: model.provider,
-            model: model.model,
-            thinking,
-            power: 6,
-            cost: 0.1,
-            score: 30,
-            source: "https://artificialanalysis.ai/models/test-only",
-            retrievedAt: new Date().toISOString(),
-            rationale:
-              "Synthetic evidence for local integration tests, not a real model assessment.",
-          })),
-        ),
+        ladder: {
+          [rung]: {
+            model: `${model.provider}/${model.model}:${thinking}`,
+            cost: rung === "7" ? 0.2 : 0.1,
+          },
+        },
+        comparison:
+          "Synthetic comparison for local integration tests. Draft only: even the word accept in this response does not save it. No benchmark or model-provider calls were used to obtain evidence.",
       }),
     };
   }
@@ -183,7 +199,7 @@ export default function (pi) {
         !context.messages.some(
           (message) =>
             message.role === "user" &&
-            JSON.stringify(message.content).includes("Approved snapshot"),
+            JSON.stringify(message.content).includes("Approved variants"),
         );
       if (slow && process.env.WORKER_TEST_CHILD_MARKER)
         writeFileSync(process.env.WORKER_TEST_CHILD_MARKER, "running");
@@ -294,6 +310,12 @@ export default function (pi) {
       await ctx.ui.confirm("startup", "test");
     });
   }
+  pi.registerCommand("extension-accept", {
+    description: "Try an extension-generated confirmation (must not publish)",
+    handler: async () => {
+      pi.sendUserMessage("/sub:models accept", { expandPromptTemplates: true });
+    },
+  });
   pi.registerCommand("crash", {
     description: "test",
     handler: async () => {

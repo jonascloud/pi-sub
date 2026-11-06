@@ -172,7 +172,11 @@ export function renderWidget(
 }
 
 // Count only components after our identity path; earlier siblings are transcript.
-function available(tui: TUI, component: Component, width: number): number {
+export function availableWidgetHeight(
+  tui: TUI,
+  component: Component,
+  width: number,
+): number {
   function following(children: Component[]): number | undefined {
     for (let i = children.length - 1; i >= 0; i--) {
       const child = children[i]!;
@@ -231,7 +235,7 @@ export function mountWidget(
       let unmounted = false;
       const component: Component & { dispose(): void } = {
         render(width) {
-          height = available(tui, component, width);
+          height = availableWidgetHeight(tui, component, width);
           visible = height > 0 && width > 0;
           const tasks = coordinator.list();
           updateTimer(tasks);

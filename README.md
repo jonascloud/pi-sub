@@ -15,29 +15,44 @@ pi install /absolute/path/to/pi-sub
 
 Remove the old `pi-subagents` package from Pi's configuration before loading this replacement. Use `pi list` to find its configured source and `pi remove <source>` to remove it. This repository does not alter the old checkout or your Pi configuration automatically. Use `/reload` after installation or source changes.
 
-## Set up models
+## Choose the model ladder
 
-Select a research-capable parent model and its thinking setting, then run:
+The only runtime model configuration is **`<agent-dir>/pi-sub/models.json`**, normally `~/.pi/agent/pi-sub/models.json`. Pi's `PI_CODING_AGENT_DIR` selects a different profile. There are no project overrides, local fallbacks or automatic imports.
 
-```text
-/sub:models
+The file is deliberately short and directly editable:
+
+```json
+{
+  "6": { "model": "openai-codex/gpt-6.1-terra:low", "cost": 0.07134 },
+  "7": { "model": "openai-codex/gpt-6.1-terra:medium", "cost": 0.1688 },
+  "8": { "model": "openai-codex/gpt-6.1-terra:high", "cost": 0.25928 },
+  "9": { "model": "openai-codex/gpt-6.1-sol:high", "cost": 0.59099 }
+}
 ```
 
-The command starts a research subagent using that exact execution, without needing an existing capability catalog. It evaluates the models in Pi's `/scoped-models` selection, respecting pinned thinking settings. Without a scope, only the current model is eligible, not every model with credentials.
+This illustrates the format, not bundled defaults or authorization. Each key is an operator-confirmed strength from 1 to 10. Each row contains only an exact `provider/model:thinking` reference and a nonnegative reference cost, or `null` when unknown. `{}` disables delegation. Costs shown here are rounded AA Intelligence Index v5.0.1 USD/task references, **not live task prices or Codex quota consumption**.
 
-Research needs web/search tools configured in the child's normal Pi environment. It gathers existing comparable benchmark evidence; it does not run paid benchmark calls against candidate models. The research subagent itself uses your configured model and may incur normal usage costs.
+Dispatch walks upward from the requested minimum and takes the first available, currently approved rung. It never sorts by cost, infers an unlisted variant or requires a separate benchmark database. If no listed rung qualifies, it fails explicitly. Current Pi availability and scope remain authoritative; without a scope, only the current model's supported thinking variants are eligible. Retained tasks must still satisfy the current scope and a sufficient confirmed rung before executing again.
 
-The [versioned assessment instructions](instructions/model-capabilities.md) define evidence and calibration. They contain historical calibration anchors and a fixed comparison baseline, **not a bundled runtime model catalog**. Power is a reviewed estimate, not a success guarantee. Missing evidence must remain missing. Every approved thinking variant is retained in the proposal, even when excluded from routing.
+### Review, refine, accept
 
-Ratings live in **`<agent-dir>/pi-sub/models.json`**, normally `~/.pi/agent/pi-sub/models.json`. Pi's `PI_CODING_AGENT_DIR` selects a different profile. This is separate from native `settings.json` and `models.json`. There are **no project overrides or local fallbacks**; the previous project-local catalog is never loaded automatically.
+Run `/sub:models` in a TUI or persistent RPC session. A research task uses the exact current parent model/thinking without requiring an existing ladder. In the TUI, its proposal appears in a non-modal panel above the editor and a transcript comparison. RPC clients receive the comparison messages and can supply the same user inputs. **The saved ladder remains active; drafts are never automatically saved.**
 
-A complete validated proposal updates only the reviewed provider/model/thinking tuples, preserving unrelated global ratings. Commits are atomic and locked across Pi processes. A negative reassessment replaces the old rating rather than silently retaining unsupported evidence. Invalid research, changed approval or cancellation before commit preserves existing ratings. Paused research can be continued; shutdown or an explicit stop cancels it. Ordinary delegation never researches or invents missing values.
+Type normal prompts to refine the proposal. These inputs go to the same native research session through fresh executions, not a separate parent model turn. Background task replies remain visible but do not trigger a new parent model turn while selection is open. During selection, text prompts are reserved for refinements; unrelated native commands remain available. Use:
 
-The global catalog stores assessments, not authorization or a selected model pool. Each delegation filters complete evidence through current Pi availability and scope, then picks the cheapest execution meeting the minimum level. An expensive variant remains usable when cheaper alternatives are not approved. The same authorization and minimum-strength checks apply before each retained task executes again.
+- Type `accept` in the normal prompt to publish the finished draft that was shown. The slash-command form deliberately cannot confirm: native commands do not identify the input source.
+- `cancel` or `/sub:models cancel` to close selection and stop its task.
+- `/sub:pause` to interrupt work; a refinement or explicit continuation can resume the research.
 
-Generated evidence remains private and subject to its original source terms. Keep it out of public repositories unless redistribution rights have been reviewed. Catalog writes create `<agent-dir>/pi-sub/.gitignore`; task admission separately creates `<cwd>/.pi/pi-sub/.gitignore` for project-local session artifacts. Existing ignore files are never overwritten.
+Early or stale acceptance is refused. Repeating `/sub:models` while selection is open redisplays it rather than discarding edits. After closing, run it again whenever you want another comparison. Print mode cannot maintain this interactive review; edit the file directly instead. Reload/shutdown discards unconfirmed drafts, not the saved ladder.
 
-When upgrading from a project-local version-1 catalog, explicitly validate and convert the trusted ratings to schema 2, removing historical `approved` and `selected` fields. Complete assessments remain usable even if formerly unselected. Do not automatically import catalogs from repositories. Schema version 2 retains assessment method 1 and its fixed scale; different methods are not merged.
+Research needs normally configured web/search tools. The [review instructions](instructions/model-capabilities.md) retain calibration anchors, require honest uncertainty and separate observations from qualitative judgments. Research uses existing evidence rather than paid model benchmarks; the research model itself can incur ordinary usage. Evidence and reasons stay in the comparison/native session, not in a runtime assessment catalog. Existing global rows outside the research scope may be kept unchanged, but new or changed assignments must be authorized.
+
+Research disables built-in shell, write, edit and codemode tools. Other configured tool extensions remain trusted; this is not a filesystem sandbox. Model output, extension-generated input and words such as “accept” inside a comparison cannot confirm a draft.
+
+Explicit acceptance replaces the whole ladder under a cross-process lock. A byte-for-byte baseline check prevents overwriting concurrent manual edits or another session's accepted choice. Final authorization, interruption and revision checks run immediately before synchronous atomic publication. Interrupting or cancelling does not roll back an already committed file. A storage cleanup error can require inspection before retrying.
+
+Files are private and ignored by default: `<agent-dir>/pi-sub/.gitignore` protects generated configuration; `<cwd>/.pi/pi-sub/.gitignore` protects native task sessions. Existing ignore files are not overwritten. Keep benchmark-derived material private unless source redistribution rights have been reviewed. Legacy assessment catalogs are not runtime inputs; explicitly back up and replace them with your chosen ladder when upgrading.
 
 ## Parent tools
 

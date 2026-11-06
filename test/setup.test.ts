@@ -1,24 +1,18 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { afterEach, expect, it, vi } from "vitest";
+import { mkdtemp, readFile, rm, mkdir, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import { lock } from "proper-lockfile";
 import { Coordinator } from "../src/coordinator.ts";
-import {
-  catalogPath,
-  saveCatalog,
-  type ApprovedModel,
-  type Catalog,
-} from "../src/models.ts";
-import { approvedModels, setupModels, workerDirectory } from "../src/setup.ts";
+import { ladderPath, type ApprovedModel, type Ladder } from "../src/models.ts";
+import { ModelSetup, approvedModels, workerDirectory } from "../src/setup.ts";
 import type {
   Worker,
-  WorkerEvent,
   WorkerOptions,
+  WorkerEvent,
   WorkerReport,
 } from "../src/worker.ts";
-
 const approved: ApprovedModel[] = [
   { provider: "test", model: "fake", thinking: ["off"] },
 ];
@@ -29,24 +23,11 @@ const execution: WorkerOptions = {
   cwd: "/",
   name: "setup",
 };
-const catalog = (): Catalog => ({
-  version: 2,
-  methodVersion: 1,
-  generatedAt: "2026-11-05T00:00:00Z",
-  candidates: [
-    {
-      provider: "test",
-      model: "fake",
-      thinking: "off",
-      power: 6,
-      cost: 0.1,
-      score: 30,
-      source: "https://artificialanalysis.ai/models/fake",
-      retrievedAt: "2026-11-05T00:00:00Z",
-      rationale: "Test evidence",
-    },
-  ],
-});
+const ladder: Ladder = { "6": { model: "test/fake:off", cost: 0.1 } };
+const proposal = (value = ladder, comparison = "Evidence reviewed") =>
+  JSON.stringify({ ladder: value, comparison });
+const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+
 class FakeWorker implements Worker {
   listener: (event: WorkerEvent) => void = () => {};
   prompts: string[] = [];
@@ -76,6 +57,16 @@ class FakeWorker implements Worker {
       this.listener = () => {};
     };
   }
+  fail(error: string) {
+    this.finished = true;
+    this.result.resolve({
+      text: "",
+      error,
+      sessionFile: this.sessionFile,
+      interrupted: false,
+      inputPersisted: true,
+    });
+  }
   finish(text: string) {
     if (this.finished) throw new Error("Execution already ended");
     this.finished = true;
@@ -88,218 +79,295 @@ class FakeWorker implements Worker {
     });
   }
 }
-const fixtures: { cwd: string; coordinator: Coordinator }[] = [];
+
+const fixtures: { cwd: string; coordinator: Coordinator; setup: ModelSetup }[] =
+  [];
 afterEach(async () => {
-  for (const fixture of fixtures.splice(0)) {
-    await fixture.coordinator.dispose();
-    await rm(fixture.cwd, { recursive: true, force: true });
+  for (const f of fixtures.splice(0)) {
+    f.setup.dispose();
+    await f.coordinator.dispose();
+    await rm(f.cwd, { recursive: true, force: true });
   }
   vi.unstubAllEnvs();
 });
-async function begin(current = () => approved, signal?: AbortSignal) {
+async function begin(
+  options: {
+    baseline?: string;
+    approved?: () => ApprovedModel[];
+    prepare?: () => Promise<boolean>;
+  } = {},
+) {
   const cwd = await mkdtemp(join(tmpdir(), "pi-sub-setup-"));
   vi.stubEnv("PI_CODING_AGENT_DIR", join(cwd, "agent"));
   const workers: FakeWorker[] = [];
   const coordinator = new Coordinator({
-    createWorker: (_options, file) => {
-      const worker = new FakeWorker(file);
-      workers.push(worker);
-      return worker;
+    createWorker: (_, file) => {
+      const w = new FakeWorker(file);
+      workers.push(w);
+      return w;
     },
   });
-  fixtures.push({ cwd, coordinator });
-  const started = Promise.withResolvers<string>();
-  const result = setupModels({
+  if (options.baseline !== undefined) {
+    await mkdir(dirname(ladderPath()), { recursive: true });
+    await writeFile(ladderPath(), options.baseline);
+  }
+  const onReport = vi.fn();
+  const onSaved = vi.fn();
+  const onChange = vi.fn();
+  const setup = new ModelSetup({
     coordinator,
-    worker: { ...execution, cwd, sessionDir: await workerDirectory(cwd) },
-    approved: current,
-    signal,
-    onStarted: (id) => started.resolve(id),
+    approved: options.approved ?? (() => approved),
+    prepare: options.prepare ?? (async () => true),
+    onReport,
+    onSaved,
+    onChange,
   });
-  // Attach rejection handling before triggering a failure or interruption.
-  void result.catch(() => {});
-  const id = await started.promise;
-  await new Promise((resolve) => setTimeout(resolve, 0));
+  fixtures.push({ cwd, coordinator, setup });
   return {
     cwd,
+    coordinator,
+    setup,
+    workers,
+    onReport,
+    onSaved,
+    onChange,
+    open: () => setup.open({ ...execution, cwd }),
     get worker() {
       return workers.at(-1)!;
     },
-    workers,
-    coordinator,
-    id,
-    result,
+    get id() {
+      return setup.view!.id!;
+    },
   };
 }
+async function review(
+  f: Awaited<ReturnType<typeof begin>>,
+  value = ladder,
+  comparison?: string,
+) {
+  f.worker.finish(proposal(value, comparison));
+  await tick();
+  expect(f.setup.view?.phase).toBe("review");
+}
+it("returns before research ends and writes only after explicit revision-bound acceptance", async () => {
+  const f = await begin();
+  await f.open();
+  expect(f.setup.view?.phase).toBe("working");
+  await expect(f.setup.accept(f.setup.view!.revision)).rejects.toThrow();
+  expect(f.worker.prompts[0]).toContain("Approved variants (research only):");
+  await review(f, ladder, "accept");
+  await expect(readFile(ladderPath())).rejects.toMatchObject({
+    code: "ENOENT",
+  });
+  expect(f.onReport.mock.calls[0]![0].content).toContain("DRAFT (not saved)");
+  const id = f.id;
+  await f.setup.accept(f.setup.view!.revision);
+  expect(JSON.parse(await readFile(ladderPath(), "utf8"))).toEqual(ladder);
+  expect(f.onSaved).toHaveBeenCalledOnce();
+  expect(f.setup.active).toBe(false);
+  expect(f.coordinator.inspect(id)).toMatchObject({ outcome: "reply" });
+});
+it("report consumers cannot mutate the internal draft after it was shown", async () => {
+  const f = await begin();
+  await f.open();
+  await review(f);
+  const report = f.onReport.mock.calls[0]![0] as {
+    details: { proposal: { ladder: Ladder } };
+  };
+  report.details.proposal.ladder["6"]!.cost = 999;
+  expect(f.setup.view?.draft).toEqual(ladder);
+  await f.setup.accept(f.setup.view!.revision);
+  expect(JSON.parse(await readFile(ladderPath(), "utf8"))).toEqual(ladder);
+});
 
-describe("model setup", () => {
-  it("bootstraps without a catalog, validates all candidates, closes and activates", async () => {
-    const fixture = await begin();
-    expect(fixture.worker.prompts[0]).toContain("Approved snapshot");
-    expect(
-      await readFile(join(fixture.cwd, ".pi/pi-sub/.gitignore"), "utf8"),
-    ).toBe("*\n");
-    fixture.worker.finish(JSON.stringify({ ...catalog(), approved }));
-    const result = await fixture.result;
-    expect(JSON.parse(await readFile(result.path, "utf8"))).toEqual(catalog());
-    expect(fixture.worker.closes).toBe(1);
-    expect(() => fixture.coordinator.get(fixture.id)).toThrow(
-      "Unknown live task",
-    );
-    expect(fixture.coordinator.inspect(fixture.id)).toMatchObject({
-      outcome: "reply",
-    });
-  });
-  it("preserves the old catalog when research output is invalid", async () => {
-    const fixture = await begin();
-    await saveCatalog(catalogPath(), catalog());
-    fixture.worker.finish("I cannot obtain comparable evidence.");
-    await expect(fixture.result).rejects.toThrow("Global catalog:");
-    expect(JSON.parse(await readFile(catalogPath(), "utf8"))).toEqual(
-      catalog(),
-    );
-    expect(fixture.worker.closes).toBe(1);
-  });
-  it("rejects an approval change before activating the proposal", async () => {
-    let current = approved;
-    const fixture = await begin(() => current);
-    current = [];
-    fixture.worker.finish(JSON.stringify({ ...catalog(), approved }));
-    await expect(fixture.result).rejects.toThrow("approval changed");
-    await expect(readFile(catalogPath())).rejects.toMatchObject({
-      code: "ENOENT",
-    });
-  });
-  it("does not retroactively reject committed ratings when approval changes after acceptance", async () => {
-    let current = approved;
-    const fixture = await begin(() => current);
-    await saveCatalog(catalogPath(), catalog());
-    fixture.coordinator.subscribe(() => {
-      if (!fixture.coordinator.list().some((task) => task.id === fixture.id))
-        current = [];
-    });
-    fixture.worker.finish(
-      JSON.stringify({
-        ...catalog(),
-        approved,
-        generatedAt: "2026-11-05T01:00:00Z",
-      }),
-    );
-    await expect(fixture.result).resolves.toHaveProperty("catalog");
-    expect(JSON.parse(await readFile(catalogPath(), "utf8"))).toEqual({
-      ...catalog(),
-      generatedAt: "2026-11-05T01:00:00Z",
-    });
-  });
-  it.each(["interrupt", "stop", "approval"] as const)(
-    "cancels activation while waiting for the global lock: %s",
-    async (action) => {
-      let current = approved;
-      const fixture = await begin(() => current);
-      await saveCatalog(catalogPath(), catalog());
-      const release = await lock(catalogPath(), { realpath: false });
-      try {
-        fixture.worker.finish(
-          JSON.stringify({
-            ...catalog(),
-            approved,
-            generatedAt: "2026-11-05T01:00:00Z",
-          }),
-        );
-        await new Promise((resolve) => setTimeout(resolve, 30));
-        expect(fixture.coordinator.get(fixture.id).status).toBe("ready");
-        if (action === "stop") await fixture.coordinator.stop(fixture.id);
-        if (action === "approval") current = [];
-        if (action === "interrupt") {
-          await fixture.coordinator.interrupt();
-          await fixture.coordinator.prompt(); // Reopening admission must not revive an invalidated commit.
-        }
-      } finally {
-        await release();
-      }
-      await expect(fixture.result).rejects.toThrow();
-      expect(JSON.parse(await readFile(catalogPath(), "utf8"))).toEqual(
-        catalog(),
-      );
-    },
+it("reserves open before prepare and initializes ignored runtime storage", async () => {
+  const ready = Promise.withResolvers<boolean>();
+  const f = await begin({ prepare: () => ready.promise });
+  const first = f.open();
+  await expect(f.open()).rejects.toThrow("already active");
+  ready.resolve(true);
+  await first;
+  expect(await readFile(join(f.cwd, ".pi/pi-sub/.gitignore"), "utf8")).toBe(
+    "*\n",
   );
-
-  it("merges reviewed variants without deleting unrelated global assessments", async () => {
-    const fixture = await begin();
-    const other = { ...catalog().candidates[0]!, model: "other", power: 9 };
-    await saveCatalog(catalogPath(), {
-      ...catalog(),
-      candidates: [...catalog().candidates, other],
-    });
-    fixture.worker.finish(JSON.stringify({ ...catalog(), approved }));
-    const result = await fixture.result;
-    expect(result.catalog.candidates).toHaveLength(2);
-    expect(result.catalog.candidates).toContainEqual(other);
-    expect(result.catalog).not.toHaveProperty("approved");
-    expect(result.path).toBe(
-      join(fixture.cwd, "agent", "pi-sub", "models.json"),
+  await writeFile(join(f.cwd, ".pi/pi-sub/.gitignore"), "sessions/\n");
+  await workerDirectory(f.cwd);
+  expect(await readFile(join(f.cwd, ".pi/pi-sub/.gitignore"), "utf8")).toBe(
+    "sessions/\n",
+  );
+});
+it("refines using a fresh execution in the same session, rejecting stale acceptance", async () => {
+  const f = await begin();
+  await f.open();
+  await review(f);
+  const revision = f.setup.view!.revision;
+  const previous = f.worker;
+  await f.setup.revise("Recheck costs");
+  expect(f.worker).not.toBe(previous);
+  expect(f.worker.sessionFile).toBe(previous.sessionFile);
+  await expect(f.setup.accept(revision)).rejects.toThrow();
+  await review(f);
+  await expect(f.setup.accept(revision)).rejects.toThrow();
+  await f.setup.accept(f.setup.view!.revision);
+});
+it("discards an old observer on active redirection", async () => {
+  const f = await begin();
+  await f.open();
+  const previous = f.worker;
+  await f.setup.revise("New evidence");
+  expect(previous.closes).toBe(1);
+  expect(f.setup.view?.draft).toBeUndefined();
+  await review(f);
+  expect(f.onReport).toHaveBeenCalledOnce();
+});
+it("reflects pause and resumes without completing the workflow", async () => {
+  const f = await begin();
+  await f.open();
+  const id = f.id;
+  await f.coordinator.pause(id);
+  expect(f.setup.view?.paused).toBe(true);
+  await f.coordinator.continue(id);
+  expect(f.setup.view?.paused).toBe(false);
+  await review(f);
+});
+it.each(["cancel", "interrupt", "approval", "external"] as const)(
+  "blocks publication under the global lock: %s",
+  async (action) => {
+    let current = approved;
+    const baseline = JSON.stringify({});
+    const f = await begin({ baseline, approved: () => current });
+    await f.open();
+    await review(f);
+    const release = await lock(ladderPath(), { realpath: false });
+    const saving = f.setup.accept(f.setup.view!.revision);
+    void saving.catch(() => {});
+    await tick();
+    await expect(f.setup.revise("Busy input")).rejects.toThrow("busy");
+    if (action === "cancel") await f.setup.cancel();
+    if (action === "interrupt") {
+      await f.coordinator.interrupt();
+      await f.coordinator.prompt();
+    }
+    if (action === "approval") current = [];
+    if (action === "external") await writeFile(ladderPath(), "{\n}\n");
+    await release();
+    await expect(saving).rejects.toThrow();
+    expect(await readFile(ladderPath(), "utf8")).toBe(
+      action === "external" ? "{\n}\n" : baseline,
     );
-    await expect(
-      readFile(join(fixture.cwd, ".pi/pi-sub/models.json")),
-    ).rejects.toMatchObject({ code: "ENOENT" });
+    expect(f.onSaved).not.toHaveBeenCalled();
+  },
+);
+it("retains foreign baseline rows but does not grant authority to move them", async () => {
+  const foreign = { model: "foreign/model:off", cost: 2 };
+  const f = await begin({ baseline: JSON.stringify({ "9": foreign }) });
+  await f.open();
+  await review(f, { ...ladder, "9": foreign });
+  await f.setup.accept(f.setup.view!.revision);
+  await f.open();
+  f.worker.finish(proposal({ "8": foreign }));
+  await tick();
+  expect(f.setup.active).toBe(false);
+  expect(f.onReport.mock.calls.at(-1)![0].content).toContain("approval");
+});
+it("checks current approval only for changed rows at acceptance", async () => {
+  let current = approved;
+  const f = await begin({
+    baseline: JSON.stringify(ladder),
+    approved: () => current,
   });
+  await f.open();
+  await review(f);
+  current = [];
+  await f.setup.accept(f.setup.view!.revision);
+  expect(f.onSaved).toHaveBeenCalledOnce();
+});
+it.each([
+  "garbage",
+  JSON.stringify({ ladder, comparison: "ok", approved }),
+  JSON.stringify({ ladder, comparison: "" }),
+])("closes invalid research without writing: %s", async (response) => {
+  const f = await begin({ baseline: "{}" });
+  await f.open();
+  const id = f.id;
+  f.worker.finish(response);
+  await tick();
+  expect(f.setup.active).toBe(false);
+  expect(f.coordinator.list()).toHaveLength(0);
+  expect(f.coordinator.inspect(id)).toBeDefined();
+  expect(await readFile(ladderPath(), "utf8")).toBe("{}");
+});
+it("allows explicit repair of malformed baseline", async () => {
+  const f = await begin({ baseline: "broken" });
+  await f.open();
+  expect(f.setup.view?.currentError).toBeTruthy();
+  await review(f);
+  await f.setup.accept(f.setup.view!.revision);
+  expect(JSON.parse(await readFile(ladderPath(), "utf8"))).toEqual(ladder);
+});
+it("closes provider failures and remains rerunnable", async () => {
+  const f = await begin();
+  await f.open();
+  f.worker.fail("Provider unavailable");
+  await tick();
+  expect(f.setup.active).toBe(false);
+  await f.open();
+  expect(f.setup.active).toBe(true);
+});
+it("leaves failed termination owned by the coordinator, even with throwing callbacks", async () => {
+  const f = await begin();
+  await f.open();
+  const id = f.id;
+  const stop = vi
+    .spyOn(f.worker, "stop")
+    .mockRejectedValue(new Error("stop failed"));
+  f.onReport.mockImplementation(() => {
+    throw new Error("observer failed");
+  });
+  f.onChange.mockImplementation(() => {
+    throw new Error("observer failed");
+  });
+  await f.setup.cancel();
+  expect(f.setup.active).toBe(false);
+  expect(f.coordinator.get(id).outcome).toBe("error");
+  stop.mockRestore();
+  await f.coordinator.stop(id);
+  expect(f.coordinator.list()).toHaveLength(0);
+});
+it("dispose only detaches observers; coordinator shutdown owns workers", async () => {
+  const f = await begin();
+  await f.open();
+  const worker = f.worker;
+  f.setup.dispose();
+  expect(worker.closes).toBe(0);
+  expect(f.setup.active).toBe(false);
+  expect(f.setup.view).toBeUndefined();
+  expect(f.onChange).toHaveBeenLastCalledWith(undefined);
+  await f.coordinator.dispose();
+  expect(worker.closes).toBe(1);
+});
 
-  it("persists a negative reassessment instead of silently retaining old routing evidence", async () => {
-    const fixture = await begin();
-    await saveCatalog(catalogPath(), catalog());
-    const negative = {
-      provider: "test",
-      model: "fake",
-      thinking: "off",
-      rationale: "No comparable evidence remains.",
-    };
-    fixture.worker.finish(
-      JSON.stringify({ ...catalog(), approved, candidates: [negative] }),
-    );
-    const result = await fixture.result;
-    expect(result.catalog.candidates).toEqual([negative]);
-  });
-
-  it("preserves an existing runtime ignore file", async () => {
-    const fixture = await begin();
-    const path = join(fixture.cwd, ".pi/pi-sub/.gitignore");
-    await writeFile(path, "sessions/\n");
-    await workerDirectory(fixture.cwd);
-    expect(await readFile(path, "utf8")).toBe("sessions/\n");
-    fixture.worker.finish(JSON.stringify({ ...catalog(), approved }));
-    await fixture.result;
-  });
-
-  it("keeps paused research pending until the parent explicitly continues", async () => {
-    const fixture = await begin();
-    await fixture.coordinator.pause(fixture.id);
-    let completed = false;
-    void fixture.result
-      .finally(() => {
-        completed = true;
-      })
-      .catch(() => {});
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(completed).toBe(false);
-    const previous = fixture.worker;
-    expect(previous.closes).toBe(1);
-    await fixture.coordinator.continue(fixture.id);
-    expect(fixture.worker).not.toBe(previous);
-    expect(fixture.worker.sessionFile).toBe(previous.sessionFile);
-    fixture.worker.finish(JSON.stringify({ ...catalog(), approved }));
-    await expect(fixture.result).resolves.toHaveProperty("catalog");
-  });
-  it("closes research on shutdown without replacing existing configuration", async () => {
-    const controller = new AbortController();
-    const fixture = await begin(() => approved, controller.signal);
-    await saveCatalog(catalogPath(), catalog());
-    controller.abort();
-    await expect(fixture.result).rejects.toThrow("Global catalog:");
-    expect(JSON.parse(await readFile(catalogPath(), "utf8"))).toEqual(
-      catalog(),
-    );
-    expect(fixture.worker.closes).toBe(1);
-  });
+it("accepts exactly one JSON fence without extracting surrounding prose", async () => {
+  const f = await begin();
+  await f.open();
+  f.worker.finish(`\n\`\`\`json\n${proposal()}\n\`\`\`\n`);
+  await tick();
+  expect(f.setup.view?.phase).toBe("review");
+  expect(f.onReport.mock.calls.at(-1)![0].details.proposal.ladder).toEqual(
+    ladder,
+  );
+  await f.setup.cancel();
+  for (const response of [
+    `Here is the proposal:\n\`\`\`json\n${proposal()}\n\`\`\``,
+    `\`\`\`json\n${proposal()}\n\`\`\`\nDone.`,
+    `\`\`\`json\n${proposal()}\n\`\`\`\n\`\`\`json\n${proposal()}\n\`\`\``,
+  ]) {
+    await f.open();
+    f.worker.finish(response);
+    await tick();
+    expect(f.setup.active).toBe(false);
+    expect(f.coordinator.list()).toHaveLength(0);
+  }
 });
 
 it("uses native model scope and limits an unscoped session to its current model", () => {

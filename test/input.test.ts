@@ -33,6 +33,7 @@ vi.mock("../src/coordinator.ts", () => ({
     start = fake.start;
     get = () => ({ id: "new-task" });
     drainUsage = () => undefined;
+    subscribe = () => () => {};
   },
 }));
 vi.mock("../src/widget.ts", () => ({ mountWidget: () => () => {} }));
@@ -78,6 +79,8 @@ function setup(mode = "rpc") {
     isProjectTrusted: () => true,
     ui: {
       notify,
+      setWidget: vi.fn(),
+      setEditorText: vi.fn(),
       onTerminalInput: (listener: typeof terminalInput) => {
         terminalInput = listener;
         return () => {};
@@ -153,23 +156,8 @@ test("cancellation during runtime directory preparation never admits an orphan t
   vi.spyOn(modelSetup, "approvedModels").mockReturnValue([
     { provider: "test", model: "fake", thinking: ["off"] },
   ]);
-  vi.spyOn(models, "loadCatalog").mockReturnValue({
-    version: 2,
-    methodVersion: 1,
-    generatedAt: "2026-01-01T00:00:00Z",
-    candidates: [
-      {
-        provider: "test",
-        model: "fake",
-        thinking: "off",
-        power: 6,
-        cost: 0.1,
-        score: 30,
-        source: "https://example.com/test",
-        retrievedAt: "2026-01-01T00:00:00Z",
-        rationale: "Test evidence",
-      },
-    ],
+  vi.spyOn(models, "loadLadder").mockReturnValue({
+    "6": { model: "test/fake:off", cost: 0.1 },
   });
   const directory = Promise.withResolvers<string>();
   const prepare = vi
@@ -272,11 +260,186 @@ test("model setup reserves admission before awaiting user-input cleanup", async 
   await commands.get("sub:models")!.handler("", ctx);
   expect(fake.prompt).toHaveBeenCalledOnce();
   expect(notify).toHaveBeenCalledWith(
-    expect.stringContaining("already running"),
-    "error",
+    expect.stringContaining("already open"),
+    "info",
   );
   preparation.resolve(false);
   await first;
+});
+
+test("selection refinements use the native review session and never fall through to the parent", async () => {
+  const { commands, ctx, emit } = setup();
+  Object.assign(ctx, {
+    model: { provider: "test", id: "fake", reasoning: false },
+    thinkingLevel: "off",
+  });
+  vi.spyOn(modelSetup.ModelSetup.prototype, "open").mockResolvedValue();
+  vi.spyOn(modelSetup.ModelSetup.prototype, "active", "get").mockReturnValue(
+    true,
+  );
+  vi.spyOn(modelSetup.ModelSetup.prototype, "view", "get").mockReturnValue({
+    phase: "review",
+    revision: 2,
+    paused: false,
+    draft: { "6": { model: "test/fake:off", cost: 0.1 } },
+  });
+  const revise = vi
+    .spyOn(modelSetup.ModelSetup.prototype, "revise")
+    .mockResolvedValue();
+  await commands.get("sub:models")!.handler("", ctx);
+  expect(
+    await emit("input", {
+      source: "rpc",
+      text: "Use less thinking for small tasks",
+    }),
+  ).toEqual({ action: "handled" });
+  expect(revise).toHaveBeenCalledWith("Use less thinking for small tasks");
+  expect(
+    await emit("input", { source: "extension", text: "accept" }),
+  ).toBeUndefined();
+  expect(revise).toHaveBeenCalledTimes(1);
+});
+
+test("acceptance binds the draft shown before asynchronous user-input preparation", async () => {
+  const { commands, ctx, emit } = setup();
+  Object.assign(ctx, {
+    model: { provider: "test", id: "fake", reasoning: false },
+    thinkingLevel: "off",
+  });
+  vi.spyOn(modelSetup.ModelSetup.prototype, "open").mockResolvedValue();
+  vi.spyOn(modelSetup.ModelSetup.prototype, "active", "get").mockReturnValue(
+    true,
+  );
+  const view = vi
+    .spyOn(modelSetup.ModelSetup.prototype, "view", "get")
+    .mockReturnValue({
+      phase: "review",
+      id: "same-review-task",
+      revision: 2,
+      paused: false,
+      draft: {},
+    });
+  const accept = vi
+    .spyOn(modelSetup.ModelSetup.prototype, "accept")
+    .mockResolvedValue();
+  await commands.get("sub:models")!.handler("", ctx);
+  const preparation = Promise.withResolvers<boolean>();
+  fake.prompt.mockReturnValue(preparation.promise);
+  const pending = emit("input", { source: "rpc", text: "accept" });
+  view.mockReturnValue({
+    phase: "review",
+    id: "same-review-task",
+    revision: 3,
+    paused: false,
+    draft: {},
+  });
+  preparation.resolve(true);
+  expect(await pending).toEqual({ action: "handled" });
+  expect(accept).toHaveBeenCalledWith(2);
+  expect(
+    await emit("input", { source: "extension", text: "accept" }),
+  ).toBeUndefined();
+  expect(accept).toHaveBeenCalledTimes(1);
+});
+
+test("an early accept cannot approve a draft that arrives while preparation is pending", async () => {
+  const { commands, ctx, emit, notify } = setup();
+  Object.assign(ctx, {
+    model: { provider: "test", id: "fake", reasoning: false },
+    thinkingLevel: "off",
+  });
+  vi.spyOn(modelSetup.ModelSetup.prototype, "open").mockResolvedValue();
+  vi.spyOn(modelSetup.ModelSetup.prototype, "active", "get").mockReturnValue(
+    true,
+  );
+  const view = vi
+    .spyOn(modelSetup.ModelSetup.prototype, "view", "get")
+    .mockReturnValue({ phase: "working", revision: 2, paused: false });
+  const accept = vi
+    .spyOn(modelSetup.ModelSetup.prototype, "accept")
+    .mockResolvedValue();
+  await commands.get("sub:models")!.handler("", ctx);
+  const preparation = Promise.withResolvers<boolean>();
+  fake.prompt.mockReturnValue(preparation.promise);
+  const pending = emit("input", { source: "interactive", text: "accept" });
+  view.mockReturnValue({
+    phase: "review",
+    revision: 2,
+    paused: false,
+    draft: {},
+  });
+  preparation.resolve(true);
+  expect(await pending).toEqual({ action: "handled" });
+  expect(accept).not.toHaveBeenCalled();
+  expect(notify).toHaveBeenCalledWith(
+    expect.stringContaining("No finished draft"),
+    "error",
+  );
+  expect(ctx.ui.setEditorText).toHaveBeenCalledWith("accept");
+});
+
+test("cancellation invalidates publication before awaiting unrelated input cleanup", async () => {
+  const { commands, ctx, emit } = setup();
+  Object.assign(ctx, {
+    model: { provider: "test", id: "fake", reasoning: false },
+    thinkingLevel: "off",
+  });
+  vi.spyOn(modelSetup.ModelSetup.prototype, "open").mockResolvedValue();
+  vi.spyOn(modelSetup.ModelSetup.prototype, "active", "get").mockReturnValue(
+    true,
+  );
+  vi.spyOn(modelSetup.ModelSetup.prototype, "view", "get").mockReturnValue({
+    phase: "saving",
+    id: "task",
+    revision: 1,
+    paused: false,
+    draft: {},
+  });
+  const cancel = vi
+    .spyOn(modelSetup.ModelSetup.prototype, "cancel")
+    .mockResolvedValue();
+  await commands.get("sub:models")!.handler("", ctx);
+  const preparation = Promise.withResolvers<boolean>();
+  fake.prompt.mockReturnValue(preparation.promise);
+  const pending = emit("input", { source: "rpc", text: "cancel" });
+  expect(cancel).toHaveBeenCalledOnce();
+  preparation.resolve(true);
+  await pending;
+  expect(cancel.mock.invocationCallOrder[0]).toBeLessThan(
+    fake.prompt.mock.invocationCallOrder[0]!,
+  );
+  fake.prompt.mockClear();
+  await commands.get("sub:models")!.handler("cancel", ctx);
+  expect(fake.prompt).not.toHaveBeenCalled();
+});
+
+test("slash commands cannot confirm a draft without an identifiable user input source", async () => {
+  const { commands, ctx, notify } = setup();
+  Object.assign(ctx, {
+    model: { provider: "test", id: "fake", reasoning: false },
+    thinkingLevel: "off",
+  });
+  vi.spyOn(modelSetup.ModelSetup.prototype, "open").mockResolvedValue();
+  vi.spyOn(modelSetup.ModelSetup.prototype, "active", "get").mockReturnValue(
+    true,
+  );
+  vi.spyOn(modelSetup.ModelSetup.prototype, "view", "get").mockReturnValue({
+    phase: "review",
+    id: "task",
+    revision: 1,
+    paused: false,
+    draft: {},
+  });
+  const accept = vi
+    .spyOn(modelSetup.ModelSetup.prototype, "accept")
+    .mockResolvedValue();
+  await commands.get("sub:models")!.handler("", ctx);
+  await commands.get("sub:models")!.handler("accept", ctx);
+  expect(accept).not.toHaveBeenCalled();
+  expect(notify).toHaveBeenCalledWith(
+    expect.stringContaining("normal prompt"),
+    "error",
+  );
 });
 
 test("global /sub:pause interrupts headless work and aborts the parent", async () => {
@@ -309,6 +472,39 @@ test("terminal errors notify the human, never trigger the parent LLM", () => {
     "error",
   );
   expect(sendMessage).not.toHaveBeenCalled();
+});
+
+test("background replies cannot wake a second parent model turn while human selection is open", async () => {
+  const { commands, ctx, sendMessage } = setup();
+  Object.assign(ctx, {
+    model: { provider: "test", id: "fake", reasoning: false },
+    thinkingLevel: "off",
+  });
+  vi.spyOn(modelSetup.ModelSetup.prototype, "open").mockResolvedValue();
+  vi.spyOn(modelSetup.ModelSetup.prototype, "active", "get").mockReturnValue(
+    true,
+  );
+  vi.spyOn(modelSetup.ModelSetup.prototype, "view", "get").mockReturnValue({
+    phase: "working",
+    id: "setup",
+    revision: 1,
+    paused: false,
+  });
+  await commands.get("sub:models")!.handler("", ctx);
+  sendMessage.mockClear();
+  fake.onReady!({
+    ...failure,
+    level: 1,
+    status: "ready",
+    activity: "",
+    outcome: "reply",
+    error: undefined,
+    response: "Question?",
+  });
+  expect(sendMessage).toHaveBeenCalledWith(
+    expect.objectContaining({ customType: "pi-sub:response" }),
+    { deliverAs: "followUp", triggerTurn: false },
+  );
 });
 
 test("ordinary ready replies trigger a follow-up only while runnable", () => {
