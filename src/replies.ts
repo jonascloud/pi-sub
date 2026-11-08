@@ -29,7 +29,6 @@ export function pendingReplyBatch(
     .reverse()
     .filter(
       (task) =>
-        task.level !== undefined &&
         task.status === "ready" &&
         task.outcome === "reply" &&
         task.reply &&

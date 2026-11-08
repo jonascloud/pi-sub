@@ -18,7 +18,7 @@ import {
 } from "./models.ts";
 
 /** One stable instruction section; notifications carry observations, not a manual. */
-export const SUBAGENT_GUIDANCE = `Delegate bounded, self-contained work when briefing, research, verification and integration overhead are worthwhile. Choose the minimum sufficient level; the confirmed ladder determines execution. Children do not inherit your conversation or interactive UI.
+export const SUBAGENT_GUIDANCE = `Delegate bounded, self-contained work when briefing, research, verification and integration overhead are worthwhile. Choose the minimum sufficient level; the configured ladder determines execution. Children do not inherit your conversation or interactive UI.
 ${STRENGTH_GUIDANCE}
 Tasks are asynchronous; a reply may be a question rather than a final result. Delivered replies remain available for follow-up; finish:true closes a task, it is not needed to acknowledge a report or clear its widget row. User interruption pauses children; a new prompt resumes only you. Failed work is closed and reported automatically.
 Use reports internally; surface only material results, blockers or user decisions. Ignore reports for already collected or stopped tasks rather than acknowledging or collecting them again.`;
@@ -272,97 +272,6 @@ export const renderStopped: MessageRenderer = (message, options, theme) => {
             style: "title",
           },
         ],
-    options,
-    theme,
-  );
-};
-
-function rationale(text: string): string {
-  let fenced = false;
-  const lines = sanitize(text.slice(0, 4096))
-    .split("\n")
-    .filter((line) => {
-      if (/^\s*```/.test(line)) {
-        fenced = !fenced;
-        return false;
-      }
-      return !fenced;
-    });
-  const prose = lines.find((line) => {
-    const value = line.trim();
-    return value && !/^(?:#{1,6}\s|[\[\]{}]|".*"\s*:|DRAFT\b)/.test(value);
-  });
-  const heading = lines.find((line) => /^#{1,6}\s+/.test(line.trim()));
-  return (
-    preview(prose ?? heading?.trim().replace(/^#{1,6}\s+/, "")) ||
-    "Model comparison"
-  );
-}
-
-/** Proposals stay explicitly unsaved; status messages retain their own wording. */
-export const renderModels: MessageRenderer = (message, options, theme) => {
-  const details = record(message.details);
-  const proposal = record(details?.proposal);
-  const draft =
-    proposal &&
-    record(proposal.ladder) &&
-    typeof proposal.comparison === "string" &&
-    proposal.comparison.trim().length > 0;
-  const content = messageText(message);
-
-  if (options.expanded) {
-    let delivery = message;
-    if (draft) {
-      const sourceTask = record(details?.task);
-      const taskMetadata = sourceTask
-        ? Object.fromEntries(
-            Object.entries(sourceTask).filter(([key]) => key !== "response"),
-          )
-        : undefined;
-      delivery = {
-        ...message,
-        content: `${proposal.comparison}\n\nDRAFT (not saved):\n${JSON.stringify(proposal.ladder, null, 2)}`,
-        details: taskMetadata ? { task: taskMetadata } : undefined,
-      };
-    }
-    return fullDelivery(
-      delivery,
-      options,
-      draft ? "Model ladder · DRAFT — not saved" : undefined,
-    );
-  }
-  if (!draft)
-    return compact(
-      [
-        {
-          text: /^[\[{]/.test(content.trim())
-            ? "Model selection · details unavailable"
-            : preview(content) || "Model selection",
-          style: "title",
-        },
-      ],
-      options,
-      theme,
-    );
-  const task = record(details?.task);
-  return compact(
-    [
-      {
-        text: `DRAFT — not saved${task ? ` · ${identity(task)}` : ""}`,
-        style: "title",
-      },
-      {
-        text: rationale(proposal.comparison as string),
-      },
-      ...(Object.keys(proposal.ladder as object).length === 0
-        ? [
-            {
-              text: "Empty draft — delegation disabled if accepted.",
-              style: "error" as const,
-            },
-          ]
-        : []),
-    ],
     options,
     theme,
   );

@@ -230,20 +230,6 @@ describe("widget rendering", () => {
     expect(rows[0]).not.toContain("token");
     expect(rows[0]).not.toContain("model");
   });
-  it("leaves research JSON in its own panel but retains genuine failure causes", () => {
-    const proposal = task({
-      level: undefined,
-      response: '{"ladder":{"6":{"model":"test/m:off"}}}',
-      status: "ready",
-      outcome: "reply",
-    });
-    expect(render([proposal], 120).join("\n")).not.toContain("ladder");
-    const failed = render(
-      [{ ...proposal, outcome: "error", error: "Invalid proposal" }],
-      120,
-    ).join("\n");
-    expect(failed).toContain("Invalid proposal");
-  });
   it("collapses delivered replies without calling them completed", () => {
     const reply = task({
       status: "ready",

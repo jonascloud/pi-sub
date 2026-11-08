@@ -1,15 +1,23 @@
 import { afterEach, expect, test, vi } from "vitest";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import childGuard from "../src/child.ts";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   createWorker,
+  workerDirectory,
   type Worker,
   type WorkerOptions,
 } from "../src/worker.ts";
@@ -83,6 +91,55 @@ function nextEvent(worker: Worker, type = "agent_start") {
     });
   });
 }
+
+test.each([
+  "",
+  "# custom rules\n*.tmp",
+  "sessions/\n!sessions/\n",
+  "/sessions/\n",
+])(
+  "worker journals stay private and ignored, preserving existing rules: %j",
+  async (contents) => {
+    const cwd = await mkdtemp(join(tmpdir(), "worker-directory-"));
+    dirs.push(cwd);
+    execFileSync("git", ["init", "--quiet", cwd]);
+    const directory = join(cwd, ".pi/pi-sub");
+    await mkdir(directory, { recursive: true });
+    const ignore = join(directory, ".gitignore");
+    await writeFile(ignore, contents, { mode: 0o600 });
+    const [sessions] = await Promise.all(
+      Array.from({ length: 4 }, () => workerDirectory(cwd)),
+    );
+    expect(sessions).toBe(join(directory, "sessions"));
+    await mkdir(sessions!);
+    await writeFile(join(sessions!, "private.jsonl"), "private task history");
+    expect(
+      execFileSync(
+        "git",
+        ["check-ignore", "--", ".pi/pi-sub/sessions/private.jsonl"],
+        { cwd, encoding: "utf8" },
+      ).trim(),
+    ).toBe(".pi/pi-sub/sessions/private.jsonl");
+    const ignored = await readFile(ignore, "utf8");
+    expect(ignored.startsWith(contents)).toBe(true);
+    await workerDirectory(cwd);
+    expect(await readFile(ignore, "utf8")).toBe(ignored);
+  },
+);
+
+test("worker directory creation protects session history without touching the profile", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "worker-directory-"));
+  dirs.push(cwd);
+  const sessions = await workerDirectory(cwd);
+  expect(sessions).toBe(join(cwd, ".pi/pi-sub/sessions"));
+  expect(await readFile(join(cwd, ".pi/pi-sub/.gitignore"), "utf8")).toBe(
+    "*\n",
+  );
+  expect((await stat(join(cwd, ".pi/pi-sub"))).mode & 0o777).toBe(0o700);
+  expect((await stat(join(cwd, ".pi/pi-sub/.gitignore"))).mode & 0o777).toBe(
+    0o600,
+  );
+});
 
 test("launch uses stdin and fixed native options, LF-only framing and split UTF-8", async () => {
   const { worker, dir } = await setup(
