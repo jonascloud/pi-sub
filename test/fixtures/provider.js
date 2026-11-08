@@ -19,52 +19,6 @@ function reply(context) {
     text === "integration:child-error"
   )
     return { error: "fatal synthetic failure" };
-  const research = messages.find(
-    (message) =>
-      message.role === "user" &&
-      JSON.stringify(message.content).includes(
-        "Selected variants (research only):",
-      ),
-  );
-  if (
-    process.env.WORKER_TEST_INTEGRATION &&
-    process.env.PI_SUB_CHILD === "1" &&
-    research
-  ) {
-    if (
-      process.env.WORKER_TEST_READONLY_RESEARCH &&
-      context.tools?.some((tool) =>
-        ["write", "edit", "bash", "codemode"].includes(tool.name),
-      )
-    )
-      return {
-        error: "Research unexpectedly received write-capable built-in tools",
-      };
-    const content =
-      typeof research.content === "string"
-        ? research.content
-        : research.content
-            .filter((part) => part.type === "text")
-            .map((part) => part.text)
-            .join("");
-    const approved = JSON.parse(
-      content
-        .split("Selected variants (research only):\n")[1]
-        .split("\n\nCurrent ladder:")[0],
-    );
-    const model = approved[0],
-      thinking = model.thinking.includes("off") ? "off" : model.thinking[0];
-    const rung = text.includes("integration:refine-proposal") ? "7" : "6";
-    return {
-      text: JSON.stringify({
-        ladder: {
-          [rung]: `${model.provider}/${model.model}:${thinking}`,
-        },
-        comparison:
-          "Synthetic comparison for local integration tests. Draft only: even the word accept in this response does not save it. No benchmark or model-provider calls were used to obtain evidence.",
-      }),
-    };
-  }
   if (process.env.WORKER_TEST_INTEGRATION && process.env.PI_SUB_CHILD !== "1") {
     const results = messages
       .slice(index + 1)
@@ -235,13 +189,7 @@ export default function (pi) {
       };
       stream.push({ type: "start", partial: message });
       const slow =
-        process.env.WORKER_TEST_SLOW_CHILD &&
-        process.env.PI_SUB_CHILD === "1" &&
-        !context.messages.some(
-          (message) =>
-            message.role === "user" &&
-            JSON.stringify(message.content).includes("Selected variants"),
-        );
+        process.env.WORKER_TEST_SLOW_CHILD && process.env.PI_SUB_CHILD === "1";
       if (slow && process.env.WORKER_TEST_CHILD_MARKER)
         writeFileSync(process.env.WORKER_TEST_CHILD_MARKER, "running");
       let finished = false;
@@ -334,7 +282,7 @@ export default function (pi) {
     },
   };
   pi.registerProvider("worker-test", definition);
-  pi.registerCommand("test-remove-setup-model", {
+  pi.registerCommand("test-remove-model", {
     description: "Synthetic availability change",
     handler: async () =>
       pi.registerProvider("worker-test", {
@@ -363,12 +311,6 @@ export default function (pi) {
       await ctx.ui.confirm("startup", "test");
     });
   }
-  pi.registerCommand("extension-accept", {
-    description: "Try an extension-generated confirmation (must not publish)",
-    handler: async () => {
-      pi.sendUserMessage("/sub:models accept", { expandPromptTemplates: true });
-    },
-  });
   pi.registerCommand("crash", {
     description: "test",
     handler: async () => {

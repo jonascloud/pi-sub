@@ -1,4 +1,4 @@
-import { getSupportedThinkingLevels, StringEnum } from "@earendil-works/pi-ai";
+import { StringEnum } from "@earendil-works/pi-ai";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import {
   defineTool,
@@ -8,11 +8,7 @@ import {
   type AgentBeforeSettleEvent,
   type TurnEndEvent,
 } from "@earendil-works/pi-coding-agent";
-import {
-  matchesKey,
-  stripTerminalSequences,
-  type Component,
-} from "@earendil-works/pi-tui";
+import { matchesKey, stripTerminalSequences } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
   Coordinator,
@@ -20,28 +16,21 @@ import {
   type TaskResult,
 } from "./src/coordinator.ts";
 import {
+  availableModels,
   ladderPath,
   loadLadder,
   parseReference,
   selectExecution,
 } from "./src/models.ts";
-import {
-  availableModels,
-  ModelSetup,
-  workerDirectory,
-  type SetupView,
-} from "./src/setup.ts";
-import { renderModelSelection } from "./src/model-view.ts";
-import { chooseModels } from "./src/model-picker.ts";
+import { workerDirectory } from "./src/worker.ts";
 import { taskToolRenderers } from "./src/tool-view.ts";
-import { mountWidget, availableWidgetHeight } from "./src/widget.ts";
+import { mountWidget } from "./src/widget.ts";
 import {
   SUBAGENT_GUIDANCE,
   failureSummary,
   renderReply,
   renderFailures,
   renderStopped,
-  renderModels,
   routingSummary,
 } from "./src/messages.ts";
 import { pendingReplyBatch, deliveredReplies } from "./src/replies.ts";
@@ -55,7 +44,6 @@ export default function piSub(pi: ExtensionAPI): void {
   pi.registerMessageRenderer("pi-sub:response", renderReply);
   pi.registerMessageRenderer("pi-sub:failures", renderFailures);
   pi.registerMessageRenderer("pi-sub:stopped", renderStopped);
-  pi.registerMessageRenderer("pi-sub:models", renderModels);
   let context: ExtensionContext | undefined;
   let coordinator: Coordinator | undefined;
   let unmount: (() => void) | undefined;
@@ -63,7 +51,6 @@ export default function piSub(pi: ExtensionAPI): void {
   const signals = new WeakSet<AbortSignal>();
   let runInterrupted = false;
   let dialogOpen = false;
-  let selection: ModelSetup | undefined;
   const lifetime = new AbortController();
   let idleDelivery: ReturnType<typeof setImmediate> | undefined;
 
@@ -88,7 +75,7 @@ export default function piSub(pi: ExtensionAPI): void {
         return;
       try {
         const batch = replyBatchFor(ctx);
-        if (batch) pi.sendMessage(batch, { triggerTurn: !selection?.active });
+        if (batch) pi.sendMessage(batch, { triggerTurn: true });
       } catch (error) {
         notify(
           `Could not deliver subagent responses: ${reason(error)}`,
@@ -115,7 +102,7 @@ export default function piSub(pi: ExtensionAPI): void {
         authorizeTask(task, context);
       },
       onReady(task) {
-        if (lifetime.signal.aborted || task.level === undefined) return;
+        if (lifetime.signal.aborted) return;
         if (task.outcome === "error") {
           notify(`${task.description} · failed\n${task.error}`, "error");
           return;
@@ -133,7 +120,6 @@ export default function piSub(pi: ExtensionAPI): void {
   const interrupt = () => {
     if (lifetime.signal.aborted) return Promise.resolve();
     runInterrupted = true;
-    if (selection?.view?.phase === "choosing") void selection.cancel();
     const pending = manager()
       .interrupt()
       .catch((error) =>
@@ -183,23 +169,21 @@ export default function piSub(pi: ExtensionAPI): void {
         "The retained execution is no longer available. Stop this subagent instead.",
       );
     }
-    if (task.level !== undefined) {
-      const retained = Object.entries(loadLadder(ladderPath())).some(
-        ([level, entry]) => {
-          const ref = parseReference(entry);
-          return (
-            Number(level) >= task.level! &&
-            ref.provider === execution.provider &&
-            ref.model === execution.model &&
-            ref.thinking === execution.thinking
-          );
-        },
-      );
-      if (!retained)
-        throw new Error(
-          "The retained execution no longer meets the task's minimum level. Stop this subagent instead.",
+    const retained = Object.entries(loadLadder(ladderPath())).some(
+      ([level, entry]) => {
+        const ref = parseReference(entry);
+        return (
+          Number(level) >= task.level &&
+          ref.provider === execution.provider &&
+          ref.model === execution.model &&
+          ref.thinking === execution.thinking
         );
-    }
+      },
+    );
+    if (!retained)
+      throw new Error(
+        "The retained execution no longer meets the task's minimum level. Stop this subagent instead.",
+      );
   };
   const authorized = (id: string, ctx: ExtensionContext) =>
     authorizeTask(manager().get(id), ctx);
@@ -223,81 +207,6 @@ export default function piSub(pi: ExtensionAPI): void {
       ...(error ? { isError: true } : {}),
       ...(usage ? { usage } : {}),
     };
-  };
-
-  const refreshSelection = (view: SetupView | undefined) => {
-    if (!context?.hasUI) return;
-    context.ui.setWidget(
-      "pi-sub:models",
-      view
-        ? (tui) => {
-            const component: Component = {
-              render(width) {
-                return renderModelSelection(
-                  selection?.view,
-                  width,
-                  availableWidgetHeight(tui, component, width),
-                );
-              },
-              invalidate() {},
-            };
-            return component;
-          }
-        : undefined,
-      { placement: "aboveEditor" },
-    );
-  };
-  const reportSelection = (report: { content: string; details?: unknown }) => {
-    if (lifetime.signal.aborted) return;
-    pi.sendMessage(
-      {
-        customType: "pi-sub:models",
-        display: true,
-        content: truncateHead(stripTerminalSequences(report.content), {
-          maxBytes: 24000,
-          maxLines: 300,
-        }).content,
-        details: report.details,
-      },
-      { triggerTurn: false },
-    );
-  };
-  const modelSelection = () =>
-    (selection ??= new ModelSetup({
-      coordinator: manager(),
-      available: () => (context ? availableModels(context) : []),
-      choose: (available, current, signal) => {
-        if (!context) throw new Error("No active parent context");
-        return chooseModels(
-          context.ui,
-          available,
-          current,
-          signal,
-          context.model && {
-            provider: context.model.provider,
-            model: context.model.id,
-          },
-        );
-      },
-      prepare: preparePrompt,
-      signal: lifetime.signal,
-      onChange: refreshSelection,
-      onReport: reportSelection,
-      onSaved: (path) =>
-        reportSelection({
-          content: `Model ladder saved: ${path}`,
-        }),
-    }));
-  const cancelSelection = async () => {
-    const setup = selection;
-    const shown = setup?.view;
-    if (!setup?.active)
-      throw new Error("No model selection is open. Run /sub:models.");
-    // Invalidate publication immediately, not after unrelated input preparation.
-    await setup.cancel();
-    reportSelection({
-      content: `Model selection ${shown?.revision ?? ""} closed.`,
-    });
   };
 
   pi.on("session_start", (_event, ctx) => {
@@ -325,59 +234,10 @@ export default function piSub(pi: ExtensionAPI): void {
   pi.on("input", async (event, ctx) => {
     if (event.source !== "interactive" && event.source !== "rpc") return;
     context = ctx;
-    const wasSelecting = selection?.active;
-    const shown = selection?.view;
     try {
-      if (wasSelecting && event.text.trim().toLowerCase() === "cancel") {
-        await selection!.cancel(); // Close the publication gate before asynchronous preparation.
-        if (await preparePrompt())
-          reportSelection({
-            content: `Model selection ${shown?.revision ?? ""} closed.`,
-          });
-        return { action: "handled" };
-      }
       if (!(await preparePrompt())) return { action: "handled" };
-      if (wasSelecting || selection?.active) {
-        if (!selection?.active)
-          throw new Error(
-            "Model selection closed while preparing input. Run /sub:models to begin again.",
-          );
-        if (
-          shown?.id
-            ? selection.view?.id !== shown.id
-            : selection.view?.revision !== shown?.revision
-        )
-          throw new Error(
-            "Model selection changed while preparing input. Please review it before resubmitting.",
-          );
-        const action = event.text.trim().toLowerCase();
-        if (action === "accept") {
-          if (shown?.phase !== "review")
-            throw new Error(
-              "No finished draft was shown to accept. Wait for the proposal.",
-            );
-          await selection.accept(shown.revision);
-        } else {
-          if (event.images?.length)
-            throw new Error(
-              "Model selection accepts text refinements; reference image files by path.",
-            );
-          await selection.revise(event.text);
-        }
-        return { action: "handled" };
-      }
     } catch (error) {
       notify(`Could not prepare user input: ${reason(error)}`, "error");
-      const current = selection?.view;
-      if (
-        wasSelecting &&
-        ctx.hasUI &&
-        current &&
-        shown &&
-        current.revision === shown.revision &&
-        current.id === shown.id
-      )
-        ctx.ui.setEditorText(event.text);
       return { action: "handled" };
     }
   });
@@ -407,8 +267,8 @@ export default function piSub(pi: ExtensionAPI): void {
         { type: "custom_message" as const, ...batch },
       ],
       // Natural tool/queue continuation satisfies this request; Pi does not add
-      // another turn on top of it. Selection may store reports but never wake us.
-      continue: event.continue || !selection?.active,
+      // another turn on top of it.
+      continue: true,
     };
   };
   pi.on("turn_end", deliverAtBoundary);
@@ -453,7 +313,7 @@ export default function piSub(pi: ExtensionAPI): void {
         .map(([level]) => Number(level));
       table =
         `Your configured strength: ${self.length ? Math.max(...self) + "/10" : "unknown"}.\n` +
-        "Confirmed ladder (minimum level → execution):\n" +
+        "Configured ladder (minimum level → execution):\n" +
         routingSummary(ladder, available);
     } catch (error) {
       table = reason(error);
@@ -473,62 +333,11 @@ export default function piSub(pi: ExtensionAPI): void {
   pi.on("session_shutdown", async () => {
     lifetime.abort();
     if (idleDelivery) clearImmediate(idleDelivery);
-    selection?.dispose();
     detachInput?.();
     unmount?.();
     await coordinator?.dispose();
   });
 
-  pi.registerCommand("sub:models", {
-    description:
-      "Choose available models, review the global ladder, then explicitly accept or cancel.",
-    getArgumentCompletions: (prefix) =>
-      ["cancel"]
-        .filter((action) => action.startsWith(prefix))
-        .map((value) => ({ value, label: value })),
-    handler: async (args, ctx) => {
-      try {
-        checkContext(ctx);
-        if (!ctx.hasUI)
-          throw new Error(
-            "Model selection requires a TUI or RPC session. Edit the global ladder directly in print mode.",
-          );
-        const action = args.trim().toLowerCase();
-        if (action === "accept")
-          throw new Error(
-            "Type accept in the normal prompt to save the shown draft.",
-          );
-        if (action === "cancel") {
-          await cancelSelection();
-          return;
-        }
-        if (action)
-          throw new Error(
-            "Use /sub:models to review, type accept to save, or use /sub:models cancel.",
-          );
-        if (selection?.active) {
-          refreshSelection(selection.view);
-          return;
-        }
-        const model = ctx.model;
-        if (!model)
-          throw new Error("Select the setup model with /model first.");
-        const thinking = ctx.thinkingLevel ?? "off";
-        if (!getSupportedThinkingLevels(model).includes(thinking))
-          throw new Error("Unsupported setup thinking level.");
-        await modelSelection().open({
-          cwd: ctx.cwd,
-          provider: model.provider,
-          model: model.id,
-          thinking,
-          name: "pi-sub model selection",
-          args: ["--approve", "--tools", "-write,-edit,-bash,-codemode"],
-        });
-      } catch (error) {
-        notify(reason(error), "error");
-      }
-    },
-  });
   for (const action of ["pause", "continue", "stop"] as const) {
     pi.registerCommand(`sub:${action}`, {
       description: `${action} one subagent by ID, or all when no ID is supplied.`,

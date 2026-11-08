@@ -10,6 +10,7 @@ import {
 
 const task: TaskView = {
   id: "task-1",
+  level: 3,
   description: "Review changes",
   execution: { provider: "p", model: "m", thinking: "off" },
   sessionFile: "native.jsonl",
@@ -228,7 +229,6 @@ test("live replies are selected oldest-first without a second queue or mutations
     delivered = ready("delivered");
   delivered.reply!.delivered = true;
   const tasks: TaskView[] = [
-    { ...ready("research"), level: undefined },
     { ...ready("paused"), status: "paused" },
     { ...ready("queued"), status: "queued" },
     { ...ready("active"), status: "active" },

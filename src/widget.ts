@@ -21,9 +21,7 @@ const clean = (text: string) =>
   stripTerminalSequences(text)
     .replace(/[\r\n\t\x00-\x1f\x7f-\x9f]+/g, " ")
     .trim();
-// Research proposals have their own panel; do not leak its JSON into the task row.
-const detail = (task: TaskView) =>
-  clean(task.error || (task.level === undefined ? "" : task.response));
+const detail = (task: TaskView) => clean(task.error || task.response);
 const code = (task: TaskView) => {
   if (task.outcome === "error") return "err";
   if (task.operation === "pausing") return "psg";

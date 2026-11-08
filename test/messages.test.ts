@@ -7,7 +7,6 @@ import {
   renderReply,
   renderFailures,
   renderStopped,
-  renderModels,
   routingSummary,
 } from "../src/messages.ts";
 import { replyBatch } from "../src/replies.ts";
@@ -15,6 +14,7 @@ import { STRENGTH_GUIDANCE } from "../src/models.ts";
 
 const task: TaskView = {
   id: "task-1",
+  level: 3,
   description: "Review changes",
   execution: { provider: "p", model: "m", thinking: "off" },
   sessionFile: "native.jsonl",
@@ -202,52 +202,6 @@ test("stop acknowledgements summarize task identities", () => {
   expect(draw(renderStopped, "[]", []).join("\n")).not.toContain("[]");
 });
 
-test("model proposals preview rationale and unsaved state, retaining full research on expansion", () => {
-  const comparison =
-    "# Comparison\nUse the smaller model for checks; keep the stronger rung for design.\n\nSources:\nhttps://example.test/models";
-  const proposal = {
-    ladder: { "6": "p/m:off" },
-    comparison,
-  };
-  const details = {
-    task: { ...task, response: JSON.stringify(proposal) },
-    proposal,
-  };
-  const content = `${comparison}\n\nDRAFT (not saved):\n${JSON.stringify(proposal.ladder, null, 2)}`;
-  const collapsed = draw(renderModels, content, details).join("\n");
-  expect(collapsed).toContain("DRAFT — not saved");
-  expect(collapsed).toContain("Use the smaller model for checks");
-  expect(collapsed).toContain("Review changes");
-  expect(collapsed).not.toContain('"6"');
-  expect(collapsed).not.toContain("p/m:off");
-  const expanded = draw(renderModels, content, details, true, 180).join("\n");
-  expect(expanded).toContain("DRAFT — not saved");
-  expect(expanded).toContain("https://example.test/models");
-  expect(expanded).toContain('"6"');
-  expect(expanded).toContain("p/m:off");
-  expect(expanded).toContain("native.jsonl");
-  expect(expanded).toContain('"task"');
-  expect(expanded.match(/https:\/\/example.test\/models/g)).toHaveLength(1); // Do not repeat the proposal inside task metadata.
-});
-
-test("model previews prefer rationale over headings and embedded JSON", () => {
-  for (const comparison of [
-    '# Comparison\n```json\n{"6":"raw/ladder:off"}\n```\nSmaller model is sufficient for checks.',
-    '{\n"6": "raw/ladder:off"\n}\nSmaller model is sufficient for checks.',
-    "# Smaller model is sufficient for checks.",
-  ]) {
-    const details = { proposal: { ladder: {}, comparison } };
-    const collapsed = draw(renderModels, comparison, details).join("\n");
-    expect(collapsed).toContain("Smaller model is sufficient");
-    expect(collapsed).not.toContain("raw/ladder");
-  }
-  const malformed = draw(renderModels, '{"ladder":[]}', {
-    proposal: null,
-  }).join("\n");
-  expect(malformed).not.toContain("{");
-  expect(malformed).not.toContain("DRAFT");
-});
-
 test("stopping preserves failed and already accepted outcomes rather than claiming every task stopped", () => {
   const accepted = {
     ...failure,
@@ -266,7 +220,7 @@ test("stopping preserves failed and already accepted outcomes rather than claimi
   expect(mixed).not.toContain("Stopped · 2 tasks");
 });
 
-test("expanded replies and proposals recover complete source payloads without repeating them", () => {
+test("expanded replies recover complete source payloads without repeating them", () => {
   const response = "x".repeat(20000) + "\nEND_OF_FULL_REPLY";
   const reply = replyBatch([{ ...task, response }])!;
   expect(reply.content).not.toContain("END_OF_FULL_REPLY");
@@ -280,42 +234,6 @@ test("expanded replies and proposals recover complete source payloads without re
   expect(expanded).toContain("END_OF_FULL_REPLY");
   expect(expanded.match(/END_OF_FULL_REPLY/g)).toHaveLength(1);
   expect(expanded).toContain("native.jsonl");
-  const comparison = "x".repeat(30000) + "\nEND_OF_FULL_COMPARISON";
-  const metadata = {
-    task: { ...task, response: JSON.stringify({ ladder: {}, comparison }) },
-    proposal: { ladder: {}, comparison },
-  };
-  const before = JSON.stringify(metadata);
-  const proposal = draw(
-    renderModels,
-    "clipped delivery",
-    metadata,
-    true,
-    200,
-  ).join("\n");
-  expect(proposal).toContain("END_OF_FULL_COMPARISON");
-  expect(proposal.match(/END_OF_FULL_COMPARISON/g)).toHaveLength(1);
-  expect(JSON.stringify(metadata)).toBe(before);
-  expect(draw(renderModels, "clipped delivery", metadata).join("\n")).toContain(
-    "delegation disabled if accepted",
-  );
-});
-
-test("model status wording is not promoted to a draft or a saved success", () => {
-  for (const status of [
-    "Model setup requested",
-    "Model setup cancelled",
-    "Model setup failed: permission denied",
-    "Saved model ladder to /tmp/ladder.json",
-  ])
-    expect(draw(renderModels, status).map((line) => line.trim())).toEqual([
-      status,
-    ]);
-  expect(
-    draw(renderModels, "Model setup failed: bad proposal", {
-      proposal: [],
-    }).join("\n"),
-  ).not.toContain("DRAFT");
 });
 
 test("renderers handle content arrays and malformed metadata without mutating payloads", () => {
@@ -334,14 +252,8 @@ test("renderers handle content arrays and malformed metadata without mutating pa
     [],
     [null, 42, []],
     { id: [], description: {}, preview: 4 },
-    { proposal: { ladder: [], comparison: {} } },
   ];
-  for (const renderer of [
-    renderReply,
-    renderFailures,
-    renderStopped,
-    renderModels,
-  ])
+  for (const renderer of [renderReply, renderFailures, renderStopped])
     for (const details of malformed) {
       const before = JSON.stringify({ content, details });
       for (const expanded of [false, true])
@@ -370,11 +282,6 @@ test("all views respect width and output padding, collapsed and expanded", () =>
     ],
     [renderFailures, failureSummary([failure]), [failure]],
     [renderStopped, JSON.stringify([failure]), [failure]],
-    [
-      renderModels,
-      "Rationale",
-      { task, proposal: { ladder: {}, comparison: "漢字 rationale" } },
-    ],
   ];
   for (const [renderer, content, details] of cases)
     for (const expanded of [false, true])
@@ -414,30 +321,20 @@ test("all views respect width and output padding, collapsed and expanded", () =>
 test("terminal commands and controls are sanitized in previews and full delivery", () => {
   const unsafe =
     "\x1b[31mVisible\x1b[0m\x1b]8;;https://evil.test\x07link\x1b]8;;\x07\x1b_Gpayload\x1b\\\x07\b\r";
-  for (const renderer of [
-    renderReply,
-    renderFailures,
-    renderStopped,
-    renderModels,
-  ]) {
+  for (const renderer of [renderReply, renderFailures, renderStopped]) {
     const details =
       renderer === renderFailures || renderer === renderStopped
         ? [{ ...failure, description: unsafe, error: unsafe }]
-        : renderer === renderModels
-          ? {
-              task: { ...task, description: unsafe },
-              proposal: { ladder: {}, comparison: unsafe },
-            }
-          : {
-              replies: [
-                {
-                  ...task,
-                  description: unsafe,
-                  response: unsafe,
-                  preview: unsafe,
-                },
-              ],
-            };
+        : {
+            replies: [
+              {
+                ...task,
+                description: unsafe,
+                response: unsafe,
+                preview: unsafe,
+              },
+            ],
+          };
     for (const expanded of [false, true]) {
       const text = draw(renderer, unsafe, details, expanded, 200).join("\n");
       expect(text).toContain("Visible");

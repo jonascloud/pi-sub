@@ -1,10 +1,12 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import { lock } from "proper-lockfile";
-import { readFileSync, renameSync } from "node:fs";
-import { mkdir, open, unlink } from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
-import { randomUUID } from "node:crypto";
+import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
+import {
+  getAgentDir,
+  type ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 export type { ThinkingLevel };
 
@@ -35,6 +37,22 @@ const thinkingLevels = new Set<string>([
 
 export const ladderPath = (): string =>
   join(getAgentDir(), "pi-sub-config.json");
+
+const setupGuide = fileURLToPath(
+  new URL("../instructions/create-model-ladder.md", import.meta.url),
+);
+const setupHelp = `Ask an agent to follow ${setupGuide}.`;
+
+/** Native availability is a hard limit; the configured ladder, not parent scope, authorizes delegation. */
+export function availableModels(
+  ctx: Pick<ExtensionContext, "modelRegistry">,
+): AvailableModel[] {
+  return ctx.modelRegistry.getAvailable().map((model) => ({
+    provider: model.provider,
+    model: model.id,
+    thinking: getSupportedThinkingLevels(model),
+  }));
+}
 
 export function parseReference(
   text: string,
@@ -79,118 +97,26 @@ export function validateLadder(value: unknown): Ladder {
   return result;
 }
 
-export function formatLadder(ladder: Ladder): string {
-  const valid = validateLadder(ladder);
-  const rows = Object.keys(valid)
-    .sort((a, b) => Number(a) - Number(b))
-    .map((rung) => `  ${JSON.stringify(rung)}: ${JSON.stringify(valid[rung])}`);
-  return rows.length ? `{\n${rows.join(",\n")}\n}\n` : "{}\n";
-}
-
-export function readLadderSource(path: string): string | undefined {
+/** Runtime configuration is read-only; changes take effect on the next admission. */
+export function loadLadder(path: string): Ladder {
+  let source: string;
   try {
-    return readFileSync(path, "utf8");
+    source = readFileSync(path, "utf8");
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    if ((error as NodeJS.ErrnoException).code === "ENOENT")
+      throw new Error(`Model ladder missing at ${path}. ${setupHelp}`, {
+        cause: error,
+      });
     throw error;
   }
-}
-
-export function loadLadder(path: string): Ladder {
-  const source = readLadderSource(path);
-  if (source === undefined)
-    throw new Error("Model ladder missing; run /sub:models");
   try {
     return validateLadder(JSON.parse(source));
   } catch (error) {
-    throw new Error("Invalid model ladder; run /sub:models to replace it", {
-      cause: error,
-    });
+    throw new Error(
+      `Invalid model ladder at ${path}: ${error instanceof Error ? error.message : String(error)}. ${setupHelp}`,
+      { cause: error },
+    );
   }
-}
-
-/** Resolve only after publication; returned cleanup warnings do not undo the save. */
-export async function saveLadder(
-  path: string,
-  ladder: Ladder,
-  expectedSource: string | undefined,
-  beforeCommit?: () => void,
-): Promise<unknown[]> {
-  const source = formatLadder(ladder);
-  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-  const release = await lock(path, {
-    realpath: false,
-    retries: { retries: 12, factor: 1, minTimeout: 100, maxTimeout: 100 },
-  });
-  const temp = join(dirname(path), `.${randomUUID()}.tmp`);
-  const verifySource = () => {
-    if (readLadderSource(path) !== expectedSource)
-      throw new Error(
-        "Model ladder changed; run /sub:models again before replacing it",
-      );
-  };
-  let committed = false;
-  let failure: unknown;
-  let failed = false;
-  const cleanupWarnings: unknown[] = [];
-  try {
-    verifySource();
-    // Serialize cooperative saves so they cannot append duplicate ignore rules.
-    const ignore = await open(join(dirname(path), ".gitignore"), "a+", 0o600);
-    try {
-      const contents = await ignore.readFile("utf8");
-      const rule = `/${basename(path).replace(/[\\*?\[\]#! ]/g, "\\$&")}`;
-      const last = contents
-        .split(/\r?\n/)
-        .findLast((line) => line && !line.startsWith("#"));
-      if (last !== rule)
-        await ignore.appendFile(
-          `${contents && !contents.endsWith("\n") ? "\n" : ""}${rule}\n`,
-          "utf8",
-        );
-    } finally {
-      await ignore.close();
-    }
-    const file = await open(temp, "wx", 0o600);
-    try {
-      await file.writeFile(source, "utf8");
-    } finally {
-      await file.close();
-    }
-    // Recheck after asynchronous IO, including non-cooperating manual edits.
-    verifySource();
-    beforeCommit?.();
-    // Cancellation/authorization verification and publication must not yield.
-    renameSync(temp, path);
-    committed = true;
-  } catch (error) {
-    failed = true;
-    failure = error;
-  } finally {
-    if (!committed) {
-      try {
-        await unlink(temp);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT")
-          cleanupWarnings.push(error);
-      }
-    }
-    try {
-      await release();
-    } catch (error) {
-      cleanupWarnings.push(error);
-    }
-  }
-  if (failed) {
-    if (cleanupWarnings.length)
-      throw new AggregateError(
-        [failure, ...cleanupWarnings],
-        "Model ladder save and cleanup failed",
-        { cause: failure },
-      );
-    throw failure;
-  }
-  return cleanupWarnings;
 }
 
 export function selectExecution(
@@ -216,7 +142,7 @@ export function selectExecution(
       return { ...reference, power };
   }
   throw new Error(
-    `No available ladder execution for level ${level}; run /sub:models`,
+    `No available ladder execution for level ${level}; check ${ladderPath()} and native model availability. ${setupHelp}`,
   );
 }
 

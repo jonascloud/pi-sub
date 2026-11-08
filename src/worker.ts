@@ -3,12 +3,13 @@ import type { AssistantMessage, Usage } from "@earendil-works/pi-ai";
 import {
   getPackageDir,
   parseSessionEntries,
+  withFileMutationQueue,
   type JsonAgentSessionEvent,
   type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { readFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { mkdir, open, readFile } from "node:fs/promises";
+import { join, resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 import { addUsage } from "./usage.ts";
@@ -43,6 +44,30 @@ export interface Worker {
   run(prompt: string): Promise<WorkerReport>;
   stop(): Promise<void>;
   onEvent(listener: (event: WorkerEvent) => void): () => void;
+}
+
+export async function workerDirectory(cwd: string): Promise<string> {
+  const directory = join(cwd, ".pi", "pi-sub");
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  const path = join(directory, ".gitignore");
+  await withFileMutationQueue(path, async () => {
+    const file = await open(path, "a+", 0o600);
+    try {
+      const contents = await file.readFile("utf8");
+      // A final directory rule also overrides earlier negations. Preserve any
+      // operator rules; do not assume that an existing file protects sessions.
+      const last = contents
+        .split(/\r?\n/)
+        .findLast((line) => line && !line.startsWith("#"));
+      if (!["*", "/*", "sessions/", "/sessions/"].includes(last ?? ""))
+        await file.appendFile(
+          `${contents && !contents.endsWith("\n") ? "\n" : ""}${contents ? "/sessions/" : "*"}\n`,
+        );
+    } finally {
+      await file.close();
+    }
+  });
+  return join(directory, "sessions");
 }
 
 const excludedTools = "sub_task,sub_message,sub_result,sub_control";

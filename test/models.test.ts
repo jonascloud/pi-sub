@@ -5,31 +5,22 @@ import {
   readFile,
   readdir,
   rm,
-  stat,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { execFileSync, spawn } from "node:child_process";
-import * as lockfile from "proper-lockfile";
+import type { Model } from "@earendil-works/pi-ai";
 import {
   type AvailableModel,
   type Ladder,
+  availableModels,
   describeLevels,
-  formatLadder,
   ladderPath,
   loadLadder,
   parseReference,
-  readLadderSource,
-  saveLadder,
   selectExecution,
   validateLadder,
 } from "../src/models.ts";
-
-vi.mock("proper-lockfile", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("proper-lockfile")>();
-  return { ...actual, lock: vi.fn(actual.lock) };
-});
 
 let dir: string;
 const ladder: Ladder = {
@@ -122,7 +113,7 @@ describe("model ladder", () => {
       expect(() => validateLadder(value)).toThrow();
   });
 
-  it("uses the first currently available confirmed rung at or above the minimum", () => {
+  it("uses the first currently available configured rung at or above the minimum", () => {
     expect(selectExecution(ladder, 3, available)).toEqual({
       provider: "p",
       model: "main",
@@ -154,225 +145,89 @@ describe("model ladder", () => {
     expect(available).toHaveLength(4);
   });
 
-  it("formats four sorted single-line rows without runtime metadata", () => {
-    const text = formatLadder(
-      Object.fromEntries(Object.entries(ladder).reverse()),
-    );
-    expect(text.split("\n")).toHaveLength(7);
-    expect(text).toBe(
-      '{\n  "2": "p/cheap:off",\n  "6": "p/main:low",\n  "8": "p/main:high",\n  "10": "p/top:max"\n}\n',
-    );
-    expect(JSON.parse(text)).toEqual(ladder);
-    expect(formatLadder({})).toBe("{}\n");
-    expect(text).not.toMatch(
-      /version|approved|available|selected|candidates|ranking|benchmark|auth/,
-    );
-  });
-
-  it("uses the configured profile and reports a missing ladder", () => {
+  it("uses the configured profile and reports a missing ladder without creating files", async () => {
     const path = ladderPath();
     expect(path).toBe(join(dir, "profile", "pi-sub-config.json"));
-    expect(readLadderSource(path)).toBeUndefined();
-    expect(() => loadLadder(path)).toThrow(/\/sub:models/);
+    expect(() => loadLadder(path)).toThrow(path);
+    expect(() => loadLadder(path)).toThrow(
+      /instructions\/create-model-ladder\.md/,
+    );
+    expect(await readdir(dir)).toEqual([]);
   });
 
-  it("writes private complete replacements, preserving the ignore file", async () => {
+  it("reads external edits on every load without changing configuration or profile files", async () => {
     const path = ladderPath();
-    await saveLadder(path, ladder, undefined);
-    expect(loadLadder(path)).toEqual(ladder);
-    expect((await stat(path)).mode & 0o777).toBe(0o600);
-    expect((await stat(dirname(path))).mode & 0o777).toBe(0o700);
+    await mkdir(dirname(path));
     const ignore = join(dirname(path), ".gitignore");
-    expect((await stat(ignore)).mode & 0o777).toBe(0o600);
-    expect(await readFile(ignore, "utf8")).toBe("/pi-sub-config.json\n");
-    execFileSync("git", ["init", "-q", dirname(path)]);
-    const ignored = execFileSync("git", ["check-ignore", "--stdin"], {
-      cwd: dirname(path),
-      input:
-        "pi-sub-config.json\nsettings.json\nauth.json\nnested/pi-sub-config.json\n",
-      encoding: "utf8",
-    });
-    expect(ignored).toBe("pi-sub-config.json\n");
-    await writeFile(ignore, "custom\n# keep this");
-    await saveLadder(path, {}, readLadderSource(path));
-    expect(loadLadder(path)).toEqual({});
-    expect(await readFile(ignore, "utf8")).toBe(
-      "custom\n# keep this\n/pi-sub-config.json\n",
-    );
-    await saveLadder(path, ladder, readLadderSource(path));
-    expect(await readFile(ignore, "utf8")).toBe(
-      "custom\n# keep this\n/pi-sub-config.json\n",
-    );
-  });
-
-  it("appends a final ignore rule after a negation and does not duplicate it", async () => {
-    const path = ladderPath();
-    await mkdir(dirname(path), { recursive: true });
-    const ignore = join(dirname(path), ".gitignore");
-    const original = "/pi-sub-config.json\n!/pi-sub-config.json\n# keep";
-    await writeFile(ignore, original);
-    execFileSync("git", ["init", "-q", dirname(path)]);
-    await saveLadder(path, ladder, undefined);
-    expect(await readFile(ignore, "utf8")).toBe(
-      `${original}\n/pi-sub-config.json\n`,
-    );
-    expect(
-      execFileSync("git", ["check-ignore", "--", "pi-sub-config.json"], {
-        cwd: dirname(path),
-        encoding: "utf8",
-      }).trim(),
-    ).toBe("pi-sub-config.json");
-    await saveLadder(path, {}, readLadderSource(path));
-    expect(await readFile(ignore, "utf8")).toBe(
-      `${original}\n/pi-sub-config.json\n`,
-    );
-  });
-
-  it("returns cleanup warnings after publication but preserves pre-commit failures", async () => {
-    const original = (
-      await vi.importActual<typeof import("proper-lockfile")>("proper-lockfile")
-    ).lock;
-    const spy = vi
-      .spyOn(lockfile, "lock")
-      .mockImplementation(async (...args) => {
-        const release = await original(...args);
-        return async () => {
-          await release();
-          throw new Error("release failed");
-        };
-      });
-    try {
-      const path = ladderPath();
-      expect(await saveLadder(path, ladder, undefined)).toEqual([
-        expect.objectContaining({ message: "release failed" }),
-      ]);
-      expect(loadLadder(path)).toEqual(ladder);
-      await expect(
-        saveLadder(path, {}, readLadderSource(path), () => {
-          throw new Error("cancelled");
-        }),
-      ).rejects.toMatchObject({
-        cause: expect.objectContaining({ message: "cancelled" }),
-        errors: [
-          expect.objectContaining({ message: "cancelled" }),
-          expect.objectContaining({ message: "release failed" }),
-        ],
-      });
-      expect(loadLadder(path)).toEqual(ladder);
-    } finally {
-      spy.mockRestore();
+    await writeFile(ignore, "# operator rules\nsettings.json\n");
+    for (const value of [ladder, { "7": "p/main:high" }, {}]) {
+      const source = JSON.stringify(value);
+      await writeFile(path, source);
+      expect(loadLadder(path)).toEqual(value);
+      expect(await readFile(path, "utf8")).toBe(source);
     }
-  });
-
-  it("rejects stale tokens, manual edits and deletion without merging", async () => {
-    const path = ladderPath();
-    const results = await Promise.allSettled([
-      saveLadder(path, ladder, undefined),
-      saveLadder(path, {}, undefined),
-    ]);
-    expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
-    expect(await readFile(join(dirname(path), ".gitignore"), "utf8")).toBe(
-      "/pi-sub-config.json\n",
+    expect(await readFile(ignore, "utf8")).toBe(
+      "# operator rules\nsettings.json\n",
     );
-    const token = readLadderSource(path)!;
-    await writeFile(path, token + " ");
-    await expect(saveLadder(path, {}, token)).rejects.toThrow(/changed/);
-    expect(readLadderSource(path)).toBe(token + " ");
-    await rm(path);
-    await expect(saveLadder(path, {}, token)).rejects.toThrow(/changed/);
-    expect(readLadderSource(path)).toBeUndefined();
-  });
-
-  it("preserves malformed sources until explicit exact-source repair", async () => {
-    const path = ladderPath();
-    await mkdir(dirname(path), { recursive: true });
-    for (const broken of ["{", '{"6":"p/m:auto"}']) {
-      await writeFile(path, broken);
-      expect(() => loadLadder(path)).toThrow(/\/sub:models/);
-      expect(readLadderSource(path)).toBe(broken);
-      await expect(saveLadder(path, ladder, undefined)).rejects.toThrow(
-        /changed/,
-      );
-      await saveLadder(path, ladder, broken);
-      expect(loadLadder(path)).toEqual(ladder);
-    }
-    expect(() => readLadderSource(dirname(path))).toThrow();
-  });
-
-  it("cleans up cancellation and publishes in the same JS turn as the final check", async () => {
-    const path = ladderPath();
-    await saveLadder(path, ladder, undefined);
-    const token = readLadderSource(path);
-    await expect(
-      saveLadder(path, {}, token, () => {
-        throw new Error("cancelled");
-      }),
-    ).rejects.toThrow("cancelled");
-    expect(readLadderSource(path)).toBe(token);
     expect((await readdir(dirname(path))).sort()).toEqual([
       ".gitignore",
       "pi-sub-config.json",
     ]);
-    let observed: Ladder | undefined;
-    await saveLadder(path, {}, token, () => {
-      queueMicrotask(() => {
-        observed = loadLadder(path);
-      });
-    });
-    expect(observed).toEqual({});
+    await rm(path);
+    expect(() => loadLadder(path)).toThrow(/missing/);
   });
 
-  it("compares source under an independent process lock", async () => {
+  it("reports malformed sources without repairing them or hiding the cause", async () => {
     const path = ladderPath();
-    await saveLadder(path, ladder, undefined);
-    const token = readLadderSource(path);
-    const child = spawn(
-      process.execPath,
-      [
-        "--input-type=module",
-        "-e",
-        `
-      import lockfile from 'proper-lockfile';
-      import { writeFile } from 'node:fs/promises';
-      const release = await lockfile.lock(process.argv[1], {realpath:false});
-      console.log('locked');
-      await new Promise(resolve => process.stdin.once('data', resolve));
-      await writeFile(process.argv[1], '{}\\n');
-      await release();
-    `,
-        path,
-      ],
-      {
-        cwd: dirname(dirname(new URL(import.meta.url).pathname)),
-        stdio: ["pipe", "pipe", "pipe"],
-      },
-    );
-    const exited = new Promise<void>((resolve, reject) => {
-      child.once("error", reject);
-      child.once("exit", (code) =>
-        code === 0 ? resolve() : reject(new Error(`child exit ${code}`)),
-      );
-    });
-    try {
-      await new Promise<void>((resolve, reject) => {
-        child.stdout!.once("data", () => resolve());
-        child.once("error", reject);
-        child.once("exit", () =>
-          reject(new Error("child exited before locking")),
-        );
-      });
-      const saving = saveLadder(path, ladder, token);
-      const rejected = expect(saving).rejects.toThrow(/changed/);
-      child.stdin!.end("release\n");
-      await rejected;
-      await exited;
-      expect(loadLadder(path)).toEqual({});
-      expect((await readdir(dirname(path))).sort()).toEqual([
-        ".gitignore",
-        "pi-sub-config.json",
-      ]);
-    } finally {
-      child.kill();
+    await mkdir(dirname(path));
+    for (const source of ["{", '{"6":"p/m:auto"}', "null", "[]"]) {
+      await writeFile(path, source);
+      expect(() => loadLadder(path)).toThrow(/Invalid model ladder/);
+      expect(() => loadLadder(path)).toThrow(path);
+      expect(await readFile(path, "utf8")).toBe(source);
     }
+    await writeFile(path, '{"11":"p/m:off"}');
+    expect(() => loadLadder(path)).toThrow(/Invalid ladder rung: 11/);
+    expect(() => loadLadder(dirname(path))).toThrow();
   });
+});
+
+it("uses all native availability regardless of parent scope or thinking pins", () => {
+  const model = {
+    id: "fake",
+    provider: "test",
+    api: "openai-responses",
+    name: "Fake",
+    reasoning: false,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 1024,
+    maxTokens: 256,
+  } as Model<any>;
+  const another = { ...model, id: "another" };
+  const ctx = {
+    model,
+    scopedModels: [],
+    modelRegistry: { getAvailable: () => [model, another] },
+  };
+  const expected = [
+    { provider: "test", model: "fake", thinking: ["off"] },
+    { provider: "test", model: "another", thinking: ["off"] },
+  ];
+  expect(availableModels(ctx as never)).toEqual(expected);
+  expect(
+    availableModels({
+      ...ctx,
+      scopedModels: [{ model, thinkingLevel: "high" }],
+    } as never),
+  ).toEqual(expected);
+  expect(
+    availableModels({
+      ...ctx,
+      modelRegistry: { getAvailable: () => [another] },
+    } as never),
+  ).toEqual([expected[1]]);
+  expect(
+    availableModels({ modelRegistry: { getAvailable: () => [] } } as never),
+  ).toEqual([]);
 });

@@ -1,6 +1,6 @@
 # pi-sub
 
-A small coordinator for native [Pi](https://pi.dev) subprocesses. Pi owns conversation history, tools, compaction and retries; pi-sub owns model selection, task/process lifetime and compact presentation.
+A small coordinator for native [Pi](https://pi.dev) subprocesses. Pi owns conversation history, tools, compaction and retries; pi-sub owns ladder-based routing, task/process lifetime and compact presentation.
 
 A **task** owns a native Pi session. Each **execution** is a fresh `pi --mode json --print` process on that session. A reply may be a question: follow-up continues the session, while explicit acceptance removes the task. Complete delivery folds its widget row without accepting it. Ready and paused tasks hold no process.
 
@@ -26,27 +26,25 @@ The only runtime configuration is **`<agent-dir>/pi-sub-config.json`**, normally
 }
 ```
 
-This is a format example, not bundled defaults. Keys are operator-confirmed strengths from 1 to 10; values are exact `provider/model:thinking` references. `{}` disables delegation.
+This is a format example, not bundled defaults. Keys are configured strengths from 1 to 10; values are exact `provider/model:thinking` references. `{}` disables delegation.
 
-Strength is a rough local capability scale: 1–2 for narrow mechanical work, 3–4 for bounded routine implementation, 5–6 for multi-file changes and moderate analysis, 7–8 for complex design and debugging, and 9–10 for the hardest, highly uncertain work. These are workload anchors, not benchmark scores, equal numerical steps or guarantees. Parent delegation and model research receive the same guidance. Research compares candidates together and against the saved ladder rather than rescaling to whichever models are selected. Unused levels can remain empty.
+Strength is a rough local capability scale: 1–2 for narrow mechanical work, 3–4 for bounded routine implementation, 5–6 for multi-file changes and moderate analysis, 7–8 for complex design and debugging, and 9–10 for the hardest, highly uncertain work. These are workload anchors, not benchmark scores, equal numerical steps or guarantees. The agent setup guide and parent delegation use the same anchors. Compare candidates against the saved ladder rather than rescaling to whichever models are available. Unused levels can remain empty.
 
-Dispatch walks upward from the requested minimum and chooses the first natively available rung. It never infers unlisted variants. The confirmed ladder authorizes delegation independently of the parent session's `enabledModels`, cycling scope and thinking pins. Availability, credentials, supported thinking, project trust and sufficient ladder membership are checked before execution, including continuations. If none qualifies, delegation fails explicitly.
+Dispatch walks upward from the requested minimum and chooses the first natively available rung. It never infers unlisted variants. The configured ladder authorizes delegation independently of the parent session's `enabledModels`, cycling scope and thinking pins. Availability, credentials, supported thinking, project trust and sufficient ladder membership are checked before execution, including continuations. If none qualifies, delegation fails explicitly.
 
-### Review, refine, accept
+### Create the ladder with an agent
 
-1. Run `/sub:models` in a TUI or persistent RPC session. Choose candidates in the native dialog, then **Review selected models**. This writes nothing; cancelling starts no research.
-2. Research uses the exact parent model/thinking captured when the command opened. Review the unsaved proposal and comparison in the transcript; the TUI also shows a non-modal panel above the editor.
-3. Type normal prompts to refine the same research session. Type **`accept`** to publish the finished draft that was shown, or **`cancel`** to discard it. `/sub:models cancel` also closes selection. `/sub:pause` interrupts research; a refinement or explicit continuation can resume it.
+Ask your normal coding agent to follow [the ladder setup guide](instructions/create-model-ladder.md). It discovers your available models, compares useful candidates, proposes a compact ladder, and writes the configuration after you approve it. No working delegation setup is needed.
 
-**The saved ladder remains active until acceptance.** Saved models are preselected; without a file, the current parent model is suggested. An existing empty file selects nothing. Unavailable saved references are labelled, not silently dropped. Only selected variants may receive new or changed assignments; deselected available models cannot remain in the draft. Unavailable saved entries may remain exactly unchanged. Removals require confirmation, and native availability is rechecked before publication. Changing candidates requires a new selection.
+From this checkout, start an interactive conversation with:
 
-During selection, ordinary text prompts are refinements, not parent-model turns. Background replies remain visible without waking the parent; unrelated native commands remain available. Repeating `/sub:models` redisplays the current proposal. Early or stale acceptance is refused. Only identifiable interactive/RPC user input can confirm: slash commands, extension-generated input and model output cannot. Print mode requires direct file editing. Reload/shutdown discards unconfirmed drafts, not saved configuration.
+```sh
+pi @instructions/create-model-ladder.md "Help me create or revise my pi-sub model ladder."
+```
 
-Research uses normally configured web/search tools and current relevant evidence. The [review instructions](instructions/model-capabilities.md) require comparable evaluations, sources, uncertainty and a distinction between observations and judgment, without prescribing a benchmark or version. Missing evidence is disclosed. Evidence stays in the comparison/native session, not configuration. No paid benchmarks run implicitly; research itself can incur ordinary model usage. Built-in shell, write, edit and codemode tools are disabled for research. Trusted custom tools remain available; this is not a filesystem sandbox.
+The guide is also usable in an existing conversation: ask the agent to read it. It uses ordinary agent tools; approval and safe editing are instructions, not a separate enforced workflow.
 
-Acceptance replaces the whole ladder under a cross-process lock. An exact-byte baseline check rejects concurrent changes instead of merging them. Final authorization, interruption and revision checks immediately precede synchronous atomic publication. Cancellation cannot undo a committed file. Post-commit cleanup failures are reported as warnings, not failed saves.
-
-Configuration is private (`0600`); a final rule for its exact filename is appended to `<agent-dir>/.gitignore` when needed, preserving existing rules and the rest of the profile. Project task sessions are separately protected by `<cwd>/.pi/pi-sub/.gitignore`.
+pi-sub reads configuration but never creates, repairs or writes it. File changes apply to subsequent execution admission without a reload; already running executions are not changed. Missing or invalid configuration fails explicitly and points to the guide. Keep the file private (`0600`) and ignored in the profile repository. Project task sessions are separately protected by `<cwd>/.pi/pi-sub/.gitignore`.
 
 ## Parent tools
 
@@ -102,11 +100,11 @@ Tool and transcript rows show task names and confirmed outcomes, with compact re
 
 The above-editor widget shows outstanding attention: active, paused, failed and undelivered ready tasks, newest first. Completely delivered replies fold into a `delivered` count, not a completion count. Follow-up creates a new outstanding reply. Accepted/stopped tasks disappear; final errors disappear after user-prompt cleanup. Completion and token totals survive removal. Task names and current detail take priority on narrow terminals; tokens appear only in the summary as `↑input ↓output`, formatted like Pi's footer. These are native input/output counts; cache-read/write tokens are not folded into either arrow.
 
-There are no spinners or worker heartbeats. Native events update progress immediately; visible active elapsed time refreshes once per second. The widget does not poll while idle or fully hidden. Model review keeps unsaved state, empty-ladder consequences and repair warnings prominent; omitted rows point to the transcript comparison.
+There are no spinners or worker heartbeats. Native events update progress immediately; visible active elapsed time refreshes once per second. The widget does not poll while idle or fully hidden.
 
 After process closure, each execution reads the saved native journal, including late shutdown usage. A valid whole-session snapshot replaces the previous snapshot so continuation does not charge earlier executions again. An unreadable, corrupt or identity-mismatched final journal cannot replace confirmed accounting. Unpersisted provider usage cannot be reconstructed.
 
-Acceptance, explicit stop or automatic failure collection transfers original assistant, tool, compaction, branch-summary and native usage. Delivery changes visibility only, not billing. Captured usage is aggregated until the next subagent tool result reports it once, including setup usage. Commands and notifications alone cannot add it to native parent tool-result totals; uncollected work at shutdown is not charged through this extension. Costs are never repriced through the parent model. Streamed widget tokens reconcile with the confirmed saved snapshot after execution.
+Acceptance, explicit stop or automatic failure collection transfers original assistant, tool, compaction, branch-summary and native usage. Delivery changes visibility only, not billing. Captured usage is aggregated until the next subagent tool result reports it once. Commands and notifications alone cannot add it to native parent tool-result totals; uncollected work at shutdown is not charged through this extension. Costs are never repriced through the parent model. Streamed widget tokens reconcile with the confirmed saved snapshot after execution.
 
 ## Native boundaries
 
@@ -127,6 +125,6 @@ npm test
 npm run format:check
 ```
 
-Tests include real parent/child Pi processes with a synthetic local provider and no paid model calls. They cover routing, review/publication, interruption, continuation, reply delivery, collection and native usage.
+Tests include real parent/child Pi processes with a synthetic local provider and no paid model calls. They cover read-only configuration, routing, interruption, continuation, reply delivery, collection and native usage.
 
 See the [architectural decisions](docs/decisions/). Code is [MIT licensed](LICENSE).

@@ -15,7 +15,7 @@ export type Outcome = "reply" | "error" | "stopped";
 interface TaskData {
   id: string;
   description: string;
-  level?: number;
+  level: number;
   execution: Pick<WorkerOptions, "provider" | "model" | "thinking">;
   sessionFile: string;
   turns: number;
@@ -110,9 +110,6 @@ export class Coordinator {
   }
   get interrupted() {
     return this.suspended;
-  }
-  get interruptEpoch() {
-    return this.epoch;
   }
   get runnable() {
     return !this.disposed && !this.suspended && !this.preparing;
@@ -212,7 +209,7 @@ export class Coordinator {
   start(request: {
     prompt: string;
     description: string;
-    level?: number;
+    level: number;
     worker: WorkerOptions;
   }): string {
     if (this.disposed) throw new Error("Coordinator disposed");
