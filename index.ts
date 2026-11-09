@@ -2,7 +2,6 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import {
   defineTool,
-  truncateHead,
   type ExtensionAPI,
   type ExtensionContext,
   type AgentBeforeSettleEvent,
@@ -33,11 +32,8 @@ import {
   renderFailures,
   renderStopped,
 } from "./src/messages.ts";
-import {
-  pendingReplyBatch,
-  deliveredReplies,
-  taskReport,
-} from "./src/replies.ts";
+import { pendingReplyBatch, deliveredReplies } from "./src/replies.ts";
+import { handoff, reportResult, type Reports } from "./src/reports.ts";
 
 const reason = (error: unknown) =>
   error instanceof Error ? error.message : String(error);
@@ -61,7 +57,12 @@ export default function piSub(pi: ExtensionAPI): void {
   const replyBatchFor = (ctx: ExtensionContext, messages?: AgentMessage[]) =>
     lifetime.signal.aborted || !coordinator?.runnable
       ? undefined
-      : pendingReplyBatch(coordinator.list(), ctx.sessionManager, messages);
+      : pendingReplyBatch(
+          coordinator.list(),
+          ctx.sessionManager,
+          messages,
+          ctx.cwd,
+        );
   const scheduleReplies = () => {
     if (idleDelivery || lifetime.signal.aborted || !coordinator?.runnable)
       return;
@@ -146,12 +147,19 @@ export default function piSub(pi: ExtensionAPI): void {
   const preparePrompt = async () => {
     const prepared = await manager().prompt((failures: TaskResult[]) => {
       if (!failures.length) return;
+      const delivery = handoff(
+        failureSummary(failures),
+        failures,
+        context!.cwd,
+      );
       pi.sendMessage(
         {
           customType: "pi-sub:failures",
           display: true,
-          content: failureSummary(failures),
-          details: failures,
+          content: delivery.content,
+          details: delivery.file
+            ? { report: failures, handoff: delivery }
+            : failures,
         },
         { triggerTurn: false },
       );
@@ -191,34 +199,11 @@ export default function piSub(pi: ExtensionAPI): void {
   };
   const authorized = (id: string, ctx: ExtensionContext) =>
     authorizeTask(manager().get(id), ctx);
-  const response = (
-    value: string | TaskView | TaskResult | (TaskView | TaskResult)[],
-    error = false,
-  ) => {
-    const tasks =
-      typeof value === "string" ? [] : Array.isArray(value) ? value : [value];
-    const raw =
-      typeof value === "string"
-        ? value
-        : JSON.stringify(
-            Array.isArray(value) ? value.map(taskReport) : taskReport(value),
-          );
-    const clipped = truncateHead(raw);
+  const response = (value: Reports, error = false) => {
+    const result = reportResult(value, context!.cwd);
     const usage = coordinator?.drainUsage();
     return {
-      content: [
-        {
-          type: "text" as const,
-          text:
-            clipped.content +
-            (clipped.truncated
-              ? tasks.length
-                ? `\n[Truncated; full responses: ${tasks.map((task) => task.sessionFile).join(", ")}]`
-                : "\n[Truncated]"
-              : ""),
-        },
-      ],
-      details: value,
+      ...result,
       ...(error ? { isError: true } : {}),
       ...(usage ? { usage } : {}),
     };
@@ -377,17 +362,18 @@ export default function piSub(pi: ExtensionAPI): void {
                     .map((task) => task.id)
               ).map((taskId) => manager().stop(taskId)),
             );
-            if (results.length)
+            if (results.length) {
+              const result = reportResult(results, ctx.cwd);
               pi.sendMessage(
                 {
                   customType: "pi-sub:stopped",
                   display: true,
-                  content: JSON.stringify(results.map(taskReport)),
-                  details: results,
+                  content: result.content[0]!.text,
+                  details: result.details,
                 },
                 { triggerTurn: false },
               );
-            else notify("No tasks to stop.");
+            } else notify("No tasks to stop.");
           }
         } catch (error) {
           notify(reason(error), "error");

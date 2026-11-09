@@ -1,5 +1,6 @@
 import { expect, test } from "vitest";
 import type { TaskResult, TaskView } from "../src/coordinator.ts";
+import { reportDetails } from "../src/reports.ts";
 import {
   mkdtemp,
   mkdir,
@@ -120,13 +121,61 @@ async function latestResult(client: RpcClient) {
   const visible = JSON.parse(
     result.content.find((part) => part.type === "text")!.text,
   );
-  const details = result.details as unknown as TaskView | TaskResult;
+  const details = reportDetails(result.details) as TaskView | TaskResult;
   expect(visible.id).toBe(details.id);
-  expect(visible.response).toBe(details.response);
+  if (visible.file)
+    expect(await readFile(visible.file, "utf8")).toContain(details.response);
+  else expect(visible.response).toBe(details.response);
   expect(visible).not.toHaveProperty("execution");
   expect(visible).not.toHaveProperty("sessionFile");
   return details;
 }
+
+test("native file handoffs deliver without reading, stay resumable and survive acceptance and shutdown", async () => {
+  const { client, cwd, dispose } = await host({ WORKER_TEST_LARGE_CHILD: "1" });
+  try {
+    await client.promptAndWait("integration:read-via-wait", undefined, 20000);
+    const messages = await client.getMessages();
+    const result = messages.findLast(
+      (message) =>
+        message.role === "toolResult" && message.toolName === "sub_result",
+    )!;
+    if (result.role !== "toolResult") throw new Error("Missing result");
+    const ref = JSON.parse(
+      result.content.find((part) => part.type === "text")!.text,
+    );
+    expect(ref.file).toContain(join(cwd, ".pi/pi-sub/reports"));
+    const original = await readFile(ref.file, "utf8");
+    expect(original).toContain("Evidence line 漢字\n");
+    expect(original).toContain("END_OF_LARGE_REPORT");
+    expect(
+      Buffer.byteLength(
+        result.content.find((part) => part.type === "text")!.text,
+      ),
+    ).toBeLessThanOrEqual(50 * 1024);
+    await client.promptAndWait("integration:inspect", undefined, 20000);
+    const first = await latestResult(client);
+    expect(first).toMatchObject({
+      status: "ready",
+      reply: { delivered: true },
+    });
+    await client.promptAndWait("integration:refine-task", undefined, 20000);
+    await client.promptAndWait("integration:accept", undefined, 20000);
+    expect(await latestResult(client)).toMatchObject({
+      id: first.id,
+      outcome: "reply",
+    });
+    expect(
+      (await client.getMessages())
+        .filter((message) => message.role === "toolResult")
+        .map((message) => message.toolName),
+    ).not.toContain("read");
+    await client.stop();
+    expect(await readFile(ref.file, "utf8")).toBe(original);
+  } finally {
+    await dispose();
+  }
+}, 30000);
 
 test("native reply delivery keeps the task and its session available for follow-up", async () => {
   const { client, dispose } = await host();

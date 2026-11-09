@@ -1,13 +1,30 @@
-import { expect, test } from "vitest";
+import { afterEach, beforeEach, expect, test } from "vitest";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { TaskView } from "../src/coordinator.ts";
 import {
-  replyBatch,
-  pendingReplyBatch,
+  replyBatch as buildBatch,
+  pendingReplyBatch as buildPendingBatch,
   announcedReplies,
   deliveredReplies,
-  taskReport,
 } from "../src/replies.ts";
+import { taskReport, reportResult } from "../src/reports.ts";
+
+let cwd: string;
+beforeEach(() => {
+  cwd = mkdtempSync(join(tmpdir(), "pi-sub-replies-"));
+});
+afterEach(() => {
+  rmSync(cwd, { recursive: true, force: true });
+});
+const replyBatch = (tasks: TaskView[]) => buildBatch(tasks, cwd);
+const pendingReplyBatch = (
+  tasks: TaskView[],
+  session: Parameters<typeof buildPendingBatch>[1],
+  messages?: AgentMessage[],
+) => buildPendingBatch(tasks, session, messages, cwd);
 
 const task: TaskView = {
   id: "task-1",
@@ -37,9 +54,10 @@ test("replies carry identity and new information, not repeated operating instruc
     ...task,
     preview: "Question?",
   });
-  const long = replyBatch([{ ...task, response: "x".repeat(20000) }])!;
+  const long = replyBatch([{ ...task, response: "x".repeat(60000) }])!;
   expect(long.details.replies[0]!.preview.length).toBeLessThan(200);
-  expect(long.content.length).toBeLessThan(8100);
+  expect(JSON.parse(long.content).file).toBeDefined();
+  expect(long.content.length).toBeLessThan(1000);
 });
 
 test("only complete native reply notifications acknowledge their exact reply", () => {
@@ -68,14 +86,24 @@ test("only complete native reply notifications acknowledge their exact reply", (
       details: { replies: [{ ...ready, outcome: "error" }] },
     }),
   ).toEqual([]);
-  for (const response of ["x".repeat(20000), "line\n".repeat(110)]) {
-    const clipped = replyBatch([{ ...ready, response }])!;
-    expect(clipped.content).toContain("[Truncated; use sub_result");
-    expect(deliveredReplies({ ...message, ...clipped })).toEqual([]);
+  for (const response of ["x".repeat(60000), "line\n".repeat(310)]) {
+    const spilled = replyBatch([{ ...ready, response }])!;
+    const file = JSON.parse(spilled.content).file;
+    expect(readFileSync(file, "utf8")).toContain(response);
+    expect(deliveredReplies({ ...message, ...spilled })).toEqual([
+      { id: task.id, replyId: "reply-1" },
+    ]);
+    expect(
+      deliveredReplies({
+        ...message,
+        ...spilled,
+        content: spilled.content.replace(file, "/wrong/file"),
+      }),
+    ).toEqual([]);
   }
 });
 
-test("batches acknowledge each complete answer, not clipped neighbours", () => {
+test("inline batches acknowledge each complete answer, not missing neighbours", () => {
   const a = { ...task, reply: { id: "reply-a", delivered: false } };
   const b = {
     ...a,
@@ -94,6 +122,7 @@ test("batches acknowledge each complete answer, not clipped neighbours", () => {
   ]);
   expect(deliveredReplies(message)).toEqual([
     { id: a.id, replyId: "reply-a" },
+    { id: b.id, replyId: "reply-b" },
     { id: c.id, replyId: "reply-c" },
   ]);
   expect(
@@ -136,13 +165,15 @@ test("batches are bounded without losing the full reports or silently dropping l
     reply: { id: `reply-${n}`, delivered: false },
   }));
   const batch = replyBatch(tasks)!;
-  expect(batch.details.replies.length).toBeGreaterThan(1);
-  expect(batch.details.replies.length).toBeLessThan(tasks.length);
+  expect(batch.details.replies).toHaveLength(tasks.length);
   expect(Buffer.byteLength(batch.content, "utf8")).toBeLessThanOrEqual(24000);
   expect(batch.content.split("\n").length).toBeLessThanOrEqual(300);
   expect(batch.details.replies[0]!.response).toBe(tasks[0]!.response);
-  const remaining = tasks.slice(batch.details.replies.length);
-  expect(replyBatch(remaining)!.details.replies[0]!.id).toBe(remaining[0]!.id);
+  const text = readFileSync(JSON.parse(batch.content).file, "utf8");
+  for (const task of tasks) expect(text).toContain(task.id);
+  expect(
+    deliveredReplies({ ...batch, role: "custom", timestamp: 0 }),
+  ).toHaveLength(tasks.length);
   expect(replyBatch([])).toBeUndefined();
 });
 
@@ -205,6 +236,50 @@ test("complete tool returns acknowledge replies without accepting tasks", () => 
   ]);
 });
 
+test("a file tool handoff delivers exactly its snapshot without reading or closing it", () => {
+  const a = { ...ready("a"), response: "answer\n".repeat(10000) };
+  const result = reportResult(a, cwd);
+  const message: AgentMessage = {
+    ...result,
+    details: JSON.parse(JSON.stringify(result.details)),
+    role: "toolResult",
+    toolCallId: "call",
+    toolName: "sub_result",
+    isError: false,
+    timestamp: 0,
+  };
+  expect(deliveredReplies(message)).toEqual([{ id: "a", replyId: "reply-a" }]);
+  expect(a.reply!.delivered).toBe(false);
+  expect(
+    deliveredReplies({
+      ...message,
+      content: [{ type: "text", text: "Partial reference" }],
+    }),
+  ).toEqual([]);
+  expect(deliveredReplies({ ...message, isError: true })).toEqual([]);
+  expect(pendingReplyBatch([a], session([message]))).toBeUndefined();
+  const next = { ...a, reply: { id: "successor", delivered: false } };
+  expect(
+    pendingReplyBatch([next], session([message]))!.details.replies[0]!.reply!
+      .id,
+  ).toBe("successor");
+  const batch = reportResult(
+    [a, { ...a, id: "b", reply: { id: "reply-b", delivered: false } }],
+    cwd,
+  );
+  expect(
+    deliveredReplies({
+      ...message,
+      ...batch,
+      details: JSON.parse(JSON.stringify(batch.details)),
+      toolName: "sub_control",
+    }),
+  ).toEqual([
+    { id: "a", replyId: "reply-a" },
+    { id: "b", replyId: "reply-b" },
+  ]);
+});
+
 type NativeSession = Parameters<typeof pendingReplyBatch>[1];
 function session(messages: AgentMessage[] = []): NativeSession {
   return {
@@ -248,8 +323,8 @@ test("live replies are selected oldest-first without a second queue or mutations
   expect(pendingReplyBatch([], session())).toBeUndefined();
 });
 
-test("native branch announcements suppress even compacted truncated reports", () => {
-  const a = { ...ready("a"), response: "line\n".repeat(110) },
+test("native branch announcements suppress even compacted file references", () => {
+  const a = { ...ready("a"), response: "line\n".repeat(310) },
     b = ready("b");
   const announcement = replyBatch([a])!;
   const history = session();
@@ -262,7 +337,9 @@ test("native branch announcements suppress even compacted truncated reports", ()
       timestamp: new Date(0).toISOString(),
     },
   ];
-  expect(deliveredReplies(customMessage(announcement))).toEqual([]);
+  expect(deliveredReplies(customMessage(announcement))).toEqual([
+    { id: "a", replyId: "reply-a" },
+  ]);
   expect(
     pendingReplyBatch([b, a], history)!.details.replies.map(({ id }) => id),
   ).toEqual(["b"]);
@@ -315,19 +392,15 @@ test("complete tool returns suppress announcements; previews and old replies do 
   ).toBe("next-reply");
 });
 
-test("overflow is recovered from current tasks after native commit, not a retained batch", () => {
+test("large batches use one file and need no overflow wakeup after native commit", () => {
   const tasks = Array.from({ length: 10 }, (_, i) => ({
     ...ready(String(i)),
     response: "line of results\n".repeat(200),
   })).reverse();
   const first = pendingReplyBatch(tasks, session())!;
   const saved: AgentMessage = { ...first, role: "custom", timestamp: 0 };
-  const second = pendingReplyBatch(tasks, session([saved]))!;
-  const announced = new Set(first.details.replies.map(({ id }) => id));
-  expect(second.details.replies.length).toBeGreaterThan(0);
-  expect(second.details.replies.every(({ id }) => !announced.has(id))).toBe(
-    true,
-  );
+  expect(first.details.replies).toHaveLength(tasks.length);
+  expect(pendingReplyBatch(tasks, session([saved]))).toBeUndefined();
   // Accepted tasks need no tombstone; they simply stop being inbox candidates.
   expect(pendingReplyBatch([], session([saved]))).toBeUndefined();
 });

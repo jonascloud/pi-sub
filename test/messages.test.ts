@@ -1,4 +1,7 @@
-import { expect, test } from "vitest";
+import { afterEach, beforeEach, expect, test } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import type { TaskView, TaskResult } from "../src/coordinator.ts";
 import {
@@ -8,7 +11,16 @@ import {
   renderFailures,
   renderStopped,
 } from "../src/messages.ts";
-import { replyBatch } from "../src/replies.ts";
+import { replyBatch as buildBatch } from "../src/replies.ts";
+
+let cwd: string;
+beforeEach(() => {
+  cwd = mkdtempSync(join(tmpdir(), "pi-sub-messages-"));
+});
+afterEach(() => {
+  rmSync(cwd, { recursive: true, force: true });
+});
+const replyBatch = (tasks: TaskView[]) => buildBatch(tasks, cwd);
 import { STRENGTH_GUIDANCE } from "../src/models.ts";
 
 const task: TaskView = {
@@ -201,7 +213,7 @@ test("stopping preserves failed and already accepted outcomes rather than claimi
 });
 
 test("expanded replies recover complete source payloads without repeating them", () => {
-  const response = "x".repeat(20000) + "\nEND_OF_FULL_REPLY";
+  const response = "x".repeat(60000) + "\nEND_OF_FULL_REPLY";
   const reply = replyBatch([{ ...task, response }])!;
   expect(reply.content).not.toContain("END_OF_FULL_REPLY");
   const expanded = draw(

@@ -181,7 +181,7 @@ export class Coordinator {
     const receipt = this.receipts.get(id);
     return receipt ? structuredClone(receipt) : this.get(id);
   }
-  /** A parent context contains this exact reply; keep its task resumable. */
+  /** A parent context contains this exact handoff; keep its task resumable. */
   markDelivered(id: string, replyId: string): boolean {
     const t = this.tasks.get(id);
     if (

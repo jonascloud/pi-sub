@@ -6,6 +6,7 @@ import {
   type Component,
 } from "@earendil-works/pi-tui";
 import type { TaskResult, TaskView } from "./coordinator.ts";
+import { reportDetails } from "./reports.ts";
 
 type Tool = "sub_task" | "sub_message" | "sub_result" | "sub_control";
 type Args = {
@@ -332,10 +333,11 @@ export function taskToolRenderers(tool: Tool): ToolRenderers {
     renderResult(result, { expanded, isPartial }, theme, context) {
       const args = (context.args ?? {}) as Args;
       const raw = textContent(result.content);
+      const details = reportDetails(result.details);
       const view = summary(
         tool,
         args,
-        result.details,
+        details,
         raw,
         context.isError,
         isPartial,
@@ -343,10 +345,10 @@ export function taskToolRenderers(tool: Tool): ToolRenderers {
       (context.state as RowState).view = view;
       if (expanded) {
         const data =
-          Array.isArray(result.details) && result.details.every(isTask)
-            ? result.details
-            : isTask(result.details)
-              ? [result.details]
+          Array.isArray(details) && details.every(isTask)
+            ? details
+            : isTask(details)
+              ? [details]
               : undefined;
         const detail = data
           ? data.map(taskDetails).join("\n\n")

@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -9,7 +12,8 @@ import piSub from "../index.ts";
 import * as models from "../src/models.ts";
 import * as workers from "../src/worker.ts";
 import { SUBAGENT_GUIDANCE } from "../src/messages.ts";
-import { replyBatch, taskReport } from "../src/replies.ts";
+import { replyBatch } from "../src/replies.ts";
+import { taskReport, reportDetails } from "../src/reports.ts";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 
 const fake = vi.hoisted(() => ({
@@ -50,13 +54,16 @@ vi.mock("../src/coordinator.ts", () => ({
 }));
 vi.mock("../src/widget.ts", () => ({ mountWidget: () => () => {} }));
 
+let cwd: string;
 afterEach(async () => {
   await flushReplies();
+  rmSync(cwd, { recursive: true, force: true });
   vi.unstubAllEnvs();
   vi.restoreAllMocks();
 });
 
 beforeEach(() => {
+  cwd = mkdtempSync(join(tmpdir(), "pi-sub-input-"));
   vi.stubEnv("PI_SUB_CHILD", "");
   fake.interrupted = false;
   fake.runnable = true;
@@ -102,6 +109,7 @@ function setup(mode = "rpc") {
   const abort = vi.fn();
   let terminalInput: ((data: string) => unknown) | undefined;
   const ctx = {
+    cwd,
     mode,
     hasUI: true,
     abort,
@@ -219,7 +227,7 @@ test("operator stop preserves machine-readable content and supplies presentation
   );
 });
 
-test("tool handoffs omit diagnostics, retain full details and locate truncated responses", async () => {
+test("tool handoffs omit diagnostics and preserve oversized reports in files", async () => {
   const { tools, ctx } = setup();
   const report = {
     ...failure,
@@ -238,7 +246,7 @@ test("tool handoffs omit diagnostics, retain full details and locate truncated r
         () => {},
         ctx,
       );
-    expect(result.details).toEqual(value);
+    expect(reportDetails(result.details)).toEqual(value);
     const text = result.content[0].text;
     if (response.length < 60000) {
       expect(JSON.parse(text)).toEqual({
@@ -251,8 +259,17 @@ test("tool handoffs omit diagnostics, retain full details and locate truncated r
       });
       expect(text).not.toContain(value.sessionFile);
     } else {
-      expect(text).toContain("[Truncated; full responses: native.jsonl]");
-      expect(text.length).toBeLessThan(response.length);
+      const envelope = JSON.parse(text);
+      expect(envelope).toMatchObject({
+        id: value.id,
+        outcome: "error",
+        errors: 1,
+      });
+      const full = readFileSync(envelope.file, "utf8");
+      expect(full).toContain(response);
+      expect(full).toContain(value.error);
+      expect(full).toContain("Unsent correction");
+      expect(Buffer.byteLength(text)).toBeLessThanOrEqual(50 * 1024);
     }
   }
 });
@@ -277,6 +294,36 @@ test.each(["interactive", "rpc"])(
     );
   },
 );
+
+test("failure-report publication errors block input forwarding and allow a later complete retry", async () => {
+  const { emit, sendMessage, notify } = setup();
+  const report = {
+    ...failure,
+    response: "Partial work\n".repeat(6000),
+    pendingInput: ["Unsent correction"],
+  };
+  fake.prompt.mockImplementation(async (deliver) => {
+    deliver([report]);
+    return true;
+  });
+  writeFileSync(join(cwd, ".pi"), "not a directory");
+  expect(await emit("input", { source: "rpc", text: "next" })).toEqual({
+    action: "handled",
+  });
+  expect(sendMessage).not.toHaveBeenCalled();
+  expect(notify).toHaveBeenCalledWith(
+    expect.stringContaining("Could not prepare user input"),
+    "error",
+  );
+  rmSync(join(cwd, ".pi"));
+  expect(await emit("input", { source: "rpc", text: "next" })).toBeUndefined();
+  const message = sendMessage.mock.calls[0]![0];
+  const full = readFileSync(JSON.parse(message.content).file, "utf8");
+  expect(full).toContain(report.response);
+  expect(full).toContain("Unsent correction");
+  expect(full).toContain(report.error);
+  expect(reportDetails(message.details)).toEqual([report]);
+});
 
 test("new tasks select from fresh configuration after asynchronous directory preparation", async () => {
   const { ctx, tools } = setup();
@@ -561,7 +608,11 @@ test("announcing a batch is not delivery; only complete parent context messages 
   expect(fake.markDelivered).not.toHaveBeenCalled();
   emit("context", { messages: [] });
   expect(fake.markDelivered).not.toHaveBeenCalled();
-  const message = { ...replyBatch([reply])!, role: "custom", timestamp: 0 };
+  const message = {
+    ...replyBatch([reply], cwd)!,
+    role: "custom",
+    timestamp: 0,
+  };
   emit("context", { messages: [{ ...message, content: "preview" }] });
   expect(fake.markDelivered).not.toHaveBeenCalled();
   emit("context", { messages: [message] });
@@ -730,17 +781,17 @@ test("interruption retains unannounced replies and cannot wake the parent", asyn
   expect(emit("turn_end").entries[0].details.replies[0].id).toBe("a");
 });
 
-test("late replies can join the settlement boundary and truncated announcements are not repeated", async () => {
+test("late file handoffs join the settlement boundary without repeated announcements", async () => {
   const { emit, ready, sendMessage } = setup();
   emit("agent_start");
   fake.idle = false;
   expect(emit("turn_end")).toBeUndefined();
-  const a = { ...readyReply("a"), response: "x".repeat(20000) };
+  const a = { ...readyReply("a"), response: "x".repeat(60000) };
   ready(a);
   const result = emit("agent_before_settle");
   expect(result.continue).toBe(true);
   const notification = {
-    ...replyBatch([a])!,
+    ...replyBatch([a], cwd)!,
     role: "custom" as const,
     timestamp: 0,
   };
@@ -750,7 +801,7 @@ test("late replies can join the settlement boundary and truncated announcements 
     }),
   ).toBeUndefined();
   emit("context", { messages: [notification] });
-  expect(a.reply!.delivered).toBe(false);
+  expect(a.reply!.delivered).toBe(true);
   await flushReplies();
   expect(sendMessage).not.toHaveBeenCalled();
 });

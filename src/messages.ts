@@ -1,7 +1,4 @@
-import {
-  truncateHead,
-  type MessageRenderer,
-} from "@earendil-works/pi-coding-agent";
+import type { MessageRenderer } from "@earendil-works/pi-coding-agent";
 import {
   stripTerminalSequences,
   Text,
@@ -10,12 +7,13 @@ import {
 import type { TaskResult } from "./coordinator.ts";
 import { replyReports, replyText } from "./replies.ts";
 import { STRENGTH_GUIDANCE } from "./models.ts";
+import { reportDetails } from "./reports.ts";
 
 /** One stable instruction section; notifications carry observations, not a manual. */
 export const SUBAGENT_GUIDANCE = `Delegate bounded work when the result justifies briefing and integration overhead. Give the smallest sufficient brief: goal, scope, constraints, success criteria and decisive context. Prefer paths to copied content; do not repeat loaded instructions. Children share files and load native global/project instructions, not your conversation or UI. Follow-ups add new information with enough context to interpret it.
 Choose the minimum sufficient level; do not lower it to fit availability. The configured ladder selects the execution.
 ${STRENGTH_GUIDANCE}
-Replies arrive asynchronously and may be questions. User interruption pauses children; a new prompt resumes only you.
+Replies arrive asynchronously and may be questions. A file reference delivers the full report; read it as needed. User interruption pauses children; a new prompt resumes only you.
 Use reports internally; surface only material results, blockers or user decisions. Reports need no acknowledgement; stale reports alone are not a reason to revisit accepted/stopped tasks.`;
 
 type Message = Parameters<MessageRenderer>[0];
@@ -166,7 +164,7 @@ export const renderReply: MessageRenderer = (message, options, theme) => {
 };
 
 function reports(message: Message): Record<string, unknown>[] {
-  const value = message.details;
+  const value = reportDetails(message.details);
   return Array.isArray(value)
     ? value.filter((item) => {
         const task = record(item);
@@ -250,16 +248,11 @@ export const renderStopped: MessageRenderer = (message, options, theme) => {
 export function failureSummary(failures: readonly TaskResult[]): string {
   const lines = failures.map((report) => {
     const identity = `${report.description} (${report.id}): ${report.error ?? "execution failed"}`;
-    const partial = report.response
-      ? `\nPartial: ${truncateHead(report.response, { maxBytes: 1600, maxLines: 30 }).content}`
-      : "";
+    const partial = report.response ? `\nPartial: ${report.response}` : "";
     const pending = report.pendingInput?.length
-      ? `\nPending: ${report.pendingInput.map((text) => truncateHead(text, { maxBytes: 1600, maxLines: 30 }).content).join("\n")}`
+      ? `\nPending: ${report.pendingInput.join("\n")}`
       : "";
     return stripTerminalSequences(identity + partial + pending);
   });
-  return truncateHead(`Collected failures:\n${lines.join("\n")}`, {
-    maxBytes: 16000,
-    maxLines: 160,
-  }).content;
+  return `Collected failures:\n${lines.join("\n")}`;
 }

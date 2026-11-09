@@ -274,6 +274,28 @@ test("in-flight calls expose the original request on expansion", () => {
   expect(text(component)).not.toContain("Original full briefing");
 });
 
+test("file-backed tool rows keep full native diagnostics without reading the artifact", () => {
+  const component = row("sub_result", { id: "task-123456789" });
+  const report = task({
+    status: "ready",
+    outcome: "reply",
+    response: "Question?\nComplete evidence",
+  });
+  const content = JSON.stringify({ file: "/not-read/report.txt" });
+  result(
+    component,
+    { report, handoff: { content, file: "/not-read/report.txt" } },
+    false,
+    false,
+    content,
+  );
+  expect(text(component)).toContain("Question?");
+  component.setExpanded(true);
+  expect(text(component)).toContain("Complete evidence");
+  expect(text(component)).toContain("/native/task.jsonl");
+  expect(text(component)).toContain("test/strong:high");
+});
+
 test("partial results never prematurely announce acceptance or control success", () => {
   const component = row("sub_result", { id: "task-123456789", finish: true });
   result(component, receipt(), false, true);

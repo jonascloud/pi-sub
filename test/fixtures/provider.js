@@ -130,7 +130,14 @@ function reply(context) {
       return { name: "sub_result", args: { id: task.id, finish: true } };
     }
   }
-  return { text: "fake response" };
+  return {
+    text:
+      process.env.PI_SUB_CHILD === "1" && process.env.WORKER_TEST_LARGE_CHILD
+        ? "Large report\n" +
+          "Evidence line 漢字\n".repeat(4000) +
+          "END_OF_LARGE_REPORT"
+        : "fake response",
+  };
 }
 
 export default function (pi) {

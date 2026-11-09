@@ -1,29 +1,11 @@
-import {
-  truncateHead,
-  type ExtensionContext,
-} from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   stripTerminalSequences,
   truncateToWidth,
 } from "@earendil-works/pi-tui";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { TaskResult, TaskView } from "./coordinator.ts";
-
-/** Model-facing handoff; execution diagnostics stay in native result details. */
-export function taskReport(task: TaskView | TaskResult) {
-  return {
-    id: task.id,
-    description: task.description,
-    ...("status" in task
-      ? { status: task.status, operation: task.operation }
-      : {}),
-    outcome: task.outcome,
-    ...("reply" in task && task.reply ? { reply: { id: task.reply.id } } : {}),
-    response: task.response,
-    error: task.error,
-    pendingInput: task.pendingInput?.length ? task.pendingInput : undefined,
-  };
-}
+import type { TaskView } from "./coordinator.ts";
+import { deliveredFile, handoff, reportDetails } from "./reports.ts";
 
 const record = (value: unknown): Record<string, unknown> | undefined =>
   value !== null && typeof value === "object" && !Array.isArray(value)
@@ -39,7 +21,8 @@ export function pendingReplyBatch(
     ExtensionContext["sessionManager"],
     "getBranch" | "buildSessionProjection"
   >,
-  messages?: readonly AgentMessage[],
+  messages: readonly AgentMessage[] | undefined,
+  cwd: string,
 ) {
   const replies = [...tasks]
     .reverse()
@@ -60,7 +43,10 @@ export function pendingReplyBatch(
       for (const reply of announcedReplies(message)) covered.add(reply.replyId);
     for (const reply of deliveredReplies(message)) covered.add(reply.replyId);
   }
-  return replyBatch(replies.filter((task) => !covered.has(task.reply!.id)));
+  return replyBatch(
+    replies.filter((task) => !covered.has(task.reply!.id)),
+    cwd,
+  );
 }
 
 export function replyText(
@@ -74,51 +60,28 @@ export function replyText(
   return `Subagent ${task.id} (${description})\n${response}`;
 }
 
-function notificationText(task: Parameters<typeof replyText>[0]) {
-  const clipped = truncateHead(replyText(task), {
-    maxBytes: 8000,
-    maxLines: 100,
+/** One bounded message: complete text or one immutable file for the entire batch. */
+export function replyBatch(tasks: readonly TaskView[], cwd: string) {
+  if (!tasks.length) return;
+  const delivery = handoff(tasks.map(replyText).join("\n\n"), [...tasks], cwd, {
+    maxBytes: 24000,
+    maxLines: 300,
   });
+  const replies = tasks.map((task) => ({
+    ...structuredClone(task),
+    preview: truncateToWidth(
+      stripTerminalSequences(task.error ?? task.response)
+        .split(/\r?\n/)
+        .find((line) => line.trim()) ?? "",
+      160,
+    ),
+  }));
   return {
-    content:
-      clipped.content +
-      (clipped.truncated
-        ? "\n[Truncated; use sub_result for the full response.]"
-        : ""),
-    complete: !clipped.truncated,
+    customType: "pi-sub:response",
+    display: true,
+    content: delivery.content,
+    details: { replies, ...(delivery.file ? { handoff: delivery } : {}) },
   };
-}
-
-/** One bounded native message; remaining replies stay eligible for the next turn. */
-export function replyBatch(tasks: readonly TaskView[]) {
-  const replies: (TaskView & { preview: string })[] = [];
-  let content = "";
-  for (const task of tasks) {
-    const text = notificationText(task).content;
-    const next = content ? `${content}\n\n${text}` : text;
-    if (
-      Buffer.byteLength(next, "utf8") > 24000 ||
-      next.split("\n").length > 300
-    )
-      break;
-    const response = stripTerminalSequences(task.error ?? task.response);
-    replies.push({
-      ...structuredClone(task),
-      preview: truncateToWidth(
-        response.split(/\r?\n/).find((line) => line.trim()) ?? "",
-        160,
-      ),
-    });
-    content = next;
-  }
-  return replies.length
-    ? {
-        customType: "pi-sub:response",
-        display: true,
-        content,
-        details: { replies },
-      }
-    : undefined;
 }
 
 type ReplyReference = { id: string; replyId: string };
@@ -148,7 +111,7 @@ export function replyReports(details: unknown) {
     );
 }
 
-/** An announcement is durable even when its answer was only a truncated preview. */
+/** Native history suppresses repeated announcements, including older previews. */
 export function announcedReplies(message: {
   customType: string;
   details?: unknown;
@@ -172,13 +135,12 @@ export function deliveredReplies(message: AgentMessage): ReplyReference[] {
         : undefined;
   if (text === undefined) return [];
   if (message.role === "custom" && message.customType === "pi-sub:response") {
-    // Compare at exact segment positions, not substring matches: an answer may
-    // itself quote another report. Truncation never acknowledges the whole batch.
+    if (deliveredFile(message.details, text)) return announcedReplies(message);
+    // Compare exact segments: an answer may itself quote another report.
     let offset = 0;
     return replyReports(message.details).flatMap((data, index) => {
-      const part = notificationText(data);
-      const segment = (index ? "\n\n" : "") + part.content;
-      const complete = part.complete && text.startsWith(segment, offset);
+      const segment = (index ? "\n\n" : "") + replyText(data);
+      const complete = text.startsWith(segment, offset);
       offset += segment.length;
       const ref = replyReference(data);
       return complete && ref ? [ref] : [];
@@ -191,15 +153,19 @@ export function deliveredReplies(message: AgentMessage): ReplyReference[] {
       message.toolName,
     )
   ) {
+    const details = reportDetails(message.details);
+    const originals = Array.isArray(details) ? details : [details];
+    if (deliveredFile(message.details, text))
+      return originals.flatMap((value) => {
+        const ref = replyReference(value);
+        return ref ? [ref] : [];
+      });
     let visible: unknown;
     try {
       visible = JSON.parse(text);
     } catch {
       return []; // Truncated tool returns are not complete deliveries.
     }
-    const originals = Array.isArray(message.details)
-      ? message.details
-      : [message.details];
     const values = Array.isArray(visible) ? visible : [visible];
     return values.flatMap((value) => {
       const ref = replyReference(value);
