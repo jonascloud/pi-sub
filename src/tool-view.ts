@@ -5,8 +5,12 @@ import {
   truncateToWidth,
   type Component,
 } from "@earendil-works/pi-tui";
-import type { TaskResult, TaskView } from "./coordinator.ts";
-import { reportDetails, reportFailure } from "./reports.ts";
+import { reportDetails, reportFailure, type TaskMetadata } from "./reports.ts";
+type DisplayReport = TaskMetadata & {
+  response?: string;
+  pendingInput?: string[];
+  activity?: string;
+};
 
 type Tool = "sub_task" | "sub_message" | "sub_result" | "sub_control";
 type Args = {
@@ -43,11 +47,11 @@ const textContent = (content: { type: string; text?: string }[]) =>
     .filter((part) => part.type === "text")
     .map((part) => part.text ?? "")
     .join("\n");
-const isTask = (value: unknown): value is TaskView | TaskResult => {
+const isTask = (value: unknown): value is DisplayReport => {
   if (!value || typeof value !== "object") return false;
-  const task = value as TaskView;
+  const task = value as DisplayReport;
   return (
-    ["id", "description", "response", "sessionFile"].every(
+    ["id", "description", "sessionFile"].every(
       (key) =>
         typeof (task as unknown as Record<string, unknown>)[key] === "string",
     ) &&
@@ -61,13 +65,15 @@ const isTask = (value: unknown): value is TaskView | TaskResult => {
         typeof (task.execution as unknown as Record<string, unknown>)[key] ===
         "string",
     ) &&
-    (!("status" in task) ||
+    (task.status === undefined ||
       ["queued", "active", "paused", "ready"].includes(task.status)) &&
     (task.outcome === undefined ||
       ["reply", "error", "stopped"].includes(task.outcome)) &&
     (task.level === undefined || level(task.level) !== undefined) &&
     (task.operation === undefined ||
       ["pausing", "closing"].includes(task.operation)) &&
+    (task.response === undefined || typeof task.response === "string") &&
+    (task.preview === undefined || typeof task.preview === "string") &&
     (task.error === undefined || typeof task.error === "string") &&
     (task.pendingInput === undefined ||
       (Array.isArray(task.pendingInput) &&
@@ -145,12 +151,12 @@ function pending(tool: Tool, args: Args, started: boolean): View {
     level: tool === "sub_task" ? level(args.level) : undefined,
   };
 }
-function taskView(tool: Tool, args: Args, task: TaskView | TaskResult): View {
+function taskView(tool: Tool, args: Args, task: DisplayReport): View {
   const view: View = {
     action: "Result",
     name: clean(task.description) || task.id.slice(0, 8),
   };
-  const live = "status" in task;
+  const live = task.status !== undefined;
   const lines: string[] = [];
   if (live && task.operation) {
     view.action = task.operation === "closing" ? "Stopping…" : "Pausing…";
@@ -176,11 +182,12 @@ function taskView(tool: Tool, args: Args, task: TaskView | TaskResult): View {
     else if (task.status === "ready") view.action = "Response";
     else
       view.action =
-        { active: "Active", queued: "Queued", paused: "Paused" }[task.status] ??
-        "Result";
+        { active: "Active", queued: "Queued", paused: "Paused" }[
+          task.status!
+        ] ?? "Result";
     // An active/paused snapshot can still contain a previous execution's answer.
     if (!args.finish && (!live || task.status === "ready"))
-      lines.push(...preview(task.response));
+      lines.push(...preview(task.response ?? task.preview ?? ""));
   } else {
     view.action = live
       ? ({
@@ -188,7 +195,7 @@ function taskView(tool: Tool, args: Args, task: TaskView | TaskResult): View {
           queued: "Queued",
           active: args.action === "continue" ? "Resumed" : "Active",
           ready: "Response ready",
-        }[task.status] ?? "Result")
+        }[task.status!] ?? "Result")
       : "Result";
   }
   const cause =
@@ -198,7 +205,7 @@ function taskView(tool: Tool, args: Args, task: TaskView | TaskResult): View {
     lines.unshift(...preview(cause));
   }
   if (
-    task.pendingInput?.length &&
+    (task.pendingInput?.length || task.pendingInputs) &&
     (task.outcome === "error" ||
       task.outcome === "stopped" ||
       (live && task.status === "paused"))
@@ -275,7 +282,7 @@ function summary(
   return { action: "Result", name: identity(args), lines: preview(text) };
 }
 
-function taskDetails(task: TaskView | TaskResult): string {
+function taskDetails(task: DisplayReport): string {
   const execution = task.execution;
   return [
     `Task: ${clean(task.description)}`,
@@ -285,7 +292,7 @@ function taskDetails(task: TaskView | TaskResult): string {
       ? `Execution: ${clean(execution.provider)}/${clean(execution.model)}:${clean(execution.thinking)}`
       : undefined,
     `Session: ${clean(task.sessionFile ?? "")}`,
-    "status" in task
+    task.status !== undefined
       ? `State: ${clean(task.status)}${task.operation ? ` · ${clean(task.operation)}` : ""}`
       : undefined,
     task.outcome ? `Outcome: ${clean(task.outcome)}` : undefined,
@@ -294,7 +301,11 @@ function taskDetails(task: TaskView | TaskResult): string {
       : undefined,
     `Elapsed: ${task.elapsedMs} ms · Turns: ${task.turns} · Tools: ${task.toolUses} · Tokens: ${task.tokens}`,
     task.error ? `Error:\n${sanitize(task.error)}` : undefined,
-    task.response ? `Response:\n${sanitize(task.response)}` : undefined,
+    task.response
+      ? `Response:\n${sanitize(task.response)}`
+      : task.preview
+        ? `Preview:\n${sanitize(task.preview)}`
+        : undefined,
     task.pendingInput?.length
       ? `Pending input:\n${task.pendingInput.map((input) => sanitize(input)).join("\n\n")}`
       : undefined,
@@ -333,8 +344,14 @@ export function taskToolRenderers(tool: Tool): ToolRenderers {
     renderResult(result, { expanded, isPartial }, theme, context) {
       const args = (context.args ?? {}) as Args;
       const raw = textContent(result.content);
-      const details = reportDetails(result.details);
+      const details = reportDetails(result.details, raw);
       const publicationError = reportFailure(result.details);
+      const reference =
+        result.details &&
+        typeof result.details === "object" &&
+        "handoff" in result.details
+          ? "\n\n" + sanitize(raw)
+          : "";
       const view = summary(
         tool,
         args,
@@ -351,6 +368,11 @@ export function taskToolRenderers(tool: Tool): ToolRenderers {
           ...(view.lines ?? []),
         ];
       }
+      if (reference)
+        view.lines = [
+          ...(view.lines ?? []),
+          "Temporary report · details show the file reference.",
+        ];
       (context.state as RowState).view = view;
       if (expanded) {
         const data =
@@ -365,7 +387,8 @@ export function taskToolRenderers(tool: Tool): ToolRenderers {
             : `Report unavailable: ${sanitize(publicationError)}\n\n`) +
           (data
             ? data.map(taskDetails).join("\n\n")
-            : sanitize(typeof details === "string" ? details : raw));
+            : sanitize(typeof details === "string" ? details : raw)) +
+          reference;
         return block(
           () =>
             `${view.action}${view.name ? ` · ${clean(view.name)}` : ""}\n\nRequest:\n${JSON.stringify(args, null, 2)}\n\n${detail}`,

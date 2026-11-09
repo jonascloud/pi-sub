@@ -2,6 +2,7 @@ import { expect, test } from "vitest";
 import type { TaskResult, TaskView } from "../src/coordinator.ts";
 import { reportDetails } from "../src/reports.ts";
 import {
+  access,
   mkdtemp,
   mkdir,
   readFile,
@@ -11,7 +12,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import {
   RpcClient,
   getPackageDir,
@@ -122,17 +123,20 @@ async function latestResult(client: RpcClient) {
   const visible = JSON.parse(
     result.content.find((part) => part.type === "text")!.text,
   );
-  const details = reportDetails(result.details) as TaskView | TaskResult;
+  const details = reportDetails(
+    result.details,
+    result.content.find((part) => part.type === "text")!.text,
+  ) as TaskView | TaskResult;
   expect(visible.id).toBe(details.id);
   if (visible.file)
-    expect(await readFile(visible.file, "utf8")).toContain(details.response);
+    expect((await readFile(visible.file, "utf8")).length).toBeGreaterThan(0);
   else expect(visible.response).toBe(details.response);
   expect(visible).not.toHaveProperty("execution");
   expect(visible).not.toHaveProperty("sessionFile");
   return details;
 }
 
-test("native file handoffs deliver without reading, stay resumable and survive acceptance and shutdown", async () => {
+test("native file handoffs survive acceptance but expire with the active parent runtime", async () => {
   const { client, cwd, dispose } = await host({ WORKER_TEST_LARGE_CHILD: "1" });
   try {
     await client.promptAndWait("integration:read-via-wait", undefined, 20000);
@@ -145,7 +149,10 @@ test("native file handoffs deliver without reading, stay resumable and survive a
     const ref = JSON.parse(
       result.content.find((part) => part.type === "text")!.text,
     );
-    expect(ref.file).toContain(join(cwd, ".pi/pi-sub/reports"));
+    expect(ref.file).not.toContain(cwd);
+    expect(ref.file).toContain("/reports/");
+    expect(JSON.stringify(result.details)).not.toContain("END_OF_LARGE_REPORT");
+    await expect(access(join(cwd, ".pi/pi-sub"))).rejects.toThrow();
     const original = await readFile(ref.file, "utf8");
     expect(original).toContain("Evidence line 漢字\n");
     expect(original).toContain("END_OF_LARGE_REPORT");
@@ -171,19 +178,112 @@ test("native file handoffs deliver without reading, stay resumable and survive a
         .filter((message) => message.role === "toolResult")
         .map((message) => message.toolName),
     ).not.toContain("read");
-    await client.stop();
     expect(await readFile(ref.file, "utf8")).toBe(original);
+    const metadata = reportDetails(result.details) as TaskResult;
+    await client.stop();
+    await expect(access(ref.file)).rejects.toThrow();
+    await expect(access(metadata.sessionFile)).rejects.toThrow();
+    await expect(
+      access(dirname(dirname(metadata.sessionFile))),
+    ).rejects.toThrow();
+  } finally {
+    await dispose();
+  }
+}, 30000);
+
+test.each(["new", "resume", "clone", "reload"] as const)(
+  "native %s discards working data without deleting parent history or project edits",
+  async (transition) => {
+    const { client, cwd, dispose } = await host({
+      WORKER_TEST_LARGE_CHILD: "1",
+    });
+    try {
+      await client.promptAndWait("integration:read-via-wait", undefined, 20000);
+      const first = await latestResult(client);
+      const root = dirname(dirname(first.sessionFile));
+      const parentFile = (await client.getState()).sessionFile!;
+      await writeFile(join(cwd, "project-edit.txt"), "Keep this work");
+      if (transition === "reload") await client.prompt("/test-reload");
+      else if (transition === "clone")
+        expect(await client.clone()).toMatchObject({ cancelled: false });
+      else {
+        expect(await client.newSession()).toMatchObject({ cancelled: false });
+        if (transition === "resume") {
+          await client.promptAndWait("integration:delegate", undefined, 20000);
+          const secondRoot = dirname(
+            dirname((await latestResult(client)).sessionFile),
+          );
+          expect(secondRoot).not.toBe(root);
+          expect(await client.switchSession(parentFile)).toMatchObject({
+            cancelled: false,
+          });
+          await expect(access(secondRoot)).rejects.toThrow();
+        }
+      }
+      await expect(access(root)).rejects.toThrow();
+      expect(await readFile(join(cwd, "project-edit.txt"), "utf8")).toBe(
+        "Keep this work",
+      );
+      expect(await readFile(parentFile, "utf8")).toContain(
+        "integration:read-via-wait",
+      );
+      if (transition !== "new") {
+        const history = await client.getMessages();
+        expect(JSON.stringify(history)).toContain(first.id);
+        expect(JSON.stringify(history)).not.toContain("END_OF_LARGE_REPORT");
+        await client.promptAndWait("integration:inspect", undefined, 20000);
+        const stale = (await client.getMessages()).findLast(
+          (message) => message.role === "toolResult",
+        );
+        expect(stale).toMatchObject({ isError: true });
+        expect(JSON.stringify(stale)).toContain("Unknown live task");
+      }
+      await client.promptAndWait("integration:delegate", undefined, 20000);
+      const fresh = await latestResult(client);
+      expect(fresh.id).not.toBe(first.id);
+      expect(dirname(dirname(fresh.sessionFile))).not.toBe(root);
+    } finally {
+      await dispose();
+    }
+  },
+  30000,
+);
+
+test("native session replacement closes active children before removing their journals", async () => {
+  const { client, cwd, marker, dispose } = await host({
+    WORKER_TEST_SLOW_CHILD: "1",
+    WORKER_TEST_CHILD_PIDS: "1",
+  });
+  try {
+    await client.promptAndWait("integration:notify", undefined, 20000);
+    await eventually(() => readFile(marker));
+    const message = (await client.getMessages()).find(
+      (message) =>
+        message.role === "toolResult" && message.toolName === "sub_task",
+    );
+    if (!message || message.role !== "toolResult")
+      throw new Error("Missing task");
+    const task = reportDetails(message.details) as TaskResult;
+    const pid = Number(
+      await eventually(() =>
+        readFile(join(cwd, "child-pids", basename(task.sessionFile)), "utf8"),
+      ),
+    );
+    expect(() => process.kill(pid, 0)).not.toThrow();
+    expect(await client.newSession()).toMatchObject({ cancelled: false });
+    expect(() => process.kill(pid, 0)).toThrow();
+    await expect(access(dirname(dirname(task.sessionFile)))).rejects.toThrow();
   } finally {
     await dispose();
   }
 }, 30000);
 
 test("native acceptance reports its committed state on publication failure and retains a retrievable receipt", async () => {
-  const { client, cwd, dispose } = await host({ WORKER_TEST_LARGE_CHILD: "1" });
+  const { client, dispose } = await host({ WORKER_TEST_LARGE_CHILD: "1" });
   try {
     await client.promptAndWait("integration:read-via-wait", undefined, 20000);
     const first = await latestResult(client);
-    const directory = join(cwd, ".pi/pi-sub/reports");
+    const directory = join(dirname(dirname(first.sessionFile)), "reports");
     const backup = directory + "-backup";
     // A deterministic storage failure, also when tests run as root.
     await rename(directory, backup);
@@ -209,27 +309,21 @@ test("native acceptance reports its committed state on publication failure and r
     expect(reportDetails(failed.details)).toMatchObject({
       id: first.id,
       outcome: "reply",
-      response: first.response,
     });
+    expect(reportDetails(failed.details)).not.toHaveProperty("response");
     expect(reportDetails(failed.details)).not.toHaveProperty("status");
     await client.promptAndWait("integration:refine-task", undefined, 20000);
     const followUp = (await client.getMessages()).findLast(
       (message) =>
         message.role === "toolResult" && message.toolName === "sub_message",
     );
-    expect(followUp).toMatchObject({
-      isError: true,
-      details: expect.stringContaining("Unknown live task"),
-    });
+    expect(followUp).toMatchObject({ isError: true });
+    expect(JSON.stringify(followUp)).toContain("Unknown live task");
     await rm(directory);
     await rename(backup, directory);
     await client.promptAndWait("integration:failure-receipt", undefined, 20000);
     const receipt = await latestResult(client);
-    expect(receipt).toMatchObject({
-      id: first.id,
-      outcome: "reply",
-      response: first.response,
-    });
+    expect(receipt).toMatchObject({ id: first.id, outcome: "reply" });
     expect(receipt).not.toHaveProperty("status");
   } finally {
     await dispose();
@@ -354,8 +448,21 @@ test("native turn boundaries batch concurrent replies into the already required 
             await readFile(join(cwd, "child-pids", file), "utf8"),
           );
           expect(() => process.kill(pid, 0)).toThrow();
+          const taskMessage = (await client.getMessages()).find(
+            (message) =>
+              message.role === "toolResult" &&
+              message.toolName === "sub_task" &&
+              basename(
+                (reportDetails(message.details) as TaskResult).sessionFile,
+              ) === file,
+          );
+          if (!taskMessage || taskMessage.role !== "toolResult")
+            throw new Error("Missing task");
           expect(
-            await readFile(join(cwd, ".pi/pi-sub/sessions", file), "utf8"),
+            await readFile(
+              (reportDetails(taskMessage.details) as TaskResult).sessionFile,
+              "utf8",
+            ),
           ).toContain("fake response");
         }
       });
@@ -558,9 +665,7 @@ test("two working directories share the profile ladder without project overrides
     expect(await latestResult(second.client)).toMatchObject({
       outcome: "reply",
     });
-    expect(
-      await readFile(join(second.cwd, ".pi/pi-sub/.gitignore"), "utf8"),
-    ).toBe("*\n");
+    await expect(access(join(second.cwd, ".pi/pi-sub"))).rejects.toThrow();
     const global = join(first.agentDir, "pi-sub-config.json");
     await writeFile(local, await readFile(global));
     await rm(global);
@@ -586,7 +691,7 @@ test("two working directories share the profile ladder without project overrides
 test.each([false, true])(
   "user input collects failures without a cleanup call, even with broken report storage (%s)",
   async (brokenStorage) => {
-    const { client, cwd, dispose } = await host(
+    const { client, dispose } = await host(
       brokenStorage ? { WORKER_TEST_LARGE_CHILD: "1" } : {},
     );
     const failed = nextEvent(client, (event) => {
@@ -609,7 +714,20 @@ test.each([false, true])(
         (message) => message.role === "toolResult",
       ).length;
       expect((await client.getState()).isStreaming).toBe(false);
-      const storage = join(cwd, ".pi/pi-sub/reports");
+      const taskMessage = before.find(
+        (message) =>
+          message.role === "toolResult" && message.toolName === "sub_task",
+      );
+      if (!taskMessage || taskMessage.role !== "toolResult")
+        throw new Error("Missing task");
+      const storage = join(
+        dirname(
+          dirname(
+            (reportDetails(taskMessage.details) as TaskResult).sessionFile,
+          ),
+        ),
+        "reports",
+      );
       if (brokenStorage) await writeFile(storage, "not a directory");
       await client.promptAndWait(
         "integration:failure-cleanup",
@@ -652,7 +770,9 @@ test.each([false, true])(
           archived: true,
           reportError: expect.any(String),
         });
-        expect(reports[0]!.error).toContain("END_OF_FAILURE_REPORT");
+        expect(JSON.stringify(notice.details)).not.toContain(
+          "END_OF_FAILURE_REPORT",
+        );
         await rm(storage);
       }
       const pending = await client.getSessionStats();
@@ -669,6 +789,17 @@ test.each([false, true])(
         error: reports[0]!.error,
       });
       expect(receipt).not.toHaveProperty("status");
+      if (brokenStorage) {
+        const message = (await client.getMessages()).findLast(
+          (m) => m.role === "toolResult" && m.toolName === "sub_result",
+        );
+        if (!message || message.role !== "toolResult")
+          throw new Error("Missing receipt");
+        const file = JSON.parse(
+          message.content.find((part) => part.type === "text")!.text,
+        ).file;
+        expect(await readFile(file, "utf8")).toContain("END_OF_FAILURE_REPORT");
+      }
       const delivered = await client.getSessionStats();
       expect(delivered.cost).toBe(delivered.assistantMessages * 10 + 10);
       await client.promptAndWait(

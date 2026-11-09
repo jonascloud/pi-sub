@@ -1,7 +1,6 @@
 import { afterEach, beforeEach, expect, test } from "vitest";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { readFileSync } from "node:fs";
+import { Workspace } from "../src/workspace.ts";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { TaskView } from "../src/coordinator.ts";
 import {
@@ -10,21 +9,21 @@ import {
   announcedReplies,
   deliveredReplies,
 } from "../src/replies.ts";
-import { taskReport, reportResult } from "../src/reports.ts";
+import { taskReport, taskMetadata, reportResult } from "../src/reports.ts";
 
-let cwd: string;
+let workspace: Workspace;
 beforeEach(() => {
-  cwd = mkdtempSync(join(tmpdir(), "pi-sub-replies-"));
+  workspace = new Workspace();
 });
 afterEach(() => {
-  rmSync(cwd, { recursive: true, force: true });
+  workspace.dispose();
 });
-const replyBatch = (tasks: TaskView[]) => buildBatch(tasks, cwd);
+const replyBatch = (tasks: TaskView[]) => buildBatch(tasks, workspace);
 const pendingReplyBatch = (
   tasks: TaskView[],
   session: Parameters<typeof buildPendingBatch>[1],
   messages?: AgentMessage[],
-) => buildPendingBatch(tasks, session, messages, cwd);
+) => buildPendingBatch(tasks, session, messages, workspace);
 
 const task: TaskView = {
   id: "task-1",
@@ -51,7 +50,7 @@ test("replies carry identity and new information, not repeated operating instruc
   expect(reply.content).not.toContain("sub_result");
   expect(reply.content).not.toContain("This may be a question");
   expect(reply.details.replies[0]).toMatchObject({
-    ...task,
+    ...taskMetadata(task),
     preview: "Question?",
   });
   const long = replyBatch([{ ...task, response: "x".repeat(60000) }])!;
@@ -109,8 +108,8 @@ test("publication failure preserves the reply but never acknowledges delivery", 
     response: "x".repeat(60000),
     reply: { id: "reply-1", delivered: false },
   };
-  writeFileSync(join(cwd, ".pi"), "not a directory");
-  const result = reportResult(ready, cwd);
+  workspace.dispose();
+  const result = reportResult(ready, workspace);
   expect(result.isError).toBe(true);
   const message = {
     ...result,
@@ -191,7 +190,7 @@ test("batches are bounded without losing the full reports or silently dropping l
   expect(batch.details.replies).toHaveLength(tasks.length);
   expect(Buffer.byteLength(batch.content, "utf8")).toBeLessThanOrEqual(24000);
   expect(batch.content.split("\n").length).toBeLessThanOrEqual(300);
-  expect(batch.details.replies[0]!.response).toBe(tasks[0]!.response);
+  expect(batch.details.replies[0]).not.toHaveProperty("response");
   const text = readFileSync(JSON.parse(batch.content).file, "utf8");
   for (const task of tasks) expect(text).toContain(task.id);
   expect(
@@ -261,7 +260,7 @@ test("complete tool returns acknowledge replies without accepting tasks", () => 
 
 test("a file tool handoff delivers exactly its snapshot without reading or closing it", () => {
   const a = { ...ready("a"), response: "answer\n".repeat(10000) };
-  const result = reportResult(a, cwd);
+  const result = reportResult(a, workspace);
   const message: AgentMessage = {
     ...result,
     details: JSON.parse(JSON.stringify(result.details)),
@@ -288,7 +287,7 @@ test("a file tool handoff delivers exactly its snapshot without reading or closi
   ).toBe("successor");
   const batch = reportResult(
     [a, { ...a, id: "b", reply: { id: "reply-b", delivered: false } }],
-    cwd,
+    workspace,
   );
   expect(
     deliveredReplies({

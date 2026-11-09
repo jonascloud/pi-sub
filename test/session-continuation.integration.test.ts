@@ -98,6 +98,7 @@ test("native CLI resumes an interrupted real tool call with valid provider histo
   );
   const options: WorkerOptions = {
     cwd,
+    sessionDir: join(cwd, "sessions"),
     provider: "resume-test",
     model: "fake",
     thinking: "off",

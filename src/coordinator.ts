@@ -228,7 +228,7 @@ export class Coordinator {
         },
         sessionFile: resolve(
           request.worker.cwd,
-          request.worker.sessionDir ?? ".pi/pi-sub/sessions",
+          request.worker.sessionDir,
           `${id}.jsonl`,
         ),
         turns: 0,
@@ -620,6 +620,8 @@ export class Coordinator {
     this.epoch++;
     await Promise.all([...this.tasks.values()].map((t) => this.end(t, "stop")));
     this.tasks.clear();
+    this.receipts.clear();
+    this.usage = undefined;
     this.emit();
   }
 }

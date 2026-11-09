@@ -297,6 +297,12 @@ export default function (pi) {
     },
   };
   pi.registerProvider("worker-test", definition);
+  pi.registerCommand("test-reload", {
+    description: "Synthetic runtime reload",
+    handler: async (_args, ctx) => {
+      await ctx.reload();
+    },
+  });
   pi.registerCommand("test-remove-model", {
     description: "Synthetic availability change",
     handler: async () =>

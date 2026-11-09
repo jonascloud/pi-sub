@@ -1,13 +1,10 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import {
-  closeSync,
-  mkdirSync,
-  openSync,
-  unlinkSync,
-  writeFileSync,
-} from "node:fs";
-import { resolve } from "node:path";
+  stripTerminalSequences,
+  truncateToWidth,
+} from "@earendil-works/pi-tui";
 import type { TaskResult, TaskView } from "./coordinator.ts";
+import type { Workspace } from "./workspace.ts";
 
 export type Report = TaskView | TaskResult;
 export type Reports = string | Report | Report[];
@@ -51,59 +48,59 @@ function reportText(value: Reports): string {
     .join("\n\n---\n\n");
 }
 
-/** Reuse only this process's successful writes; files are not a shared cache. */
-const savedReports = new Map<string, string>();
-function saveReport(cwd: string, text: string): string {
-  const directory = resolve(cwd, ".pi/pi-sub/reports");
-  const key = resolve(
-    directory,
-    createHash("sha256").update(text).digest("hex"),
+export const digest = (text: string) =>
+  createHash("sha256").update(text).digest("hex");
+const preview = (text: string) =>
+  truncateToWidth(
+    stripTerminalSequences(text.slice(0, 4096)).replace(/\s+/g, " ").trim(),
+    160,
   );
-  const saved = savedReports.get(key);
-  if (saved) return saved;
 
-  mkdirSync(directory, { recursive: true, mode: 0o700 });
-  try {
-    writeFileSync(resolve(directory, ".gitignore"), "*\n", {
-      flag: "wx",
-      mode: 0o600,
-    });
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-    // Existing ignore rules belong to the operator.
-  }
-  const file = resolve(directory, `${randomUUID()}.txt`);
-  const fd = openSync(file, "wx", 0o600);
-  try {
-    try {
-      writeFileSync(fd, text, "utf8");
-    } finally {
-      closeSync(fd);
-    }
-  } catch (error) {
-    unlinkSync(file);
-    throw error;
-  }
-  savedReports.set(key, file);
-  return file;
+/** Persist diagnostics, not a second copy of the answer or unsent instructions. */
+export function taskMetadata(task: Report) {
+  return {
+    id: task.id,
+    description: preview(task.description),
+    level: task.level,
+    execution: { ...task.execution },
+    sessionFile: task.sessionFile,
+    turns: task.turns,
+    toolUses: task.toolUses,
+    tokens: task.tokens,
+    elapsedMs: task.elapsedMs,
+    ...("status" in task
+      ? {
+          status: task.status,
+          operation: task.operation,
+          reply: task.reply ? { ...task.reply } : undefined,
+        }
+      : {}),
+    outcome: task.outcome,
+    preview: preview(task.response),
+    responseHash: digest(task.response),
+    error: task.error === undefined ? undefined : preview(task.error),
+    errorHash: task.error === undefined ? undefined : digest(task.error),
+    pendingInputs: task.pendingInput?.length ?? 0,
+  };
 }
+export type TaskMetadata = ReturnType<typeof taskMetadata>;
 
 /** The entire envelope, including the reference, must fit. Never clip serialized JSON. */
 export function handoff(
   content: string,
   value: Reports,
-  cwd: string,
+  workspace: Workspace,
   limits = TOOL_LIMITS,
 ): Handoff {
   const fits = (text: string) =>
     Buffer.byteLength(text, "utf8") <= limits.maxBytes &&
     text.split("\n").length <= limits.maxLines;
   if (fits(content)) return { content };
-  const file = saveReport(cwd, reportText(value));
+  const file = workspace.saveReport(reportText(value));
   const envelope = JSON.stringify({
     ...reportState(value),
     file,
-    note: "Full report in file; read as needed.",
+    note: "Temporary report; read as needed and preserve relevant findings before session switch, reload or shutdown.",
   });
   if (!fits(envelope))
     throw new Error("Report reference exceeds the handoff limit");
@@ -140,7 +137,13 @@ function reportState(value: Reports) {
   };
 }
 
-export function reportResult(value: Reports, cwd: string) {
+export function reportResult(value: Reports, workspace: Workspace) {
+  const report =
+    typeof value === "string"
+      ? undefined
+      : Array.isArray(value)
+        ? value.map(taskMetadata)
+        : taskMetadata(value);
   const raw =
     typeof value === "string"
       ? value
@@ -148,10 +151,15 @@ export function reportResult(value: Reports, cwd: string) {
           Array.isArray(value) ? value.map(taskReport) : taskReport(value),
         );
   try {
-    const result = handoff(raw, value, cwd);
+    const result = handoff(raw, value, workspace);
     return {
       content: [{ type: "text" as const, text: result.content }],
-      details: result.file ? { report: value, handoff: result } : value,
+      details: {
+        report,
+        ...(result.file
+          ? { handoff: { file: result.file, digest: digest(result.content) } }
+          : {}),
+      },
     };
   } catch (error) {
     const reportError = error instanceof Error ? error.message : String(error);
@@ -160,24 +168,25 @@ export function reportResult(value: Reports, cwd: string) {
       reportError,
       note:
         typeof value === "string"
-          ? "Report storage failed. Full error retained in native details."
-          : "Task state above is confirmed; reporting failed, not the operation. Full report retained in native details. Retry sub_result after fixing report storage.",
+          ? "Report storage failed. Retry after fixing storage."
+          : "Task state above is confirmed. The full report is retained only in this active session; retry sub_result after fixing storage.",
     };
     // Keep the fallback bounded even if a diagnostic contains an oversized path.
     if (
       Buffer.byteLength(JSON.stringify(failure), "utf8") > TOOL_LIMITS.maxBytes
     )
-      failure.reportError =
-        "Report storage failed; full error in native details.";
+      failure.reportError = "Report storage failed.";
     return {
       content: [{ type: "text" as const, text: JSON.stringify(failure) }],
-      details: { report: value, reportError },
+      details: { report, reportError: preview(reportError) },
       isError: true,
     };
   }
 }
 
-function artifact(details: unknown): Handoff | undefined {
+function artifact(
+  details: unknown,
+): { file: string; digest?: string; content?: string } | undefined {
   if (!details || typeof details !== "object" || !("handoff" in details))
     return;
   const value = details.handoff;
@@ -186,10 +195,10 @@ function artifact(details: unknown): Handoff | undefined {
     typeof value === "object" &&
     "file" in value &&
     typeof value.file === "string" &&
-    "content" in value &&
-    typeof value.content === "string"
+    (("digest" in value && typeof value.digest === "string") ||
+      ("content" in value && typeof value.content === "string"))
   )
-    return value as Handoff;
+    return value as { file: string; digest?: string; content?: string };
 }
 
 export function reportFailure(details: unknown): string | undefined {
@@ -201,16 +210,54 @@ export function reportFailure(details: unknown): string | undefined {
     : undefined;
 }
 
-export function reportDetails(details: unknown): unknown {
-  return (artifact(details) || reportFailure(details) !== undefined) &&
-    details &&
-    typeof details === "object" &&
-    "report" in details
-    ? details.report
-    : details;
+/** Inline content is the sole stored copy of the body; renderers may combine it with diagnostics. */
+export function reportDetails(details: unknown, content?: string): unknown {
+  const report =
+    details && typeof details === "object" && "report" in details
+      ? details.report
+      : details;
+  if (!content) return report;
+  let visible: unknown;
+  try {
+    visible = JSON.parse(content);
+  } catch {
+    return report;
+  }
+  const values = Array.isArray(visible) ? visible : [visible];
+  const merge = (value: unknown, index: number) => {
+    const body = values[index];
+    if (
+      !value ||
+      typeof value !== "object" ||
+      !("id" in value) ||
+      !body ||
+      typeof body !== "object" ||
+      !("id" in body) ||
+      value.id !== body.id ||
+      !("response" in body) ||
+      typeof body.response !== "string"
+    )
+      return value;
+    return {
+      ...value,
+      ...("description" in body && typeof body.description === "string"
+        ? { description: body.description }
+        : {}),
+      response: body.response,
+      ...("error" in body ? { error: body.error } : {}),
+      ...("pendingInput" in body ? { pendingInput: body.pendingInput } : {}),
+    };
+  };
+  return Array.isArray(report) ? report.map(merge) : merge(report, 0);
 }
 
 /** Delivery proves the exact saved-file reference was in context, not that its file was read. */
 export function deliveredFile(details: unknown, content: string): boolean {
-  return artifact(details)?.content === content;
+  const value = artifact(details);
+  return (
+    !!value &&
+    (value.digest
+      ? value.digest === digest(content)
+      : value.content === content)
+  );
 }

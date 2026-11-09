@@ -22,7 +22,7 @@ import {
   parseReference,
   selectExecution,
 } from "./src/models.ts";
-import { workerDirectory } from "./src/worker.ts";
+import { Workspace } from "./src/workspace.ts";
 import { taskToolRenderers } from "./src/tool-view.ts";
 import { mountWidget } from "./src/widget.ts";
 import {
@@ -43,6 +43,7 @@ export default function piSub(pi: ExtensionAPI): void {
   pi.registerMessageRenderer("pi-sub:response", renderReply);
   pi.registerMessageRenderer("pi-sub:failures", renderFailures);
   pi.registerMessageRenderer("pi-sub:stopped", renderStopped);
+  const workspace = new Workspace();
   let context: ExtensionContext | undefined;
   let coordinator: Coordinator | undefined;
   let unmount: (() => void) | undefined;
@@ -60,7 +61,7 @@ export default function piSub(pi: ExtensionAPI): void {
           coordinator.list(),
           ctx.sessionManager,
           messages,
-          ctx.cwd,
+          workspace,
         );
   const scheduleReplies = () => {
     if (idleDelivery || lifetime.signal.aborted || !coordinator?.runnable)
@@ -146,7 +147,7 @@ export default function piSub(pi: ExtensionAPI): void {
   const preparePrompt = async () => {
     const prepared = await manager().prompt((failures: TaskResult[]) => {
       if (!failures.length) return;
-      const result = reportResult(failures, context!.cwd);
+      const result = reportResult(failures, workspace);
       pi.sendMessage(
         {
           customType: "pi-sub:failures",
@@ -193,7 +194,7 @@ export default function piSub(pi: ExtensionAPI): void {
   const authorized = (id: string, ctx: ExtensionContext) =>
     authorizeTask(manager().get(id), ctx);
   const response = (value: Reports, error = false) => {
-    const result = reportResult(value, context!.cwd);
+    const result = reportResult(value, workspace);
     const usage = coordinator?.drainUsage();
     return {
       ...result,
@@ -318,6 +319,7 @@ export default function piSub(pi: ExtensionAPI): void {
     detachInput?.();
     unmount?.();
     await coordinator?.dispose();
+    workspace.dispose();
   });
 
   for (const action of ["pause", "continue", "stop"] as const) {
@@ -356,7 +358,7 @@ export default function piSub(pi: ExtensionAPI): void {
               ).map((taskId) => manager().stop(taskId)),
             );
             if (results.length) {
-              const result = reportResult(results, ctx.cwd);
+              const result = reportResult(results, workspace);
               pi.sendMessage(
                 {
                   customType: "pi-sub:stopped",
@@ -398,8 +400,6 @@ export default function piSub(pi: ExtensionAPI): void {
         try {
           checkContext(ctx);
           signal?.throwIfAborted();
-          const sessionDir = await workerDirectory(ctx.cwd);
-          signal?.throwIfAborted();
           const execution = selectExecution(
             loadLadder(ladderPath()),
             args.level,
@@ -413,7 +413,7 @@ export default function piSub(pi: ExtensionAPI): void {
               ...execution,
               cwd: ctx.cwd,
               name: args.description || "Pi subagent",
-              sessionDir,
+              sessionDir: workspace.sessions,
               args: ["--approve"],
             },
           });

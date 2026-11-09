@@ -10,6 +10,8 @@ import {
 } from "@earendil-works/pi-tui";
 import type { TaskView, TaskResult } from "../src/coordinator.ts";
 import { taskToolRenderers } from "../src/tool-view.ts";
+import { reportResult } from "../src/reports.ts";
+import { Workspace } from "../src/workspace.ts";
 
 beforeAll(() => initTheme("dark", false));
 const task = (overrides: Partial<TaskView> = {}): TaskView => ({
@@ -74,6 +76,39 @@ const lines = (component: ToolExecutionComponent, width = 100) =>
   component.render(width).map(stripTerminalSequences);
 const text = (component: ToolExecutionComponent, width = 100) =>
   lines(component, width).join("\n");
+
+test.each([false, true])(
+  "persisted compact details render without a live workspace (file=%s)",
+  (large) => {
+    const workspace = new Workspace();
+    try {
+      const value = receipt({
+        response: "x".repeat(large ? 60000 : 500) + "\nEND_OF_ANSWER",
+        pendingInput: ["Unsent instruction"],
+      });
+      const saved = JSON.parse(JSON.stringify(reportResult(value, workspace)));
+      workspace.dispose();
+      expect(JSON.stringify(saved.details)).not.toContain("END_OF_ANSWER");
+      expect(JSON.stringify(saved.details)).not.toContain("Unsent instruction");
+      const component = row("sub_result", { id: value.id, finish: true });
+      result(component, saved.details, false, false, saved.content[0].text);
+      expect(text(component)).toContain("Accepted");
+      component.setExpanded(true);
+      const expanded = text(component, 300);
+      expect(expanded).toContain("Execution: test/strong:high");
+      if (large) {
+        expect(expanded).toContain(saved.details.handoff.file);
+        expect(expanded).toContain("Temporary report");
+        expect(expanded).not.toContain("END_OF_ANSWER");
+      } else {
+        expect(expanded).toContain("END_OF_ANSWER");
+        expect(expanded).toContain("Unsent instruction");
+      }
+    } finally {
+      workspace.dispose();
+    }
+  },
+);
 
 test("native tool rows replace the pending header with compact delegation/queue outcomes", () => {
   const args = {
@@ -368,6 +403,10 @@ test("native composition fits narrow widths, strips terminal controls, expands w
       }
   }
   component.setExpanded(false);
+  for (const field of ["response", "preview"]) {
+    result(component, { ...task(), [field]: 42 });
+    expect(text(component)).toContain("Result");
+  }
   result(component, { description: "malformed", pendingInput: 42 });
   expect(text(component)).toContain("Result");
   expect(text(component)).not.toContain("Accepted");

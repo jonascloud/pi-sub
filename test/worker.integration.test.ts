@@ -25,6 +25,7 @@ async function setup(env: Record<string, string> = {}) {
   const session = join(dir, "sessions", "task.jsonl");
   const options: WorkerOptions = {
     cwd: dir,
+    sessionDir: join(dir, "sessions"),
     provider: "worker-test",
     model: "fake",
     thinking: "off",

@@ -4,7 +4,7 @@ import {
   Text,
   truncateToWidth,
 } from "@earendil-works/pi-tui";
-import { replyReports, replyText } from "./replies.ts";
+import { replyReports } from "./replies.ts";
 import { STRENGTH_GUIDANCE } from "./models.ts";
 import { reportDetails, reportFailure } from "./reports.ts";
 
@@ -12,7 +12,7 @@ import { reportDetails, reportFailure } from "./reports.ts";
 export const SUBAGENT_GUIDANCE = `Delegate bounded work when the result justifies briefing and integration overhead. Give the smallest sufficient brief: goal, scope, constraints, success criteria and decisive context. Prefer paths to copied content; do not repeat loaded instructions. Children share files and load native global/project instructions, not your conversation or UI. Follow-ups add new information with enough context to interpret it.
 Choose the minimum sufficient level; do not lower it to fit availability. The configured ladder selects the execution.
 ${STRENGTH_GUIDANCE}
-Replies arrive asynchronously and may be questions. A file reference delivers the full report; read it as needed. User interruption pauses children; a new prompt resumes only you.
+Replies arrive asynchronously and may be questions. Reports and child sessions are temporary: preserve relevant findings before session switch, reload or shutdown. A file reference delivers the full report; read it as needed. User interruption pauses children; a new prompt resumes only you.
 Use reports internally; surface only material results, blockers or user decisions. Reports need no acknowledgement; stale reports alone are not a reason to revisit accepted/stopped tasks.`;
 
 type Message = Parameters<MessageRenderer>[0];
@@ -132,8 +132,9 @@ export const renderReply: MessageRenderer = (message, options, theme) => {
       return fullDelivery(
         {
           ...message,
-          content: replies.map(replyText).join("\n\n"),
+          content: message.content,
           details: {
+            ...details,
             replies: replies.map(
               ({ response: _response, preview: _preview, ...metadata }) =>
                 metadata,

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type {
@@ -10,10 +10,10 @@ import type {
 import type { TaskResult, TaskView } from "../src/coordinator.ts";
 import piSub from "../index.ts";
 import * as models from "../src/models.ts";
-import * as workers from "../src/worker.ts";
+import { Workspace } from "../src/workspace.ts";
 import { SUBAGENT_GUIDANCE } from "../src/messages.ts";
 import { replyBatch } from "../src/replies.ts";
-import { taskReport, reportDetails } from "../src/reports.ts";
+import { taskReport, taskMetadata, reportDetails } from "../src/reports.ts";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 
 const fake = vi.hoisted(() => ({
@@ -27,6 +27,7 @@ const fake = vi.hoisted(() => ({
   onReady: undefined as ((task: TaskView) => void) | undefined,
   start: vi.fn(),
   stop: vi.fn(),
+  dispose: vi.fn(),
   markDelivered: vi.fn(),
 }));
 vi.mock("../src/coordinator.ts", () => ({
@@ -45,18 +46,29 @@ vi.mock("../src/coordinator.ts", () => ({
     start = fake.start;
     stop = fake.stop;
     markDelivered = fake.markDelivered;
-    get = () => ({ id: "new-task" });
+    get = () => ({
+      ...failure,
+      id: "new-task",
+      status: "queued",
+      outcome: undefined,
+      activity: "",
+    });
     drainUsage = () => undefined;
     list = () => [...fake.tasks].reverse();
     subscribe = () => () => {};
-    dispose = async () => {};
+    dispose = fake.dispose;
   },
 }));
 vi.mock("../src/widget.ts", () => ({ mountWidget: () => () => {} }));
 
 let cwd: string;
+let workspace: Workspace;
+const shutdowns: (() => Promise<unknown>)[] = [];
 afterEach(async () => {
   await flushReplies();
+  fake.dispose.mockResolvedValue(undefined);
+  for (const shutdown of shutdowns.splice(0)) await shutdown();
+  workspace.dispose();
   rmSync(cwd, { recursive: true, force: true });
   vi.unstubAllEnvs();
   vi.restoreAllMocks();
@@ -64,6 +76,8 @@ afterEach(async () => {
 
 beforeEach(() => {
   cwd = mkdtempSync(join(tmpdir(), "pi-sub-input-"));
+  workspace = new Workspace();
+  fake.dispose.mockReset().mockResolvedValue(undefined);
   vi.stubEnv("PI_SUB_CHILD", "");
   fake.interrupted = false;
   fake.runnable = true;
@@ -167,6 +181,7 @@ function setup(mode = "rpc") {
     );
   };
   emit("session_start");
+  shutdowns.push(() => emit("session_shutdown"));
   return {
     ctx,
     emit,
@@ -221,7 +236,7 @@ test("operator stop preserves machine-readable content and supplies presentation
       customType: "pi-sub:stopped",
       display: true,
       content: JSON.stringify([taskReport(report)]),
-      details: [report],
+      details: { report: [taskMetadata(report)] },
     },
     { triggerTurn: false },
   );
@@ -246,7 +261,7 @@ test("tool handoffs omit diagnostics and preserve oversized reports in files", a
         () => {},
         ctx,
       );
-    expect(reportDetails(result.details)).toEqual(value);
+    expect(reportDetails(result.details)).toEqual(taskMetadata(value));
     const text = result.content[0].text;
     if (response.length < 60000) {
       expect(JSON.parse(text)).toEqual({
@@ -283,7 +298,9 @@ test("operator stop reports confirmed outcomes even when report publication fail
     response: "x".repeat(60000),
   };
   fake.stop.mockResolvedValue(report);
-  writeFileSync(join(cwd, ".pi"), "not a directory");
+  vi.spyOn(Workspace.prototype, "saveReport").mockImplementation(() => {
+    throw new Error("ENOSPC");
+  });
   await commands.get("sub:stop")!.handler(report.id, ctx);
   const message = sendMessage.mock.calls[0]![0];
   expect(JSON.parse(message.content)).toMatchObject({
@@ -292,7 +309,7 @@ test("operator stop reports confirmed outcomes even when report publication fail
     outcome: "stopped",
     reportError: expect.any(String),
   });
-  expect(reportDetails(message.details)).toEqual([report]);
+  expect(reportDetails(message.details)).toEqual([taskMetadata(report)]);
   expect(fake.stop).toHaveBeenCalledOnce();
 });
 
@@ -309,7 +326,7 @@ test.each(["interactive", "rpc"])(
     expect(sendMessage).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({
         customType: "pi-sub:failures",
-        details: [failure],
+        details: { report: [taskMetadata(failure)] },
         content: JSON.stringify([taskReport(failure)]),
       }),
       { triggerTurn: false },
@@ -328,7 +345,9 @@ test("report-storage errors preserve failed work in history without blocking use
     deliver([report]);
     return true;
   });
-  writeFileSync(join(cwd, ".pi"), "not a directory");
+  vi.spyOn(Workspace.prototype, "saveReport").mockImplementation(() => {
+    throw new Error("ENOSPC");
+  });
   expect(
     await emit("input", { source: "rpc", text: "fix report storage" }),
   ).toBeUndefined();
@@ -340,66 +359,32 @@ test("report-storage errors preserve failed work in history without blocking use
     reportError: expect.any(String),
   });
   expect(JSON.parse(message.content)).not.toHaveProperty("file");
-  expect(reportDetails(message.details)).toEqual([report]);
+  expect(reportDetails(message.details)).toEqual([taskMetadata(report)]);
 });
 
-test("new tasks select from fresh configuration after asynchronous directory preparation", async () => {
+test("task admission reads current configuration and respects prior cancellation", async () => {
   const { ctx, tools } = setup();
   vi.spyOn(models, "availableModels").mockReturnValue([
     { provider: "test", model: "fake", thinking: ["off"] },
-    { provider: "test", model: "other", thinking: ["off"] },
   ]);
   const load = vi
     .spyOn(models, "loadLadder")
     .mockReturnValue({ "6": "test/fake:off" });
-  const directory = Promise.withResolvers<string>();
-  vi.spyOn(workers, "workerDirectory").mockReturnValue(directory.promise);
-  const pending = tools
-    .get("sub_task")!
-    .execute(
-      "call",
-      { level: 3, prompt: "brief" },
-      new AbortController().signal,
-      () => {},
-      ctx,
-    );
-  load.mockReturnValue({ "6": "test/other:off" });
-  directory.resolve("/tmp/sessions");
-  await pending;
-  expect(fake.start).toHaveBeenCalledWith(
-    expect.objectContaining({
-      worker: expect.objectContaining({ model: "other" }),
-    }),
-  );
-});
-
-test("cancellation during runtime directory preparation never admits an orphan task", async () => {
-  const { ctx, tools } = setup();
-  vi.spyOn(models, "availableModels").mockReturnValue([
-    { provider: "test", model: "fake", thinking: ["off"] },
-  ]);
-  vi.spyOn(models, "loadLadder").mockReturnValue({
-    "6": "test/fake:off",
-  });
-  const directory = Promise.withResolvers<string>();
-  const prepare = vi
-    .spyOn(workers, "workerDirectory")
-    .mockReturnValue(directory.promise);
+  const execute = (signal: AbortSignal) =>
+    tools
+      .get("sub_task")!
+      .execute("call", { level: 3, prompt: "brief" }, signal, () => {}, ctx);
   const controller = new AbortController();
-  const pending = tools
-    .get("sub_task")!
-    .execute(
-      "call",
-      { level: 3, prompt: "brief" },
-      controller.signal,
-      () => {},
-      ctx,
-    );
-  expect(prepare).toHaveBeenCalledOnce();
   controller.abort();
-  directory.resolve("/fixture/.pi/pi-sub/sessions");
-  expect(await pending).toMatchObject({ isError: true });
+  expect(await execute(controller.signal)).toMatchObject({ isError: true });
   expect(fake.start).not.toHaveBeenCalled();
+  await execute(new AbortController().signal);
+  expect(fake.start).toHaveBeenCalledOnce();
+  load.mockReturnValue({});
+  expect(await execute(new AbortController().signal)).toMatchObject({
+    isError: true,
+  });
+  expect(fake.start).toHaveBeenCalledOnce();
 });
 
 test("extension input neither sweeps failures nor reopens admission", async () => {
@@ -627,7 +612,7 @@ test("announcing a batch is not delivery; only complete parent context messages 
   emit("context", { messages: [] });
   expect(fake.markDelivered).not.toHaveBeenCalled();
   const message = {
-    ...replyBatch([reply], cwd)!,
+    ...replyBatch([reply], workspace)!,
     role: "custom",
     timestamp: 0,
   };
@@ -776,7 +761,7 @@ test("flushes use current identities and omit accepted, stopped and superseded r
         replies: [
           expect.objectContaining({
             id: "changed",
-            response: "Successor",
+            preview: "Successor",
             reply: { id: "successor", delivered: false },
           }),
         ],
@@ -809,7 +794,7 @@ test("late file handoffs join the settlement boundary without repeated announcem
   const result = emit("agent_before_settle");
   expect(result.continue).toBe(true);
   const notification = {
-    ...replyBatch([a], cwd)!,
+    ...replyBatch([a], workspace)!,
     role: "custom" as const,
     timestamp: 0,
   };
@@ -860,6 +845,46 @@ test.each(["error", "aborted"])(
     expect(emit("turn_end", { outcome })).toBeUndefined();
     Object.assign(ctx, { signal: AbortSignal.abort() });
     expect(emit("turn_end")).toBeUndefined();
+  },
+);
+
+test.each([false, true])(
+  "workspace cleanup waits for confirmed worker closure (failure=%s)",
+  async (fails) => {
+    const { ctx, emit, tools } = setup();
+    vi.spyOn(models, "availableModels").mockReturnValue([
+      { provider: "test", model: "fake", thinking: ["off"] },
+    ]);
+    vi.spyOn(models, "loadLadder").mockReturnValue({ "6": "test/fake:off" });
+    const cleanup = vi.spyOn(Workspace.prototype, "dispose");
+    await tools
+      .get("sub_task")!
+      .execute(
+        "call",
+        { level: 3, prompt: "brief" },
+        new AbortController().signal,
+        () => {},
+        ctx,
+      );
+    let close!: () => void;
+    let reject!: (reason: Error) => void;
+    fake.dispose.mockReturnValue(
+      new Promise<void>((resolve, fail) => {
+        close = resolve;
+        reject = fail;
+      }),
+    );
+    const stopping = emit("session_shutdown");
+    expect(cleanup).not.toHaveBeenCalled();
+    if (fails) {
+      reject(new Error("Process still owned"));
+      await expect(stopping).rejects.toThrow("Process still owned");
+      expect(cleanup).not.toHaveBeenCalled();
+    } else {
+      close();
+      await stopping;
+      expect(cleanup).toHaveBeenCalledOnce();
+    }
   },
 );
 

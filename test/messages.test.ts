@@ -1,7 +1,5 @@
 import { afterEach, beforeEach, expect, test } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { Workspace } from "../src/workspace.ts";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import type { TaskView, TaskResult } from "../src/coordinator.ts";
 import {
@@ -12,14 +10,14 @@ import {
 } from "../src/messages.ts";
 import { replyBatch as buildBatch } from "../src/replies.ts";
 
-let cwd: string;
+let workspace: Workspace;
 beforeEach(() => {
-  cwd = mkdtempSync(join(tmpdir(), "pi-sub-messages-"));
+  workspace = new Workspace();
 });
 afterEach(() => {
-  rmSync(cwd, { recursive: true, force: true });
+  workspace.dispose();
 });
-const replyBatch = (tasks: TaskView[]) => buildBatch(tasks, cwd);
+const replyBatch = (tasks: TaskView[]) => buildBatch(tasks, workspace);
 import { STRENGTH_GUIDANCE } from "../src/models.ts";
 
 const task: TaskView = {
@@ -226,7 +224,7 @@ test("stopping preserves failed and already accepted outcomes rather than claimi
   expect(mixed).not.toContain("Stopped · 2 tasks");
 });
 
-test("expanded replies recover complete source payloads without repeating them", () => {
+test("expanded file replies expose a temporary reference, not an archived payload", () => {
   const response = "x".repeat(60000) + "\nEND_OF_FULL_REPLY";
   const reply = replyBatch([{ ...task, response }])!;
   expect(reply.content).not.toContain("END_OF_FULL_REPLY");
@@ -237,8 +235,9 @@ test("expanded replies recover complete source payloads without repeating them",
     true,
     200,
   ).join("\n");
-  expect(expanded).toContain("END_OF_FULL_REPLY");
-  expect(expanded.match(/END_OF_FULL_REPLY/g)).toHaveLength(1);
+  expect(expanded).not.toContain("END_OF_FULL_REPLY");
+  expect(expanded).toContain("preserve relevant findings");
+  expect(expanded).toContain(JSON.parse(reply.content).file);
   expect(expanded).toContain("native.jsonl");
 });
 

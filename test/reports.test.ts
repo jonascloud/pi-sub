@@ -1,36 +1,27 @@
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import * as fs from "node:fs";
-import {
-  mkdtempSync,
-  readFileSync,
-  readdirSync,
-  rmSync,
-  statSync,
-  writeFileSync,
-} from "node:fs";
-import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { execFileSync } from "node:child_process";
+import { dirname } from "node:path";
 import type { TaskView } from "../src/coordinator.ts";
 import {
-  handoff,
   deliveredFile,
+  handoff,
   reportDetails,
   reportResult,
+  taskMetadata,
   taskReport,
 } from "../src/reports.ts";
+import { Workspace } from "../src/workspace.ts";
 
 vi.mock("node:fs", async (original) => ({
   ...(await original<typeof import("node:fs")>()),
 }));
-
-let cwd: string;
+let workspace: Workspace;
 beforeEach(() => {
-  cwd = mkdtempSync(join(tmpdir(), "pi-sub-reports-"));
+  workspace = new Workspace();
 });
 afterEach(() => {
   vi.restoreAllMocks();
-  rmSync(cwd, { recursive: true, force: true });
+  workspace.dispose();
 });
 const task: TaskView = {
   id: "task-1",
@@ -51,26 +42,33 @@ const task: TaskView = {
 const envelope = (value: ReturnType<typeof reportResult>) =>
   JSON.parse(value.content[0]!.text);
 
-test("small handoffs stay inline without creating files or changing details", () => {
-  const result = reportResult(task, cwd);
-  expect(envelope(result)).toEqual(taskReport(task));
-  expect(result.details).toEqual(task);
-  expect(reportResult("Failure", cwd)).toEqual({
-    content: [{ type: "text", text: "Failure" }],
-    details: "Failure",
+test("inline content is the only full body; diagnostics do not require a workspace directory", () => {
+  vi.spyOn(fs, "mkdtempSync").mockImplementation(() => {
+    throw new Error("No disk");
   });
-  expect(readdirSync(cwd)).toEqual([]);
+  const value = { ...task, pendingInput: ["Unsent correction"] };
+  const result = reportResult(value, workspace);
+  expect(envelope(result)).toEqual(taskReport(value));
+  expect(reportDetails(result.details)).toEqual(taskMetadata(value));
+  expect(result.details.report).not.toHaveProperty("response");
+  expect(result.details.report).not.toHaveProperty("pendingInput");
+  expect(reportDetails(result.details, result.content[0]!.text)).toMatchObject({
+    response: value.response,
+    pendingInput: value.pendingInput,
+  });
+  expect(reportResult("Failure", workspace).details).not.toBe("Failure");
 });
 
-test("oversized UTF-8 and single-line responses retain identity, errors, pending input and complete readable text", () => {
-  for (const response of ["x".repeat(60000), "漢字🙂\n".repeat(5000)]) {
+test.each(["x".repeat(60000), "漢字🙂\n".repeat(5000)])(
+  "oversized reports are complete temporary files, not duplicated in history (%#)",
+  (response) => {
     const value = {
       ...task,
-      response,
-      error: "Partial failure",
-      pendingInput: ["Not sent\nSecond line"],
+      response: response + "END_OF_REPORT",
+      error: "error\n".repeat(3000) + "END_OF_ERROR",
+      pendingInput: ["UNSENT_INSTRUCTION"],
     };
-    const result = reportResult(value, cwd);
+    const result = reportResult(value, workspace);
     const ref = envelope(result);
     expect(ref).toMatchObject({
       id: task.id,
@@ -78,191 +76,130 @@ test("oversized UTF-8 and single-line responses retain identity, errors, pending
       outcome: "reply",
       errors: 1,
     });
-    expect(ref).not.toHaveProperty("response");
+    expect(ref.note).toContain("Temporary");
     expect(Buffer.byteLength(result.content[0]!.text)).toBeLessThanOrEqual(
       50 * 1024,
     );
-    const text = readFileSync(ref.file, "utf8");
-    expect(text).toContain("Response:\n" + response);
-    expect(text).toContain("Error:\nPartial failure");
-    expect(text).toContain("Pending input:\nNot sent\nSecond line");
-    expect(reportDetails(result.details)).toEqual(value);
-    expect(statSync(ref.file).mode & 0o777).toBe(0o600);
-    expect(statSync(dirname(ref.file)).mode & 0o777).toBe(0o700);
-    expect(readFileSync(join(dirname(ref.file), ".gitignore"), "utf8")).toBe(
-      "*\n",
-    );
-  }
-});
+    const text = fs.readFileSync(ref.file, "utf8");
+    for (const body of [value.response, value.error, ...value.pendingInput])
+      expect(text).toContain(body);
+    const stored = JSON.stringify(result.details);
+    for (const marker of [
+      "END_OF_REPORT",
+      "END_OF_ERROR",
+      "UNSENT_INSTRUCTION",
+    ])
+      expect(stored).not.toContain(marker);
+    expect(stored.length).toBeLessThan(2000);
+    expect(fs.statSync(ref.file).mode & 0o777).toBe(0o600);
+    expect(fs.statSync(dirname(ref.file)).mode & 0o777).toBe(0o700);
+    expect(deliveredFile(result.details, result.content[0]!.text)).toBe(true);
+    expect(deliveredFile(result.details, "Partial reference")).toBe(false);
+  },
+);
 
-test("large batches use one bounded reference, including all tasks and errors in the file", () => {
+test("large batches use one bounded reference", () => {
   const tasks = Array.from({ length: 600 }, (_, i) => ({
     ...task,
     id: `task-${i}`,
-    response: "Report " + i,
     description: "d".repeat(200),
-    sessionFile: "/ignored/" + "p".repeat(200),
-    ...(i === 599 ? { outcome: "error" as const, error: "Final failure" } : {}),
   }));
-  const result = reportResult(tasks, cwd);
+  const result = reportResult(tasks, workspace);
   const ref = envelope(result);
-  expect(ref).toMatchObject({ count: 600, errors: 1 });
+  expect(ref).toMatchObject({ count: 600, errors: 0 });
   expect(Buffer.byteLength(result.content[0]!.text)).toBeLessThanOrEqual(
     50 * 1024,
   );
-  const text = readFileSync(ref.file, "utf8");
+  const text = fs.readFileSync(ref.file, "utf8");
   for (const task of tasks) expect(text).toContain(`"id": "${task.id}"`);
-  expect(text).toContain("Final failure");
-  expect(
-    readdirSync(dirname(ref.file)).filter((name) => name.endsWith(".txt")),
-  ).toHaveLength(1);
 });
 
-test("report paths are reused and earlier reports survive follow-up", () => {
+test("reports survive follow-up within the runtime and are removed with journals at disposal", () => {
   const value = { ...task, response: "Saved answer\n".repeat(6000) };
-  const first = envelope(reportResult(value, cwd));
-  const original = readFileSync(first.file, "utf8");
+  const first = envelope(reportResult(value, workspace));
   const again = envelope(
     reportResult(
       { ...value, reply: { ...value.reply!, delivered: true } },
-      cwd,
+      workspace,
     ),
   );
   expect(again.file).toBe(first.file);
   const next = envelope(
-    reportResult(
-      {
-        ...value,
-        response: value.response + "More",
-        reply: { id: "reply-2", delivered: false },
-      },
-      cwd,
-    ),
+    reportResult({ ...value, response: value.response + "More" }, workspace),
   );
   expect(next.file).not.toBe(first.file);
-  expect(readFileSync(first.file, "utf8")).toBe(original);
-  execFileSync("git", ["init", "-q", cwd]);
-  expect(
-    execFileSync("git", ["-C", cwd, "check-ignore", first.file], {
-      encoding: "utf8",
-    }).trim(),
-  ).toBe(first.file);
+  expect(fs.readFileSync(first.file, "utf8")).toContain(value.response);
+  const sessions = workspace.sessions;
+  fs.writeFileSync(sessions + "/journal.jsonl", "history");
+  const root = dirname(sessions);
+  workspace.dispose();
+  expect(fs.existsSync(root)).toBe(false);
+  expect(fs.existsSync(first.file)).toBe(false);
+  expect(() => workspace.saveReport("later")).toThrow("closed");
+  expect(() => workspace.sessions).toThrow("closed");
 });
 
-test("storage failures preserve task state and full details without claiming delivery", () => {
+test("workspaces do not share report ownership", () => {
+  const other = new Workspace();
+  try {
+    const first = workspace.saveReport("same report");
+    const second = other.saveReport("same report");
+    expect(second).not.toBe(first);
+    workspace.dispose();
+    expect(fs.readFileSync(second, "utf8")).toBe("same report");
+  } finally {
+    other.dispose();
+  }
+});
+
+test("cached reports need no further writes", () => {
   const value = { ...task, response: "x".repeat(60000) };
-  writeFileSync(join(cwd, ".pi"), "not a directory");
-  const failed = reportResult(value, cwd);
+  const first = reportResult(value, workspace);
+  const writes = ["mkdirSync", "openSync", "writeFileSync"] as const;
+  for (const method of writes)
+    vi.spyOn(fs, method).mockImplementation(() => {
+      throw new Error("ENOSPC");
+    });
+  expect(reportResult(value, workspace)).toEqual(first);
+  for (const method of writes) expect(fs[method]).not.toHaveBeenCalled();
+});
+
+test("failed writes do not yield references or cache partial data; receipts remain the source for retry", () => {
+  const value = { ...task, response: "Complete evidence\n".repeat(6000) };
+  const write = fs.writeFileSync;
+  let partial = "";
+  const open = fs.openSync;
+  vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => {
+    partial = String(file);
+    return open(file, flags, mode);
+  });
+  vi.spyOn(fs, "writeFileSync").mockImplementation((file) => {
+    write(file, "Partial");
+    throw new Error("ENOSPC: no space left on device");
+  });
+  const failed = reportResult(value, workspace);
   expect(failed.isError).toBe(true);
   expect(envelope(failed)).toMatchObject({
     id: value.id,
     status: "ready",
-    reportError: expect.any(String),
+    reportError: expect.stringContaining("ENOSPC"),
   });
   expect(envelope(failed)).not.toHaveProperty("file");
-  expect(reportDetails(failed.details)).toEqual(value);
+  expect(failed.details.report).not.toHaveProperty("response");
   expect(deliveredFile(failed.details, failed.content[0]!.text)).toBe(false);
-  expect(() => handoff("x".repeat(60000), value, cwd)).toThrow();
-});
-
-test("existing ignore rules are preserved rather than policed", () => {
-  const value = { ...task, response: "x".repeat(60000) };
-  const ref = envelope(reportResult(value, cwd));
-  const ignore = join(dirname(ref.file), ".gitignore");
-  const rules = "# Local reports\n*\n";
-  writeFileSync(ignore, rules);
-  const next = reportResult(
-    { ...value, response: value.response + "More" },
-    cwd,
-  );
-  expect(next.isError).not.toBe(true);
-  expect(readFileSync(envelope(next).file, "utf8")).toContain(
-    value.response + "More",
-  );
-  expect(readFileSync(ignore, "utf8")).toBe(rules);
-});
-
-test("identical reports need no new writes, even when storage is full or read-only", () => {
-  const value = { ...task, response: "x".repeat(60000) };
-  const first = reportResult(value, cwd);
-  const writes = ["mkdirSync", "openSync", "writeFileSync"] as const;
-  for (const method of writes)
-    vi.spyOn(fs, method).mockImplementation(() => {
-      throw Object.assign(new Error("ENOSPC"), { code: "ENOSPC" });
-    });
-  expect(reportResult(value, cwd)).toEqual(first);
-  for (const method of writes) expect(fs[method]).not.toHaveBeenCalled();
-  expect(readFileSync(envelope(first).file, "utf8")).toContain(value.response);
-});
-
-test("failed writes are not cached or returned; a retry writes the complete report", () => {
-  const value = { ...task, response: "Complete evidence\n".repeat(6000) };
-  const write = fs.writeFileSync;
-  vi.spyOn(fs, "writeFileSync").mockImplementation((file, data, options) => {
-    if (typeof file === "number") {
-      write(file, "Partial");
-      throw new Error("ENOSPC: no space left on device");
-    }
-    write(file, data, options);
-  });
-  const failed = reportResult(value, cwd);
-  expect(failed.isError).toBe(true);
-  expect(envelope(failed)).not.toHaveProperty("file");
-  expect(readdirSync(join(cwd, ".pi/pi-sub/reports"))).toEqual([".gitignore"]);
+  expect(fs.existsSync(partial)).toBe(false);
   vi.restoreAllMocks();
-  const retry = reportResult(value, cwd);
-  expect(retry.isError).not.toBe(true);
-  expect(readFileSync(envelope(retry).file, "utf8")).toContain(value.response);
-});
-
-test("publication failures retain bounded confirmed state and full diagnostics, not a false handoff", () => {
-  const {
-    status: _status,
-    activity: _activity,
-    reply: _reply,
-    ...receipt
-  } = task;
-  const value = {
-    ...receipt,
-    outcome: "reply" as const,
-    response: "x".repeat(60000),
-  };
-  const reportError = "ENOSPC: no space left on device";
-  vi.spyOn(fs, "openSync").mockImplementation(() => {
-    throw new Error(reportError);
-  });
-  const result = reportResult(value, cwd);
-  expect(result.isError).toBe(true);
-  expect(envelope(result)).toMatchObject({
-    id: value.id,
-    archived: true,
-    outcome: "reply",
-    reportError,
-  });
-  expect(envelope(result)).not.toHaveProperty("file");
-  expect(result.details).toEqual({ report: value, reportError });
-  expect(Buffer.byteLength(result.content[0]!.text)).toBeLessThanOrEqual(
-    50 * 1024,
-  );
-  const batch = reportResult(
-    Array.from({ length: 600 }, (_, i) => ({ ...value, id: `task-${i}` })),
-    cwd,
-  );
-  expect(envelope(batch)).toMatchObject({
-    count: 600,
-    archived: 600,
-    errors: 0,
-  });
-  expect(Buffer.byteLength(batch.content[0]!.text)).toBeLessThanOrEqual(
-    50 * 1024,
+  const retry = reportResult(value, workspace);
+  expect(fs.readFileSync(envelope(retry).file, "utf8")).toContain(
+    value.response,
   );
 });
 
-test("limits cover actual UTF-8 bytes, line counts and the final reference", () => {
-  expect(handoff("x".repeat(51200), "full", cwd).file).toBeUndefined();
-  expect(handoff("x".repeat(51201), "full", cwd).file).toBeDefined();
-  expect(handoff("a\n".repeat(2000), "full", cwd).file).toBeDefined();
+test("handoff limits cover bytes, lines and the complete reference", () => {
+  expect(handoff("x".repeat(51200), "full", workspace).file).toBeUndefined();
+  expect(handoff("x".repeat(51201), "full", workspace).file).toBeDefined();
+  expect(handoff("a\n".repeat(2000), "full", workspace).file).toBeDefined();
   expect(() =>
-    handoff("x".repeat(1000), "full", cwd, { maxBytes: 10, maxLines: 1 }),
+    handoff("x".repeat(1000), "full", workspace, { maxBytes: 10, maxLines: 1 }),
   ).toThrow("reference exceeds");
 });

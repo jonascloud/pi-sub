@@ -10,6 +10,7 @@ import type {
 
 const options: WorkerOptions = {
   cwd: "/",
+  sessionDir: "/sessions",
   provider: "p",
   model: "m",
   thinking: "off",

@@ -5,7 +5,14 @@ import {
 } from "@earendil-works/pi-tui";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { TaskView } from "./coordinator.ts";
-import { deliveredFile, handoff, reportDetails } from "./reports.ts";
+import {
+  deliveredFile,
+  digest,
+  handoff,
+  reportDetails,
+  taskMetadata,
+} from "./reports.ts";
+import type { Workspace } from "./workspace.ts";
 
 const record = (value: unknown): Record<string, unknown> | undefined =>
   value !== null && typeof value === "object" && !Array.isArray(value)
@@ -22,7 +29,7 @@ export function pendingReplyBatch(
     "getBranch" | "buildSessionProjection"
   >,
   messages: readonly AgentMessage[] | undefined,
-  cwd: string,
+  workspace: Workspace,
 ) {
   const replies = [...tasks]
     .reverse()
@@ -45,7 +52,7 @@ export function pendingReplyBatch(
   }
   return replyBatch(
     replies.filter((task) => !covered.has(task.reply!.id)),
-    cwd,
+    workspace,
   );
 }
 
@@ -61,14 +68,21 @@ export function replyText(
 }
 
 /** One bounded message: complete text or one saved file for the entire batch. */
-export function replyBatch(tasks: readonly TaskView[], cwd: string) {
+export function replyBatch(tasks: readonly TaskView[], workspace: Workspace) {
   if (!tasks.length) return;
-  const delivery = handoff(tasks.map(replyText).join("\n\n"), [...tasks], cwd, {
+  const texts = tasks.map(
+    (task, index) => (index ? "\n\n" : "") + replyText(task),
+  );
+  const delivery = handoff(texts.join(""), [...tasks], workspace, {
     maxBytes: 24000,
     maxLines: 300,
   });
-  const replies = tasks.map((task) => ({
-    ...structuredClone(task),
+  const replies = tasks.map((task, index) => ({
+    ...taskMetadata(task),
+    delivery: {
+      length: texts[index]!.length,
+      digest: digest(texts[index]!),
+    },
     preview: truncateToWidth(
       stripTerminalSequences(task.error ?? task.response)
         .split(/\r?\n/)
@@ -80,7 +94,12 @@ export function replyBatch(tasks: readonly TaskView[], cwd: string) {
     customType: "pi-sub:response",
     display: true,
     content: delivery.content,
-    details: { replies, ...(delivery.file ? { handoff: delivery } : {}) },
+    details: {
+      replies,
+      ...(delivery.file
+        ? { handoff: { file: delivery.file, digest: digest(delivery.content) } }
+        : {}),
+    },
   };
 }
 
@@ -103,10 +122,10 @@ export function replyReports(details: unknown) {
       (
         item,
       ): item is Record<string, unknown> &
-        Pick<TaskView, "id" | "description" | "response" | "error"> =>
+        Pick<TaskView, "id" | "description"> &
+        Partial<Pick<TaskView, "response" | "error">> =>
         typeof item?.id === "string" &&
         typeof item.description === "string" &&
-        typeof item.response === "string" &&
         (item.error === undefined || typeof item.error === "string"),
     );
 }
@@ -139,9 +158,19 @@ export function deliveredReplies(message: AgentMessage): ReplyReference[] {
     // Compare exact segments: an answer may itself quote another report.
     let offset = 0;
     return replyReports(message.details).flatMap((data, index) => {
-      const segment = (index ? "\n\n" : "") + replyText(data);
-      const complete = text.startsWith(segment, offset);
-      offset += segment.length;
+      const delivery = record(data.delivery);
+      const segment =
+        typeof data.response === "string"
+          ? (index ? "\n\n" : "") +
+            replyText({ ...data, response: data.response })
+          : "";
+      const length =
+        typeof delivery?.length === "number" ? delivery.length : segment.length;
+      const complete = delivery
+        ? typeof delivery.digest === "string" &&
+          digest(text.slice(offset, offset + length)) === delivery.digest
+        : !!segment && text.startsWith(segment, offset);
+      offset += length;
       const ref = replyReference(data);
       return complete && ref ? [ref] : [];
     });
@@ -179,8 +208,13 @@ export function deliveredReplies(message: AgentMessage): ReplyReference[] {
       const data = record(value);
       // Match the actual answer, not serialization whitespace or extra metadata.
       return typeof data?.response === "string" &&
-        data.response === original?.response &&
-        data.error === original?.error
+        (original?.responseHash
+          ? digest(data.response) === original.responseHash &&
+            (typeof data.error === "string"
+              ? digest(data.error)
+              : undefined) === original.errorHash
+          : data.response === original?.response &&
+            data.error === original?.error)
         ? [ref]
         : [];
     });
