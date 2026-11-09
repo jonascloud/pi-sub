@@ -1,10 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
   closeSync,
-  linkSync,
   mkdirSync,
   openSync,
-  readFileSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -53,61 +51,40 @@ function reportText(value: Reports): string {
     .join("\n\n---\n\n");
 }
 
-/** Synchronous publication keeps native delivery boundaries free of stale async snapshots.
- * Files are private, content-addressed and atomically published without replacement.
- */
-function publish(cwd: string, text: string): string {
+/** Reuse only this process's successful writes; files are not a shared cache. */
+const savedReports = new Map<string, string>();
+function saveReport(cwd: string, text: string): string {
   const directory = resolve(cwd, ".pi/pi-sub/reports");
-  const ignore = resolve(directory, ".gitignore");
-  const checkIgnore = () => {
-    if (readFileSync(ignore, "utf8") !== "*\n")
-      throw new Error(`Report directory must remain ignored: ${ignore}`);
-  };
+  const key = resolve(
+    directory,
+    createHash("sha256").update(text).digest("hex"),
+  );
+  const saved = savedReports.get(key);
+  if (saved) return saved;
+
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
   try {
-    checkIgnore();
+    writeFileSync(resolve(directory, ".gitignore"), "*\n", {
+      flag: "wx",
+      mode: 0o600,
+    });
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    mkdirSync(directory, { recursive: true, mode: 0o700 });
-    try {
-      writeFileSync(ignore, "*\n", { flag: "wx", mode: 0o600 });
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      checkIgnore();
-    }
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    // Existing ignore rules belong to the operator.
   }
-  const bytes = Buffer.from(text, "utf8");
-  const digest = createHash("sha256").update(bytes).digest("hex");
-  const file = resolve(directory, `${digest}.txt`);
-  const stored = () => {
-    let contents: Buffer;
-    try {
-      contents = readFileSync(file);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
-      throw error;
-    }
-    if (!contents.equals(bytes))
-      throw new Error(`Stored report has changed: ${file}`);
-    return true;
-  };
-  if (stored()) return file;
-  const temporary = resolve(directory, `.${randomUUID()}.tmp`);
-  const fd = openSync(temporary, "wx", 0o600);
+  const file = resolve(directory, `${randomUUID()}.txt`);
+  const fd = openSync(file, "wx", 0o600);
   try {
     try {
-      writeFileSync(fd, bytes);
+      writeFileSync(fd, text, "utf8");
     } finally {
       closeSync(fd);
     }
-    try {
-      linkSync(temporary, file);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      if (!stored()) throw error;
-    }
-  } finally {
-    unlinkSync(temporary);
+  } catch (error) {
+    unlinkSync(file);
+    throw error;
   }
+  savedReports.set(key, file);
   return file;
 }
 
@@ -122,7 +99,7 @@ export function handoff(
     Buffer.byteLength(text, "utf8") <= limits.maxBytes &&
     text.split("\n").length <= limits.maxLines;
   if (fits(content)) return { content };
-  const file = publish(cwd, reportText(value));
+  const file = saveReport(cwd, reportText(value));
   const envelope = JSON.stringify({
     ...reportState(value),
     file,
@@ -133,7 +110,7 @@ export function handoff(
   return { content: envelope, file };
 }
 
-/** Report publication cannot roll back task operations; expose their confirmed state. */
+/** Storage errors must preserve the operation's confirmed task state. */
 function reportState(value: Reports) {
   const tasks =
     typeof value === "string" ? [] : Array.isArray(value) ? value : [value];
@@ -183,7 +160,7 @@ export function reportResult(value: Reports, cwd: string) {
       reportError,
       note:
         typeof value === "string"
-          ? "Report publication failed. Full error retained in native details."
+          ? "Report storage failed. Full error retained in native details."
           : "Task state above is confirmed; reporting failed, not the operation. Full report retained in native details. Retry sub_result after fixing report storage.",
     };
     // Keep the fallback bounded even if a diagnostic contains an oversized path.
@@ -191,7 +168,7 @@ export function reportResult(value: Reports, cwd: string) {
       Buffer.byteLength(JSON.stringify(failure), "utf8") > TOOL_LIMITS.maxBytes
     )
       failure.reportError =
-        "Report publication failed; full error in native details.";
+        "Report storage failed; full error in native details.";
     return {
       content: [{ type: "text" as const, text: JSON.stringify(failure) }],
       details: { report: value, reportError },
@@ -233,7 +210,7 @@ export function reportDetails(details: unknown): unknown {
     : details;
 }
 
-/** Delivery proves the exact published reference was in context, not that its file was read. */
+/** Delivery proves the exact saved-file reference was in context, not that its file was read. */
 export function deliveredFile(details: unknown, content: string): boolean {
   return artifact(details)?.content === content;
 }

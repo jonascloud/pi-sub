@@ -4,7 +4,6 @@ import {
   Text,
   truncateToWidth,
 } from "@earendil-works/pi-tui";
-import type { TaskResult } from "./coordinator.ts";
 import { replyReports, replyText } from "./replies.ts";
 import { STRENGTH_GUIDANCE } from "./models.ts";
 import { reportDetails, reportFailure } from "./reports.ts";
@@ -176,6 +175,18 @@ function reports(message: Message): Record<string, unknown>[] {
     : [];
 }
 
+function reportWarning(message: Message) {
+  const error = reportFailure(message.details);
+  return error === undefined
+    ? []
+    : [
+        {
+          text: `Report unavailable: ${preview(error, 240)}`,
+          style: "error" as const,
+        },
+      ];
+}
+
 /** Every failed task gets a cause line, never hidden behind partial work. */
 export const renderFailures: MessageRenderer = (message, options, theme) => {
   if (options.expanded) return fullDelivery(message, options);
@@ -188,13 +199,16 @@ export const renderFailures: MessageRenderer = (message, options, theme) => {
     );
   }
   return compact(
-    tasks.flatMap((task) => [
-      { text: `Failed · ${identity(task)}`, style: "title" as const },
-      {
-        text: preview(task.error, 240) || "Execution failed",
-        style: "error" as const,
-      },
-    ]),
+    [
+      ...tasks.flatMap((task) => [
+        { text: `Failed · ${identity(task)}`, style: "title" as const },
+        {
+          text: preview(task.error, 240) || "Execution failed",
+          style: "error" as const,
+        },
+      ]),
+      ...reportWarning(message),
+    ],
     options,
     theme,
   );
@@ -213,7 +227,6 @@ export const renderStopped: MessageRenderer = (message, options, theme) => {
           ? "Stopped"
           : "Result";
   const allStopped = tasks.every((task) => task.outcome === "stopped");
-  const publicationError = reportFailure(message.details);
   return compact(
     [
       ...(tasks.length
@@ -242,28 +255,9 @@ export const renderStopped: MessageRenderer = (message, options, theme) => {
               style: "title" as const,
             },
           ]),
-      ...(publicationError === undefined
-        ? []
-        : [
-            {
-              text: `Report unavailable: ${preview(publicationError, 240)}`,
-              style: "error" as const,
-            },
-          ]),
+      ...reportWarning(message),
     ],
     options,
     theme,
   );
 };
-
-export function failureSummary(failures: readonly TaskResult[]): string {
-  const lines = failures.map((report) => {
-    const identity = `${report.description} (${report.id}): ${report.error ?? "execution failed"}`;
-    const partial = report.response ? `\nPartial: ${report.response}` : "";
-    const pending = report.pendingInput?.length
-      ? `\nPending: ${report.pendingInput.join("\n")}`
-      : "";
-    return stripTerminalSequences(identity + partial + pending);
-  });
-  return `Collected failures:\n${lines.join("\n")}`;
-}

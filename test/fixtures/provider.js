@@ -18,7 +18,15 @@ function reply(context) {
     process.env.PI_SUB_CHILD === "1" &&
     text === "integration:child-error"
   )
-    return { error: "fatal synthetic failure" };
+    return {
+      error:
+        "fatal synthetic failure" +
+        (process.env.WORKER_TEST_LARGE_CHILD
+          ? "\n" +
+            "Failure evidence 漢字\n".repeat(4000) +
+            "END_OF_FAILURE_REPORT"
+          : ""),
+    };
   if (process.env.WORKER_TEST_INTEGRATION && process.env.PI_SUB_CHILD !== "1") {
     const results = messages
       .slice(index + 1)

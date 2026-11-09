@@ -27,13 +27,12 @@ import { taskToolRenderers } from "./src/tool-view.ts";
 import { mountWidget } from "./src/widget.ts";
 import {
   SUBAGENT_GUIDANCE,
-  failureSummary,
   renderReply,
   renderFailures,
   renderStopped,
 } from "./src/messages.ts";
 import { pendingReplyBatch, deliveredReplies } from "./src/replies.ts";
-import { handoff, reportResult, type Reports } from "./src/reports.ts";
+import { reportResult, type Reports } from "./src/reports.ts";
 
 const reason = (error: unknown) =>
   error instanceof Error ? error.message : String(error);
@@ -147,19 +146,13 @@ export default function piSub(pi: ExtensionAPI): void {
   const preparePrompt = async () => {
     const prepared = await manager().prompt((failures: TaskResult[]) => {
       if (!failures.length) return;
-      const delivery = handoff(
-        failureSummary(failures),
-        failures,
-        context!.cwd,
-      );
+      const result = reportResult(failures, context!.cwd);
       pi.sendMessage(
         {
           customType: "pi-sub:failures",
           display: true,
-          content: delivery.content,
-          details: delivery.file
-            ? { report: failures, handoff: delivery }
-            : failures,
+          content: result.content[0]!.text,
+          details: result.details,
         },
         { triggerTurn: false },
       );

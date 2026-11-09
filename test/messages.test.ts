@@ -6,7 +6,6 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 import type { TaskView, TaskResult } from "../src/coordinator.ts";
 import {
   SUBAGENT_GUIDANCE,
-  failureSummary,
   renderReply,
   renderFailures,
   renderStopped,
@@ -98,20 +97,7 @@ test("TUI notifications are two-line previews with expandable complete delivery"
       expect(visibleWidth(line)).toBeLessThanOrEqual(width);
 });
 
-test("failure reports retain partial work and pending input without a cleanup tutorial", () => {
-  const { status: _status, activity: _activity, ...data } = task;
-  const report: TaskResult = {
-    ...data,
-    outcome: "error",
-    error: "Worker exited",
-    pendingInput: ["Unsent correction"],
-  };
-  const text = failureSummary([report]);
-  expect(text).toContain("Collected failures:");
-  expect(text).toContain("Review changes (task-1): Worker exited");
-  expect(text).toContain("Partial: Question?");
-  expect(text).toContain("Pending: Unsent correction");
-  expect(text).not.toContain("cleanup tool");
+test("operating guidance avoids routine acknowledgements and duplicate workload anchors", () => {
   expect(SUBAGENT_GUIDANCE).toContain("Reports need no acknowledgement");
   expect(SUBAGENT_GUIDANCE.split(STRENGTH_GUIDANCE)).toHaveLength(2);
 });
@@ -155,7 +141,7 @@ test("failed tasks expose every cause without expanding partial work or metadata
       error: "Permission denied",
     },
   ];
-  const content = failureSummary(failures);
+  const content = JSON.stringify(failures);
   const collapsed = draw(renderFailures, content, failures).join("\n");
   expect(collapsed).toContain("Failed · Review changes");
   expect(collapsed).not.toContain("task-1");
@@ -176,6 +162,16 @@ test("failed tasks expose every cause without expanding partial work or metadata
   expect(draw(renderFailures, "failure", [{ id: "x" }]).join("\n")).toContain(
     "Execution failed",
   );
+});
+
+test("failure notices expose both execution and report-storage errors", () => {
+  const details = { report: [failure], reportError: "ENOSPC: no space left" };
+  const text = draw(renderFailures, "Report unavailable", details).join("\n");
+  expect(text).toContain("Worker exited before delivery");
+  expect(text).toContain("Report unavailable: ENOSPC");
+  expect(
+    draw(renderFailures, "Report unavailable", details, true).join("\n"),
+  ).toContain("Unsent correction");
 });
 
 test("stop acknowledgements summarize task identities", () => {
@@ -290,7 +286,7 @@ test("all views respect width and output padding, collapsed and expanded", () =>
         ],
       },
     ],
-    [renderFailures, failureSummary([failure]), [failure]],
+    [renderFailures, JSON.stringify([failure]), [failure]],
     [renderStopped, JSON.stringify([failure]), [failure]],
   ];
   for (const [renderer, content, details] of cases)

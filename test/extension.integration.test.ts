@@ -583,69 +583,115 @@ test("two working directories share the profile ladder without project overrides
   }
 }, 60000);
 
-test("a real user prompt collects a final failure without a model cleanup call", async () => {
-  const { client, dispose } = await host();
-  const failed = nextEvent(client, (event) => {
-    const ui = event as unknown as {
-      type: string;
-      method?: string;
-      message?: string;
-    };
-    return (
-      ui.type === "extension_ui_request" &&
-      ui.method === "notify" &&
-      !!ui.message?.includes("fatal synthetic failure")
+test.each([false, true])(
+  "user input collects failures without a cleanup call, even with broken report storage (%s)",
+  async (brokenStorage) => {
+    const { client, cwd, dispose } = await host(
+      brokenStorage ? { WORKER_TEST_LARGE_CHILD: "1" } : {},
     );
-  });
-  try {
-    await client.promptAndWait("integration:failure", undefined, 20000);
-    await failed.promise;
-    const before = await client.getMessages();
-    const count = before.filter(
-      (message) => message.role === "toolResult",
-    ).length;
-    expect((await client.getState()).isStreaming).toBe(false);
-    await client.promptAndWait("integration:failure-cleanup", undefined, 20000);
-    const after = await client.getMessages();
-    expect(
-      after.filter((message) => message.role === "toolResult"),
-    ).toHaveLength(count);
-    const notice = after.find(
-      (message) =>
-        message.role === "custom" && message.customType === "pi-sub:failures",
-    );
-    if (!notice || notice.role !== "custom")
-      throw new Error("Failure was not transferred into native parent history");
-    expect(notice.details).toEqual([
-      expect.objectContaining({
-        outcome: "error",
-        error: "fatal synthetic failure",
-        sessionFile: expect.stringMatching(/\.jsonl$/),
-      }),
-    ]);
-    const pending = await client.getSessionStats();
-    expect(pending.cost).toBe(pending.assistantMessages * 10); // failure usage awaits a tool result
-    await client.promptAndWait("integration:failure-receipt", undefined, 20000);
-    expect(await latestResult(client)).toMatchObject({
-      outcome: "error",
-      error: "fatal synthetic failure",
+    const failed = nextEvent(client, (event) => {
+      const ui = event as unknown as {
+        type: string;
+        method?: string;
+        message?: string;
+      };
+      return (
+        ui.type === "extension_ui_request" &&
+        ui.method === "notify" &&
+        !!ui.message?.includes("fatal synthetic failure")
+      );
     });
-    const delivered = await client.getSessionStats();
-    expect(delivered.cost).toBe(delivered.assistantMessages * 10 + 10);
-    await client.promptAndWait("integration:failure-receipt", undefined, 20000);
-    const repeated = await client.getSessionStats();
-    expect(repeated.cost).toBe(repeated.assistantMessages * 10 + 10);
-    expect(
-      (await client.getMessages()).filter(
+    try {
+      await client.promptAndWait("integration:failure", undefined, 20000);
+      await failed.promise;
+      const before = await client.getMessages();
+      const count = before.filter(
+        (message) => message.role === "toolResult",
+      ).length;
+      expect((await client.getState()).isStreaming).toBe(false);
+      const storage = join(cwd, ".pi/pi-sub/reports");
+      if (brokenStorage) await writeFile(storage, "not a directory");
+      await client.promptAndWait(
+        "integration:failure-cleanup",
+        undefined,
+        20000,
+      );
+      const after = await client.getMessages();
+      expect(
+        after.filter((message) => message.role === "toolResult"),
+      ).toHaveLength(count);
+      const notice = after.find(
         (message) =>
           message.role === "custom" && message.customType === "pi-sub:failures",
-      ),
-    ).toHaveLength(1);
-  } finally {
-    failed.dispose();
-    await dispose();
-  }
-}, 60000);
+      );
+      if (!notice || notice.role !== "custom")
+        throw new Error(
+          "Failure was not transferred into native parent history",
+        );
+      const reports = reportDetails(notice.details) as TaskResult[];
+      expect(reports).toEqual([
+        expect.objectContaining({
+          outcome: "error",
+          error: expect.stringContaining("fatal synthetic failure"),
+          sessionFile: expect.stringMatching(/\.jsonl$/),
+        }),
+      ]);
+      expect(
+        after.some(
+          (message) =>
+            message.role === "user" &&
+            JSON.stringify(message.content).includes(
+              "integration:failure-cleanup",
+            ),
+        ),
+      ).toBe(true);
+      expect(after.at(-1)?.role).toBe("assistant");
+      if (brokenStorage) {
+        expect(JSON.parse(String(notice.content))).toMatchObject({
+          id: reports[0]!.id,
+          archived: true,
+          reportError: expect.any(String),
+        });
+        expect(reports[0]!.error).toContain("END_OF_FAILURE_REPORT");
+        await rm(storage);
+      }
+      const pending = await client.getSessionStats();
+      expect(pending.cost).toBe(pending.assistantMessages * 10); // failure usage awaits a tool result
+      await client.promptAndWait(
+        "integration:failure-receipt",
+        undefined,
+        20000,
+      );
+      const receipt = await latestResult(client);
+      expect(receipt).toMatchObject({
+        id: reports[0]!.id,
+        outcome: "error",
+        error: reports[0]!.error,
+      });
+      expect(receipt).not.toHaveProperty("status");
+      const delivered = await client.getSessionStats();
+      expect(delivered.cost).toBe(delivered.assistantMessages * 10 + 10);
+      await client.promptAndWait(
+        "integration:failure-receipt",
+        undefined,
+        20000,
+      );
+      const repeated = await client.getSessionStats();
+      expect(repeated.cost).toBe(repeated.assistantMessages * 10 + 10);
+      expect(
+        (await client.getMessages()).filter(
+          (message) =>
+            message.role === "custom" &&
+            message.customType === "pi-sub:failures",
+        ),
+      ).toHaveLength(1);
+    } finally {
+      failed.dispose();
+      await dispose();
+    }
+  },
+  60000,
+);
 
 test("RPC abort during native retry backoff interrupts the children", async () => {
   const { client, marker, dispose } = await host({

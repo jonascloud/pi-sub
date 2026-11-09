@@ -310,15 +310,15 @@ test.each(["interactive", "rpc"])(
       expect.objectContaining({
         customType: "pi-sub:failures",
         details: [failure],
-        content: expect.stringContaining("Collected failures:"),
+        content: JSON.stringify([taskReport(failure)]),
       }),
       { triggerTurn: false },
     );
   },
 );
 
-test("failure-report publication errors block input forwarding and allow a later complete retry", async () => {
-  const { emit, sendMessage, notify } = setup();
+test("report-storage errors preserve failed work in history without blocking user input", async () => {
+  const { emit, sendMessage } = setup();
   const report = {
     ...failure,
     response: "Partial work\n".repeat(6000),
@@ -329,21 +329,17 @@ test("failure-report publication errors block input forwarding and allow a later
     return true;
   });
   writeFileSync(join(cwd, ".pi"), "not a directory");
-  expect(await emit("input", { source: "rpc", text: "next" })).toEqual({
-    action: "handled",
-  });
-  expect(sendMessage).not.toHaveBeenCalled();
-  expect(notify).toHaveBeenCalledWith(
-    expect.stringContaining("Could not prepare user input"),
-    "error",
-  );
-  rmSync(join(cwd, ".pi"));
-  expect(await emit("input", { source: "rpc", text: "next" })).toBeUndefined();
+  expect(
+    await emit("input", { source: "rpc", text: "fix report storage" }),
+  ).toBeUndefined();
   const message = sendMessage.mock.calls[0]![0];
-  const full = readFileSync(JSON.parse(message.content).file, "utf8");
-  expect(full).toContain(report.response);
-  expect(full).toContain("Unsent correction");
-  expect(full).toContain(report.error);
+  expect(JSON.parse(message.content)).toMatchObject({
+    id: report.id,
+    archived: true,
+    outcome: "error",
+    reportError: expect.any(String),
+  });
+  expect(JSON.parse(message.content)).not.toHaveProperty("file");
   expect(reportDetails(message.details)).toEqual([report]);
 });
 

@@ -60,7 +60,7 @@ export function replyText(
   return `Subagent ${task.id} (${description})\n${response}`;
 }
 
-/** One bounded message: complete text or one immutable file for the entire batch. */
+/** One bounded message: complete text or one saved file for the entire batch. */
 export function replyBatch(tasks: readonly TaskView[], cwd: string) {
   if (!tasks.length) return;
   const delivery = handoff(tasks.map(replyText).join("\n\n"), [...tasks], cwd, {
