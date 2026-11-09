@@ -8,7 +8,7 @@ A complete handoff is either the report text or a reference to its fully publish
 
 Never truncate serialized task reports. Bound the entire model-facing envelope, including metadata and file references. An oversized batch uses one file rather than an unbounded list of paths or additional notification turns. Preserve response text, errors and pending input in readable UTF-8, with full original diagnostics in native message details.
 
-Keep artifacts private and ignored alongside project session data. Publish before returning a reference, never overwrite an earlier artifact, and fail explicitly if publication fails. Identical reports can reuse the same content-addressed file. Do not remove artifacts when tasks close or sessions stop: persisted parent history still refers to them.
+Keep artifacts private and ignored alongside project session data. Publish before returning a reference, never overwrite an earlier artifact, and fail explicitly if publication fails. Verify and reuse identical reports without new writes. A publication failure after a task operation must retain the full report in native details and expose the confirmed task state, including prior removal; it is not a rollback or complete delivery. Notifications and automatic failure cleanup still require complete handoffs. Do not remove artifacts when tasks close or sessions stop: persisted parent history still refers to them.
 
 ## Rationale and consequences
 

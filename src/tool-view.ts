@@ -6,7 +6,7 @@ import {
   type Component,
 } from "@earendil-works/pi-tui";
 import type { TaskResult, TaskView } from "./coordinator.ts";
-import { reportDetails } from "./reports.ts";
+import { reportDetails, reportFailure } from "./reports.ts";
 
 type Tool = "sub_task" | "sub_message" | "sub_result" | "sub_control";
 type Args = {
@@ -334,14 +334,23 @@ export function taskToolRenderers(tool: Tool): ToolRenderers {
       const args = (context.args ?? {}) as Args;
       const raw = textContent(result.content);
       const details = reportDetails(result.details);
+      const publicationError = reportFailure(result.details);
       const view = summary(
         tool,
         args,
         details,
         raw,
-        context.isError,
+        context.isError &&
+          (publicationError === undefined || typeof details === "string"),
         isPartial,
       );
+      if (publicationError !== undefined) {
+        view.error = true;
+        view.lines = [
+          `Report unavailable: ${preview(publicationError).join(" ")}`,
+          ...(view.lines ?? []),
+        ];
+      }
       (context.state as RowState).view = view;
       if (expanded) {
         const data =
@@ -350,9 +359,13 @@ export function taskToolRenderers(tool: Tool): ToolRenderers {
             : isTask(details)
               ? [details]
               : undefined;
-        const detail = data
-          ? data.map(taskDetails).join("\n\n")
-          : sanitize(raw);
+        const detail =
+          (publicationError === undefined
+            ? ""
+            : `Report unavailable: ${sanitize(publicationError)}\n\n`) +
+          (data
+            ? data.map(taskDetails).join("\n\n")
+            : sanitize(typeof details === "string" ? details : raw));
         return block(
           () =>
             `${view.action}${view.name ? ` · ${clean(view.name)}` : ""}\n\nRequest:\n${JSON.stringify(args, null, 2)}\n\n${detail}`,

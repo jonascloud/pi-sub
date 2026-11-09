@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test } from "vitest";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
@@ -101,6 +101,29 @@ test("only complete native reply notifications acknowledge their exact reply", (
       }),
     ).toEqual([]);
   }
+});
+
+test("publication failure preserves the reply but never acknowledges delivery", () => {
+  const ready = {
+    ...task,
+    response: "x".repeat(60000),
+    reply: { id: "reply-1", delivered: false },
+  };
+  writeFileSync(join(cwd, ".pi"), "not a directory");
+  const result = reportResult(ready, cwd);
+  expect(result.isError).toBe(true);
+  const message = {
+    ...result,
+    details: JSON.parse(JSON.stringify(result.details)),
+    role: "toolResult" as const,
+    toolName: "sub_result",
+    toolCallId: "read",
+    timestamp: 0,
+    isError: result.isError ?? false,
+  };
+  expect(deliveredReplies(message)).toEqual([]);
+  // A state-only fallback is not complete delivery even without the error flag.
+  expect(deliveredReplies({ ...message, isError: false })).toEqual([]);
 });
 
 test("inline batches acknowledge each complete answer, not missing neighbours", () => {

@@ -274,6 +274,28 @@ test("tool handoffs omit diagnostics and preserve oversized reports in files", a
   }
 });
 
+test("operator stop reports confirmed outcomes even when report publication fails", async () => {
+  const { commands, ctx, sendMessage } = setup();
+  const report = {
+    ...failure,
+    outcome: "stopped" as const,
+    error: undefined,
+    response: "x".repeat(60000),
+  };
+  fake.stop.mockResolvedValue(report);
+  writeFileSync(join(cwd, ".pi"), "not a directory");
+  await commands.get("sub:stop")!.handler(report.id, ctx);
+  const message = sendMessage.mock.calls[0]![0];
+  expect(JSON.parse(message.content)).toMatchObject({
+    id: report.id,
+    archived: true,
+    outcome: "stopped",
+    reportError: expect.any(String),
+  });
+  expect(reportDetails(message.details)).toEqual([report]);
+  expect(fake.stop).toHaveBeenCalledOnce();
+});
+
 test.each(["interactive", "rpc"])(
   "%s input delegates cleanup and forwards its report without a model turn",
   async (source) => {

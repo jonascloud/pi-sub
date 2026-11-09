@@ -1,4 +1,5 @@
-import { afterEach, beforeEach, expect, test } from "vitest";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
+import * as fs from "node:fs";
 import {
   mkdtempSync,
   readFileSync,
@@ -13,16 +14,22 @@ import { execFileSync } from "node:child_process";
 import type { TaskView } from "../src/coordinator.ts";
 import {
   handoff,
+  deliveredFile,
   reportDetails,
   reportResult,
   taskReport,
 } from "../src/reports.ts";
+
+vi.mock("node:fs", async (original) => ({
+  ...(await original<typeof import("node:fs")>()),
+}));
 
 let cwd: string;
 beforeEach(() => {
   cwd = mkdtempSync(join(tmpdir(), "pi-sub-reports-"));
 });
 afterEach(() => {
+  vi.restoreAllMocks();
   rmSync(cwd, { recursive: true, force: true });
 });
 const task: TaskView = {
@@ -149,16 +156,124 @@ test("publication failures never return a reference or overwrite a changed artif
   const value = { ...task, response: "x".repeat(60000) };
   const ref = envelope(reportResult(value, cwd));
   writeFileSync(ref.file, "External change");
-  expect(() => reportResult(value, cwd)).toThrow("Stored report has changed");
+  const failed = reportResult(value, cwd);
+  expect(failed.isError).toBe(true);
+  expect(envelope(failed)).toMatchObject({
+    id: value.id,
+    status: "ready",
+    reportError: expect.stringContaining("Stored report has changed"),
+  });
+  expect(envelope(failed)).not.toHaveProperty("file");
+  expect(reportDetails(failed.details)).toEqual(value);
+  expect(deliveredFile(failed.details, failed.content[0]!.text)).toBe(false);
   expect(readFileSync(ref.file, "utf8")).toBe("External change");
   expect(
     readdirSync(dirname(ref.file)).some((name) => name.endsWith(".tmp")),
   ).toBe(false);
   writeFileSync(join(dirname(ref.file), ".gitignore"), "!*\n");
-  expect(() => reportResult(value, cwd)).toThrow("must remain ignored");
+  expect(envelope(reportResult(value, cwd)).reportError).toContain(
+    "must remain ignored",
+  );
   rmSync(join(cwd, ".pi"), { recursive: true });
   writeFileSync(join(cwd, ".pi"), "not a directory");
-  expect(() => reportResult(value, cwd)).toThrow();
+  expect(reportResult(value, cwd).isError).toBe(true);
+  // Notifications and pre-archive failure cleanup still require a complete handoff.
+  expect(() => handoff("x".repeat(60000), value, cwd)).toThrow();
+});
+
+test("identical reports need no new writes, even when storage is full or read-only", () => {
+  const value = { ...task, response: "x".repeat(60000) };
+  const first = reportResult(value, cwd);
+  const writes = [
+    "mkdirSync",
+    "openSync",
+    "writeFileSync",
+    "linkSync",
+  ] as const;
+  for (const method of writes)
+    vi.spyOn(fs, method).mockImplementation(() => {
+      throw Object.assign(new Error("ENOSPC"), { code: "ENOSPC" });
+    });
+  expect(reportResult(value, cwd)).toEqual(first);
+  for (const method of writes) expect(fs[method]).not.toHaveBeenCalled();
+  expect(readFileSync(envelope(first).file, "utf8")).toContain(value.response);
+});
+
+test.each([false, true])(
+  "concurrent publication validates the winner without overwriting it (changed: %s)",
+  (changed) => {
+    const value = { ...task, response: "x".repeat(60000) };
+    const link = fs.linkSync;
+    let target = "";
+    vi.spyOn(fs, "linkSync").mockImplementation((temporary, file) => {
+      target = String(file);
+      writeFileSync(
+        file,
+        changed ? "External change" : readFileSync(temporary),
+        { flag: "wx", mode: 0o600 },
+      );
+      link(temporary, file);
+    });
+    const result = reportResult(value, cwd);
+    if (changed) {
+      expect(result.isError).toBe(true);
+      expect(envelope(result)).not.toHaveProperty("file");
+      expect(envelope(result).reportError).toContain(
+        "Stored report has changed",
+      );
+      expect(readFileSync(target, "utf8")).toBe("External change");
+    } else {
+      expect(result.isError).not.toBe(true);
+      expect(envelope(result).file).toBe(target);
+      expect(readFileSync(target, "utf8")).toContain(value.response);
+    }
+    expect(
+      readdirSync(dirname(target)).some((name) => name.endsWith(".tmp")),
+    ).toBe(false);
+  },
+);
+
+test("publication failures retain bounded confirmed state and full diagnostics, not a false handoff", () => {
+  const {
+    status: _status,
+    activity: _activity,
+    reply: _reply,
+    ...receipt
+  } = task;
+  const value = {
+    ...receipt,
+    outcome: "reply" as const,
+    response: "x".repeat(60000),
+  };
+  const reportError = "Oversized storage diagnostic\n".repeat(10000);
+  vi.spyOn(fs, "openSync").mockImplementation(() => {
+    throw new Error(reportError);
+  });
+  const result = reportResult(value, cwd);
+  expect(result.isError).toBe(true);
+  expect(envelope(result)).toMatchObject({
+    id: value.id,
+    archived: true,
+    outcome: "reply",
+    reportError: expect.stringContaining("Report publication failed"),
+  });
+  expect(envelope(result)).not.toHaveProperty("file");
+  expect(result.details).toEqual({ report: value, reportError });
+  expect(Buffer.byteLength(result.content[0]!.text)).toBeLessThanOrEqual(
+    50 * 1024,
+  );
+  const batch = reportResult(
+    Array.from({ length: 600 }, (_, i) => ({ ...value, id: `task-${i}` })),
+    cwd,
+  );
+  expect(envelope(batch)).toMatchObject({
+    count: 600,
+    archived: 600,
+    errors: 0,
+  });
+  expect(Buffer.byteLength(batch.content[0]!.text)).toBeLessThanOrEqual(
+    50 * 1024,
+  );
 });
 
 test("limits cover actual UTF-8 bytes, line counts and the final reference", () => {

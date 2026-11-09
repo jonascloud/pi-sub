@@ -296,6 +296,40 @@ test("file-backed tool rows keep full native diagnostics without reading the art
   expect(text(component)).toContain("test/strong:high");
 });
 
+test("publication errors show confirmed acceptance separately from unavailable delivery", () => {
+  const component = row("sub_result", { id: "task-123456789", finish: true });
+  result(
+    component,
+    { report: receipt(), reportError: "ENOSPC: no space left" },
+    true,
+  );
+  for (const expanded of [false, true]) {
+    component.setExpanded(expanded);
+    expect(text(component)).toContain("Accepted · API review");
+    expect(text(component)).toContain("Report unavailable: ENOSPC");
+    expect(text(component)).not.toContain("Could not accept");
+    if (expanded) expect(text(component)).toContain("Full reply.");
+  }
+});
+
+test("publication failures do not hide an original tool error", () => {
+  const component = row("sub_result", { id: "unknown", finish: true });
+  result(
+    component,
+    {
+      report: "Unknown live task: unknown",
+      reportError: "ENOSPC: no space left",
+    },
+    true,
+  );
+  for (const expanded of [false, true]) {
+    component.setExpanded(expanded);
+    expect(text(component)).toContain("Could not accept");
+    expect(text(component)).toContain("Unknown live task: unknown");
+    expect(text(component)).toContain("Report unavailable: ENOSPC");
+  }
+});
+
 test("partial results never prematurely announce acceptance or control success", () => {
   const component = row("sub_result", { id: "task-123456789", finish: true });
   result(component, receipt(), false, true);

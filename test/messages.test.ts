@@ -194,6 +194,24 @@ test("stop acknowledgements summarize task identities", () => {
   expect(draw(renderStopped, "[]", []).join("\n")).not.toContain("[]");
 });
 
+test("stop acknowledgements distinguish a completed stop from report publication failure", () => {
+  const report = [{ ...failure, outcome: "stopped", error: undefined }];
+  const details = { report, reportError: "ENOSPC: no space left" };
+  const collapsed = draw(renderStopped, "Publication failed", details).join(
+    "\n",
+  );
+  expect(collapsed).toContain("Stopped · Review changes");
+  expect(collapsed).toContain("Report unavailable: ENOSPC");
+  const expanded = draw(
+    renderStopped,
+    "Publication failed",
+    details,
+    true,
+  ).join("\n");
+  expect(expanded).toContain("Partial investigation");
+  expect(expanded).toContain("ENOSPC");
+});
+
 test("stopping preserves failed and already accepted outcomes rather than claiming every task stopped", () => {
   const accepted = {
     ...failure,

@@ -17,6 +17,7 @@ export interface Handoff {
   content: string;
   file?: string;
 }
+const TOOL_LIMITS = { maxBytes: 50 * 1024, maxLines: 2000 };
 
 /** Model-facing handoff; execution diagnostics stay in native result details. */
 export function taskReport(task: Report) {
@@ -57,18 +58,39 @@ function reportText(value: Reports): string {
  */
 function publish(cwd: string, text: string): string {
   const directory = resolve(cwd, ".pi/pi-sub/reports");
-  mkdirSync(directory, { recursive: true, mode: 0o700 });
   const ignore = resolve(directory, ".gitignore");
-  try {
-    writeFileSync(ignore, "*\n", { flag: "wx", mode: 0o600 });
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  const checkIgnore = () => {
     if (readFileSync(ignore, "utf8") !== "*\n")
       throw new Error(`Report directory must remain ignored: ${ignore}`);
+  };
+  try {
+    checkIgnore();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    try {
+      writeFileSync(ignore, "*\n", { flag: "wx", mode: 0o600 });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      checkIgnore();
+    }
   }
   const bytes = Buffer.from(text, "utf8");
   const digest = createHash("sha256").update(bytes).digest("hex");
   const file = resolve(directory, `${digest}.txt`);
+  const stored = () => {
+    let contents: Buffer;
+    try {
+      contents = readFileSync(file);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+      throw error;
+    }
+    if (!contents.equals(bytes))
+      throw new Error(`Stored report has changed: ${file}`);
+    return true;
+  };
+  if (stored()) return file;
   const temporary = resolve(directory, `.${randomUUID()}.tmp`);
   const fd = openSync(temporary, "wx", 0o600);
   try {
@@ -81,8 +103,7 @@ function publish(cwd: string, text: string): string {
       linkSync(temporary, file);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      if (!readFileSync(file).equals(bytes))
-        throw new Error(`Stored report has changed: ${file}`);
+      if (!stored()) throw error;
     }
   } finally {
     unlinkSync(temporary);
@@ -95,29 +116,43 @@ export function handoff(
   content: string,
   value: Reports,
   cwd: string,
-  limits = { maxBytes: 50 * 1024, maxLines: 2000 },
+  limits = TOOL_LIMITS,
 ): Handoff {
   const fits = (text: string) =>
     Buffer.byteLength(text, "utf8") <= limits.maxBytes &&
     text.split("\n").length <= limits.maxLines;
   if (fits(content)) return { content };
   const file = publish(cwd, reportText(value));
+  const envelope = JSON.stringify({
+    ...reportState(value),
+    file,
+    note: "Full report in file; read as needed.",
+  });
+  if (!fits(envelope))
+    throw new Error("Report reference exceeds the handoff limit");
+  return { content: envelope, file };
+}
+
+/** Report publication cannot roll back task operations; expose their confirmed state. */
+function reportState(value: Reports) {
   const tasks =
     typeof value === "string" ? [] : Array.isArray(value) ? value : [value];
   const task = tasks.length === 1 ? tasks[0]! : undefined;
-  const identity = task
-    ? {
-        id: task.id,
-        ...("status" in task
-          ? { status: task.status, operation: task.operation }
-          : {}),
-        outcome: task.outcome,
-      }
-    : tasks.length
-      ? { count: tasks.length }
-      : {};
-  const envelope = JSON.stringify({
-    ...identity,
+  return {
+    ...(task
+      ? {
+          id: task.id,
+          ...("status" in task
+            ? { status: task.status, operation: task.operation }
+            : { archived: true }),
+          outcome: task.outcome,
+        }
+      : tasks.length
+        ? {
+            count: tasks.length,
+            archived: tasks.filter((task) => !("status" in task)).length,
+          }
+        : {}),
     ...(tasks.length
       ? {
           errors: tasks.filter(
@@ -125,12 +160,7 @@ export function handoff(
           ).length,
         }
       : {}),
-    file,
-    note: "Full report in file; read as needed.",
-  });
-  if (!fits(envelope))
-    throw new Error("Report reference exceeds the handoff limit");
-  return { content: envelope, file };
+  };
 }
 
 export function reportResult(value: Reports, cwd: string) {
@@ -140,11 +170,34 @@ export function reportResult(value: Reports, cwd: string) {
       : JSON.stringify(
           Array.isArray(value) ? value.map(taskReport) : taskReport(value),
         );
-  const result = handoff(raw, value, cwd);
-  return {
-    content: [{ type: "text" as const, text: result.content }],
-    details: result.file ? { report: value, handoff: result } : value,
-  };
+  try {
+    const result = handoff(raw, value, cwd);
+    return {
+      content: [{ type: "text" as const, text: result.content }],
+      details: result.file ? { report: value, handoff: result } : value,
+    };
+  } catch (error) {
+    const reportError = error instanceof Error ? error.message : String(error);
+    const failure = {
+      ...reportState(value),
+      reportError,
+      note:
+        typeof value === "string"
+          ? "Report publication failed. Full error retained in native details."
+          : "Task state above is confirmed; reporting failed, not the operation. Full report retained in native details. Retry sub_result after fixing report storage.",
+    };
+    // Keep the fallback bounded even if a diagnostic contains an oversized path.
+    if (
+      Buffer.byteLength(JSON.stringify(failure), "utf8") > TOOL_LIMITS.maxBytes
+    )
+      failure.reportError =
+        "Report publication failed; full error in native details.";
+    return {
+      content: [{ type: "text" as const, text: JSON.stringify(failure) }],
+      details: { report: value, reportError },
+      isError: true,
+    };
+  }
 }
 
 function artifact(details: unknown): Handoff | undefined {
@@ -162,8 +215,17 @@ function artifact(details: unknown): Handoff | undefined {
     return value as Handoff;
 }
 
+export function reportFailure(details: unknown): string | undefined {
+  return details &&
+    typeof details === "object" &&
+    "reportError" in details &&
+    typeof details.reportError === "string"
+    ? details.reportError
+    : undefined;
+}
+
 export function reportDetails(details: unknown): unknown {
-  return artifact(details) &&
+  return (artifact(details) || reportFailure(details) !== undefined) &&
     details &&
     typeof details === "object" &&
     "report" in details

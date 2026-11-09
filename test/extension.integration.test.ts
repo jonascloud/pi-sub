@@ -6,6 +6,7 @@ import {
   mkdir,
   readFile,
   readdir,
+  rename,
   rm,
   writeFile,
 } from "node:fs/promises";
@@ -172,6 +173,64 @@ test("native file handoffs deliver without reading, stay resumable and survive a
     ).not.toContain("read");
     await client.stop();
     expect(await readFile(ref.file, "utf8")).toBe(original);
+  } finally {
+    await dispose();
+  }
+}, 30000);
+
+test("native acceptance reports its committed state on publication failure and retains a retrievable receipt", async () => {
+  const { client, cwd, dispose } = await host({ WORKER_TEST_LARGE_CHILD: "1" });
+  try {
+    await client.promptAndWait("integration:read-via-wait", undefined, 20000);
+    const first = await latestResult(client);
+    const directory = join(cwd, ".pi/pi-sub/reports");
+    const backup = directory + "-backup";
+    // A deterministic storage failure, also when tests run as root.
+    await rename(directory, backup);
+    await writeFile(directory, "not a directory");
+    await client.promptAndWait("integration:accept", undefined, 20000);
+    const failed = (await client.getMessages()).findLast(
+      (message) =>
+        message.role === "toolResult" && message.toolName === "sub_result",
+    );
+    if (!failed || failed.role !== "toolResult")
+      throw new Error("Missing result");
+    expect(failed.isError).toBe(true);
+    const visible = JSON.parse(
+      failed.content.find((part) => part.type === "text")!.text,
+    );
+    expect(visible).toMatchObject({
+      id: first.id,
+      archived: true,
+      outcome: "reply",
+      reportError: expect.any(String),
+    });
+    expect(visible).not.toHaveProperty("file");
+    expect(reportDetails(failed.details)).toMatchObject({
+      id: first.id,
+      outcome: "reply",
+      response: first.response,
+    });
+    expect(reportDetails(failed.details)).not.toHaveProperty("status");
+    await client.promptAndWait("integration:refine-task", undefined, 20000);
+    const followUp = (await client.getMessages()).findLast(
+      (message) =>
+        message.role === "toolResult" && message.toolName === "sub_message",
+    );
+    expect(followUp).toMatchObject({
+      isError: true,
+      details: expect.stringContaining("Unknown live task"),
+    });
+    await rm(directory);
+    await rename(backup, directory);
+    await client.promptAndWait("integration:failure-receipt", undefined, 20000);
+    const receipt = await latestResult(client);
+    expect(receipt).toMatchObject({
+      id: first.id,
+      outcome: "reply",
+      response: first.response,
+    });
+    expect(receipt).not.toHaveProperty("status");
   } finally {
     await dispose();
   }

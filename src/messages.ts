@@ -7,7 +7,7 @@ import {
 import type { TaskResult } from "./coordinator.ts";
 import { replyReports, replyText } from "./replies.ts";
 import { STRENGTH_GUIDANCE } from "./models.ts";
-import { reportDetails } from "./reports.ts";
+import { reportDetails, reportFailure } from "./reports.ts";
 
 /** One stable instruction section; notifications carry observations, not a manual. */
 export const SUBAGENT_GUIDANCE = `Delegate bounded work when the result justifies briefing and integration overhead. Give the smallest sufficient brief: goal, scope, constraints, success criteria and decisive context. Prefer paths to copied content; do not repeat loaded instructions. Children share files and load native global/project instructions, not your conversation or UI. Follow-ups add new information with enough context to interpret it.
@@ -213,33 +213,44 @@ export const renderStopped: MessageRenderer = (message, options, theme) => {
           ? "Stopped"
           : "Result";
   const allStopped = tasks.every((task) => task.outcome === "stopped");
+  const publicationError = reportFailure(message.details);
   return compact(
-    tasks.length
-      ? [
-          {
-            text:
-              tasks.length === 1
-                ? `${label(tasks[0]!)} · ${identity(tasks[0]!)}`
-                : `${allStopped ? "Stopped" : "Stop results"} · ${tasks.length} tasks`,
-            style: "title",
-          },
-          ...tasks.flatMap((task) => [
-            ...((!allStopped ||
-              (typeof task.error === "string" && task.error)) &&
-            tasks.length > 1
-              ? [{ text: `${label(task)} · ${identity(task)}` }]
-              : []),
-            ...(typeof task.error === "string" && task.error
-              ? [{ text: preview(task.error, 240), style: "error" as const }]
-              : []),
+    [
+      ...(tasks.length
+        ? [
+            {
+              text:
+                tasks.length === 1
+                  ? `${label(tasks[0]!)} · ${identity(tasks[0]!)}`
+                  : `${allStopped ? "Stopped" : "Stop results"} · ${tasks.length} tasks`,
+              style: "title" as const,
+            },
+            ...tasks.flatMap((task) => [
+              ...((!allStopped ||
+                (typeof task.error === "string" && task.error)) &&
+              tasks.length > 1
+                ? [{ text: `${label(task)} · ${identity(task)}` }]
+                : []),
+              ...(typeof task.error === "string" && task.error
+                ? [{ text: preview(task.error, 240), style: "error" as const }]
+                : []),
+            ]),
+          ]
+        : [
+            {
+              text: "Stopped tasks · details unavailable",
+              style: "title" as const,
+            },
           ]),
-        ]
-      : [
-          {
-            text: "Stopped tasks · details unavailable",
-            style: "title",
-          },
-        ],
+      ...(publicationError === undefined
+        ? []
+        : [
+            {
+              text: `Report unavailable: ${preview(publicationError, 240)}`,
+              style: "error" as const,
+            },
+          ]),
+    ],
     options,
     theme,
   );
