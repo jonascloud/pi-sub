@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "vitest";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -54,17 +54,29 @@ function nextEvent(worker: Worker, type: string) {
   });
 }
 
-test("native CLI: a new process continues the same saved question/answer context", async () => {
+test("native CLI: continuation retains conversation and loads global/project instructions once", async () => {
   const { make, session, dir, options } = await setup();
   // Public context hook observes what the native CLI actually restores, rather
   // than inferring continuity just from the presence of a session file.
   const observer = join(dir, "observe.ts");
   const log = join(dir, "context.json");
+  const promptLog = join(dir, "prompt.json");
+  const global = join(options.env!.PI_CODING_AGENT_DIR!, "AGENTS.md");
+  await mkdir(options.env!.PI_CODING_AGENT_DIR!, { recursive: true });
+  await writeFile(global, "GLOBAL_INSTRUCTION");
+  await writeFile(join(dir, "AGENTS.md"), "SHADOWED_PROJECT_INSTRUCTION");
+  await writeFile(join(dir, "AGENTS.override.md"), "PROJECT_INSTRUCTION");
   await writeFile(
     observer,
-    `import {writeFileSync} from 'node:fs'; export default pi => { pi.on('context', event => {writeFileSync(${JSON.stringify(log)}, JSON.stringify(event.messages));}); };`,
+    `import {writeFileSync} from 'node:fs';
+    import {getCurrentSystemPrompt} from '@earendil-works/pi-ai';
+    export default pi => {
+      pi.on('context', event => {writeFileSync(${JSON.stringify(log)}, JSON.stringify(event.messages));});
+      pi.on('context_with_system', event => {writeFileSync(${JSON.stringify(promptLog)}, JSON.stringify(getCurrentSystemPrompt(event.messages)));});
+    };`,
   );
-  const first = make();
+  const args = [...options.args!, "-e", observer];
+  const first = make({ args });
   const events: string[] = [];
   first.onEvent((event) => events.push(event.type));
   const report = await first.run("What is your response?");
@@ -82,7 +94,14 @@ test("native CLI: a new process continues the same saved question/answer context
   });
   expect(report.error).toBeUndefined();
   expect(events).toContain("message_update");
-  const second = make({ args: [...options.args!, "-e", observer] });
+  const initialPrompt = JSON.parse(await readFile(promptLog, "utf8")) as string;
+  expect(initialPrompt.split("GLOBAL_INSTRUCTION")).toHaveLength(2);
+  expect(initialPrompt.split("PROJECT_INSTRUCTION")).toHaveLength(2);
+  expect(initialPrompt).not.toContain("SHADOWED_PROJECT_INSTRUCTION");
+  expect(initialPrompt).toContain("smallest sufficient handoff");
+  expect(initialPrompt).not.toContain("Delegate bounded work");
+  await writeFile(global, "UPDATED_GLOBAL_INSTRUCTION");
+  const second = make({ args });
   const continued = await second.run("Explain your previous answer.");
   expect(continued).toMatchObject({
     text: "fake response",
@@ -96,6 +115,13 @@ test("native CLI: a new process continues the same saved question/answer context
     },
   });
   expect(continued.error).toBeUndefined();
+  const continuedPrompt = JSON.parse(
+    await readFile(promptLog, "utf8"),
+  ) as string;
+  expect(continuedPrompt.split("UPDATED_GLOBAL_INSTRUCTION")).toHaveLength(2);
+  expect(continuedPrompt.split("GLOBAL_INSTRUCTION")).toHaveLength(2);
+  expect(continuedPrompt.split("PROJECT_INSTRUCTION")).toHaveLength(2);
+  expect(continuedPrompt.split("smallest sufficient handoff")).toHaveLength(2);
   const messages = JSON.parse(await readFile(log, "utf8"));
   expect(messages.map((message: { role: string }) => message.role)).toEqual(
     expect.arrayContaining(["user", "assistant", "user"]),

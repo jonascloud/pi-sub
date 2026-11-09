@@ -6,6 +6,7 @@ import {
   pendingReplyBatch,
   announcedReplies,
   deliveredReplies,
+  taskReport,
 } from "../src/replies.ts";
 
 const task: TaskView = {
@@ -151,7 +152,9 @@ test("complete tool returns acknowledge replies without accepting tasks", () => 
     role: "toolResult" as const,
     toolCallId: "call-1",
     toolName: "sub_result",
-    content: [{ type: "text" as const, text: JSON.stringify(ready, null, 2) }],
+    content: [
+      { type: "text" as const, text: JSON.stringify(taskReport(ready)) },
+    ],
     details: ready,
     isError: false,
     timestamp: 0,
@@ -194,7 +197,7 @@ test("complete tool returns acknowledge replies without accepting tasks", () => 
       ...message,
       toolName: "sub_control",
       details: values,
-      content: [{ type: "text", text: JSON.stringify(values, null, 2) }],
+      content: [{ type: "text", text: JSON.stringify(values.map(taskReport)) }],
     }),
   ).toEqual([
     { id: task.id, replyId: "reply-1" },

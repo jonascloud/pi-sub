@@ -1,4 +1,5 @@
 import { expect, test } from "vitest";
+import type { TaskResult, TaskView } from "../src/coordinator.ts";
 import {
   mkdtemp,
   mkdir,
@@ -116,7 +117,15 @@ async function latestResult(client: RpcClient) {
   if (!result || result.role !== "toolResult")
     throw new Error("Missing sub_result");
   expect(result.isError).toBe(false);
-  return JSON.parse(result.content.find((part) => part.type === "text")!.text);
+  const visible = JSON.parse(
+    result.content.find((part) => part.type === "text")!.text,
+  );
+  const details = result.details as unknown as TaskView | TaskResult;
+  expect(visible.id).toBe(details.id);
+  expect(visible.response).toBe(details.response);
+  expect(visible).not.toHaveProperty("execution");
+  expect(visible).not.toHaveProperty("sessionFile");
+  return details;
 }
 
 test("native reply delivery keeps the task and its session available for follow-up", async () => {

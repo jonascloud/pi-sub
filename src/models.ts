@@ -11,7 +11,7 @@ import { fileURLToPath } from "node:url";
 export type { ThinkingLevel };
 
 export const STRENGTH_GUIDANCE =
-  "Strength is an approximate relative local scale, not a benchmark guarantee or a scale with equal numeric distances: 1–2 mechanical or narrow work; 3–4 bounded routine implementation; 5–6 multi-file work or moderate analysis; 7–8 complex design or debugging; 9–10 the hardest work with high uncertainty.";
+  "Levels (approximate, not benchmark guarantees): 1–2 mechanical/narrow; 3–4 routine implementation; 5–6 multi-file work/moderate analysis; 7–8 complex design/debugging; 9–10 hardest, highly uncertain work.";
 export interface AvailableModel {
   provider: string;
   model: string;
@@ -119,6 +119,24 @@ export function loadLadder(path: string): Ladder {
   }
 }
 
+/** Validated integer rungs enumerate in ascending strength order. */
+export function availableExecutions(
+  ladder: Ladder,
+  available: readonly AvailableModel[],
+): Execution[] {
+  return Object.entries(validateLadder(ladder)).flatMap(([power, entry]) => {
+    const reference = parseReference(entry);
+    return available.some(
+      (a) =>
+        a.provider === reference.provider &&
+        a.model === reference.model &&
+        a.thinking.includes(reference.thinking),
+    )
+      ? [{ ...reference, power: Number(power) }]
+      : [];
+  });
+}
+
 export function selectExecution(
   ladder: Ladder,
   level: number,
@@ -126,39 +144,11 @@ export function selectExecution(
 ): Execution {
   if (!Number.isInteger(level) || level < 1 || level > 10)
     throw new Error("Level must be an integer from 1 to 10");
-  const valid = validateLadder(ladder);
-  for (let power = level; power <= 10; power++) {
-    const entry = valid[String(power)];
-    if (!entry) continue;
-    const reference = parseReference(entry);
-    if (
-      available.some(
-        (a) =>
-          a.provider === reference.provider &&
-          a.model === reference.model &&
-          a.thinking.includes(reference.thinking),
-      )
-    )
-      return { ...reference, power };
-  }
+  const execution = availableExecutions(ladder, available).find(
+    (entry) => entry.power >= level,
+  );
+  if (execution) return execution;
   throw new Error(
     `No available ladder execution for level ${level}; check ${ladderPath()} and native model availability. ${setupHelp}`,
   );
-}
-
-export function describeLevels(
-  ladder: Ladder,
-  available: readonly AvailableModel[],
-): Array<{ level: number; execution?: Execution; error?: string }> {
-  return Array.from({ length: 10 }, (_, i) => {
-    const level = i + 1;
-    try {
-      return { level, execution: selectExecution(ladder, level, available) };
-    } catch (error) {
-      return {
-        level,
-        error: error instanceof Error ? error.message : String(error),
-      };
-    }
-  });
 }

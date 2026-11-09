@@ -225,7 +225,7 @@ test("child guard rejects a switched assignment journal through public session c
       sessionManager: { getSessionFile: () => sessionFile },
       abort,
     } as unknown as ExtensionContext;
-    beforeStart({}, ctx);
+    beforeStart({ systemPromptOptions: { sections: {} } }, ctx);
     expect(abort).not.toHaveBeenCalled();
     sessionFile = "/unrelated/task.jsonl";
     beforeStart({}, ctx);

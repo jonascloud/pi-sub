@@ -7,7 +7,23 @@ import {
   truncateToWidth,
 } from "@earendil-works/pi-tui";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { TaskView } from "./coordinator.ts";
+import type { TaskResult, TaskView } from "./coordinator.ts";
+
+/** Model-facing handoff; execution diagnostics stay in native result details. */
+export function taskReport(task: TaskView | TaskResult) {
+  return {
+    id: task.id,
+    description: task.description,
+    ...("status" in task
+      ? { status: task.status, operation: task.operation }
+      : {}),
+    outcome: task.outcome,
+    ...("reply" in task && task.reply ? { reply: { id: task.reply.id } } : {}),
+    response: task.response,
+    error: task.error,
+    pendingInput: task.pendingInput?.length ? task.pendingInput : undefined,
+  };
+}
 
 const record = (value: unknown): Record<string, unknown> | undefined =>
   value !== null && typeof value === "object" && !Array.isArray(value)

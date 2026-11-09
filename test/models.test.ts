@@ -13,8 +13,8 @@ import type { Model } from "@earendil-works/pi-ai";
 import {
   type AvailableModel,
   type Ladder,
+  availableExecutions,
   availableModels,
-  describeLevels,
   ladderPath,
   loadLadder,
   parseReference,
@@ -138,11 +138,35 @@ describe("model ladder", () => {
       expect(() => selectExecution(ladder, level, available)).toThrow(
         /integer/,
       );
-    const rows = describeLevels(ladder, highOnly);
-    expect(rows).toHaveLength(10);
-    expect(rows[0]).toMatchObject({ level: 1, execution: { power: 8 } });
-    expect(rows[9]).toMatchObject({ level: 10, error: expect.any(String) });
     expect(available).toHaveLength(4);
+  });
+
+  it("available ranges and dispatch agree for sparse, empty and unsupported ladders", () => {
+    const cases: [Ladder, AvailableModel[], number[]][] = [
+      [ladder, available, [2, 6, 8, 10]],
+      [ladder, [{ provider: "p", model: "main", thinking: ["high"] }], [8]],
+      [ladder, [{ provider: "p", model: "main", thinking: ["off"] }], []],
+      [ladder, [{ provider: "other", model: "main", thinking: ["high"] }], []],
+      [ladder, [], []],
+      [{}, available, []],
+      [{ "1": "p/cheap:off" }, available, [1]],
+    ];
+    for (const [configured, native, powers] of cases) {
+      expect(
+        availableExecutions(configured, native).map((entry) => entry.power),
+      ).toEqual(powers);
+      const max = powers.at(-1) ?? 0;
+      for (let level = 1; level <= 10; level++) {
+        if (level <= max)
+          expect(selectExecution(configured, level, native).power).toBe(
+            powers.find((power) => power >= level),
+          );
+        else
+          expect(() => selectExecution(configured, level, native)).toThrow(
+            /No available/,
+          );
+      }
+    }
   });
 
   it("uses the configured profile and reports a missing ladder without creating files", async () => {

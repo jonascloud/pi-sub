@@ -29,8 +29,9 @@ export default function childGuard(pi: ExtensionAPI) {
   pi.on("session_start", (_event, ctx) => {
     check(ctx);
   });
-  pi.on("before_agent_start", (_event, ctx) => {
-    check(ctx);
+  pi.on("before_agent_start", (event, ctx) => {
+    if (check(ctx)) return;
+    event.systemPromptOptions.sections.pi_sub = `Work on the assigned task in the shared working directory. Return the smallest sufficient handoff for the parent's next decision or action: result or blocking question, relevant paths, verification, decisive reasons and material risks or uncertainty. Prefer references to copied content, but include evidence needed to judge correctness. Omit acknowledgements and routine progress narration. Follow-ups add new information with enough context to interpret it.`;
   });
   pi.on("before_provider_request", (_event, ctx) => {
     check(ctx);

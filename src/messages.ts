@@ -9,44 +9,14 @@ import {
 } from "@earendil-works/pi-tui";
 import type { TaskResult } from "./coordinator.ts";
 import { replyReports, replyText } from "./replies.ts";
-import {
-  describeLevels,
-  STRENGTH_GUIDANCE,
-  type AvailableModel,
-  type Ladder,
-  type Execution,
-} from "./models.ts";
+import { STRENGTH_GUIDANCE } from "./models.ts";
 
 /** One stable instruction section; notifications carry observations, not a manual. */
-export const SUBAGENT_GUIDANCE = `Delegate bounded, self-contained work when briefing, research, verification and integration overhead are worthwhile. Choose the minimum sufficient level; the configured ladder determines execution. Children do not inherit your conversation or interactive UI.
+export const SUBAGENT_GUIDANCE = `Delegate bounded work when the result justifies briefing and integration overhead. Give the smallest sufficient brief: goal, scope, constraints, success criteria and decisive context. Prefer paths to copied content; do not repeat loaded instructions. Children share files and load native global/project instructions, not your conversation or UI. Follow-ups add new information with enough context to interpret it.
+Choose the minimum sufficient level; do not lower it to fit availability. The configured ladder selects the execution.
 ${STRENGTH_GUIDANCE}
-Tasks are asynchronous; a reply may be a question rather than a final result. Delivered replies remain available for follow-up; finish:true closes a task, it is not needed to acknowledge a report or clear its widget row. User interruption pauses children; a new prompt resumes only you. Failed work is closed and reported automatically.
-Use reports internally; surface only material results, blockers or user decisions. Ignore reports for already collected or stopped tasks rather than acknowledging or collecting them again.`;
-
-export function routingSummary(
-  ladder: Ladder,
-  available: readonly AvailableModel[],
-): string {
-  const groups: { from: number; to: number; execution?: Execution }[] = [];
-  for (const row of describeLevels(ladder, available)) {
-    const last = groups.at(-1);
-    if (
-      last &&
-      JSON.stringify(last.execution) === JSON.stringify(row.execution)
-    )
-      last.to = row.level;
-    else
-      groups.push({ from: row.level, to: row.level, execution: row.execution });
-  }
-  return groups
-    .map(({ from, to, execution: e }) => {
-      const level = from === to ? `${from}` : `${from}–${to}`;
-      return e
-        ? `${level}: ${e.provider}/${e.model}:${e.thinking} · rung ${e.power}`
-        : `${level}: unavailable`;
-    })
-    .join("\n");
-}
+Replies arrive asynchronously and may be questions. User interruption pauses children; a new prompt resumes only you.
+Use reports internally; surface only material results, blockers or user decisions. Reports need no acknowledgement; stale reports alone are not a reason to revisit accepted/stopped tasks.`;
 
 type Message = Parameters<MessageRenderer>[0];
 type RenderOptions = Parameters<MessageRenderer>[1];

@@ -9,7 +9,7 @@ import piSub from "../index.ts";
 import * as models from "../src/models.ts";
 import * as workers from "../src/worker.ts";
 import { SUBAGENT_GUIDANCE } from "../src/messages.ts";
-import { replyBatch } from "../src/replies.ts";
+import { replyBatch, taskReport } from "../src/replies.ts";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 
 const fake = vi.hoisted(() => ({
@@ -205,18 +205,56 @@ test("every subagent tool and transcript message has a native renderer", () => {
 
 test("operator stop preserves machine-readable content and supplies presentation metadata", async () => {
   const { commands, ctx, sendMessage } = setup();
-  const report = { ...failure, outcome: "stopped" };
+  const report = { ...failure, outcome: "stopped" as const };
   fake.stop.mockResolvedValue(report);
   await commands.get("sub:stop")!.handler("failed", ctx);
   expect(sendMessage).toHaveBeenCalledWith(
     {
       customType: "pi-sub:stopped",
       display: true,
-      content: JSON.stringify([report], null, 2),
+      content: JSON.stringify([taskReport(report)]),
       details: [report],
     },
     { triggerTurn: false },
   );
+});
+
+test("tool handoffs omit diagnostics, retain full details and locate truncated responses", async () => {
+  const { tools, ctx } = setup();
+  const report = {
+    ...failure,
+    response: "Partial result",
+    pendingInput: ["Unsent correction"],
+  };
+  for (const response of [report.response, "x".repeat(60000)]) {
+    const value = { ...report, response };
+    fake.stop.mockResolvedValue(value);
+    const result = await tools
+      .get("sub_control")!
+      .execute(
+        "stop",
+        { id: value.id, action: "stop" },
+        new AbortController().signal,
+        () => {},
+        ctx,
+      );
+    expect(result.details).toEqual(value);
+    const text = result.content[0].text;
+    if (response.length < 60000) {
+      expect(JSON.parse(text)).toEqual({
+        id: value.id,
+        description: value.description,
+        outcome: "error",
+        response,
+        error: value.error,
+        pendingInput: value.pendingInput,
+      });
+      expect(text).not.toContain(value.sessionFile);
+    } else {
+      expect(text).toContain("[Truncated; full responses: native.jsonl]");
+      expect(text.length).toBeLessThan(response.length);
+    }
+  }
 });
 
 test.each(["interactive", "rpc"])(
@@ -368,17 +406,14 @@ test("a custom notification cannot restart an interrupted parent", () => {
 });
 
 test("one stable guidance section is replaced, not appended as repeated chat instructions", () => {
-  const { ctx, emit, sendMessage, tools } = setup();
-  Object.assign(ctx, {
-    model: { provider: "test", id: "fake" },
-    thinkingLevel: "off",
-  });
-  vi.spyOn(models, "availableModels").mockReturnValue([
-    { provider: "test", model: "fake", thinking: ["off"] },
-  ]);
-  vi.spyOn(models, "loadLadder").mockReturnValue({
+  const { emit, sendMessage, tools } = setup();
+  const load = vi.spyOn(models, "loadLadder").mockReturnValue({
     "6": "test/fake:off",
+    "10": "test/unavailable:off",
   });
+  const available = vi
+    .spyOn(models, "availableModels")
+    .mockReturnValue([{ provider: "test", model: "fake", thinking: ["off"] }]);
   const systemPromptOptions = { sections: { pi_sub: "old section" } };
   emit("before_agent_start", { systemPromptOptions });
   const first = systemPromptOptions.sections.pi_sub;
@@ -386,13 +421,54 @@ test("one stable guidance section is replaced, not appended as repeated chat ins
   expect(systemPromptOptions.sections.pi_sub).toBe(first);
   expect(first.split(SUBAGENT_GUIDANCE)).toHaveLength(2);
   expect(first).toContain(models.STRENGTH_GUIDANCE);
-  expect(first).toContain("Your configured strength: 6/10");
-  expect(first).toContain("1–6: test/fake:off");
+  expect(first).toBe(
+    `${SUBAGENT_GUIDANCE}\n\nAvailable ladder levels (snapshot): 1–6.`,
+  );
+  load.mockReturnValue({ "8": "test/fake:off" });
+  emit("before_agent_start", { systemPromptOptions });
+  expect(systemPromptOptions.sections.pi_sub).toContain(
+    "levels (snapshot): 1–8.",
+  );
+  expect(systemPromptOptions.sections.pi_sub).not.toContain("1–6.");
+  fake.tasks = [
+    {
+      ...failure,
+      status: "ready",
+      activity: "",
+      reply: { id: "internal-reply-id", delivered: false },
+    },
+  ];
+  emit("before_agent_start", { systemPromptOptions });
+  const snapshot =
+    systemPromptOptions.sections.pi_sub.split("\n\nOpen tasks: ")[1]!;
+  expect(JSON.parse(snapshot)).toEqual([
+    {
+      id: failure.id,
+      description: failure.description,
+      status: "ready",
+      outcome: "error",
+    },
+  ]);
   expect(sendMessage).not.toHaveBeenCalled();
   expect(
     [...tools.values()].reduce((n, tool) => n + tool.description.length, 0),
   ).toBeLessThan(500);
   expect(tools.get("sub_result")!.description).toContain("finish:true");
+  available.mockReturnValue([]);
+  emit("before_agent_start", { systemPromptOptions });
+  expect(systemPromptOptions.sections.pi_sub).toContain(
+    "levels (snapshot): none.",
+  );
+  load.mockImplementation(() => {
+    throw new Error("Invalid ladder");
+  });
+  emit("before_agent_start", { systemPromptOptions });
+  expect(systemPromptOptions.sections.pi_sub).toContain(
+    "Delegation unavailable: Invalid ladder",
+  );
+  expect(systemPromptOptions.sections.pi_sub).not.toContain(
+    "levels (snapshot):",
+  );
 });
 
 test.each(["interactive", "rpc"])(

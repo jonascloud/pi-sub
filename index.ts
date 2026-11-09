@@ -16,6 +16,7 @@ import {
   type TaskResult,
 } from "./src/coordinator.ts";
 import {
+  availableExecutions,
   availableModels,
   ladderPath,
   loadLadder,
@@ -31,9 +32,12 @@ import {
   renderReply,
   renderFailures,
   renderStopped,
-  routingSummary,
 } from "./src/messages.ts";
-import { pendingReplyBatch, deliveredReplies } from "./src/replies.ts";
+import {
+  pendingReplyBatch,
+  deliveredReplies,
+  taskReport,
+} from "./src/replies.ts";
 
 const reason = (error: unknown) =>
   error instanceof Error ? error.message : String(error);
@@ -187,9 +191,18 @@ export default function piSub(pi: ExtensionAPI): void {
   };
   const authorized = (id: string, ctx: ExtensionContext) =>
     authorizeTask(manager().get(id), ctx);
-  const response = (value: unknown, error = false) => {
+  const response = (
+    value: string | TaskView | TaskResult | (TaskView | TaskResult)[],
+    error = false,
+  ) => {
+    const tasks =
+      typeof value === "string" ? [] : Array.isArray(value) ? value : [value];
     const raw =
-      typeof value === "string" ? value : JSON.stringify(value, null, 2);
+      typeof value === "string"
+        ? value
+        : JSON.stringify(
+            Array.isArray(value) ? value.map(taskReport) : taskReport(value),
+          );
     const clipped = truncateHead(raw);
     const usage = coordinator?.drainUsage();
     return {
@@ -199,7 +212,9 @@ export default function piSub(pi: ExtensionAPI): void {
           text:
             clipped.content +
             (clipped.truncated
-              ? "\n[Truncated; full response is in the subagent session file.]"
+              ? tasks.length
+                ? `\n[Truncated; full responses: ${tasks.map((task) => task.sessionFile).join(", ")}]`
+                : "\n[Truncated]"
               : ""),
         },
       ],
@@ -297,38 +312,27 @@ export default function piSub(pi: ExtensionAPI): void {
       return;
     }
     runInterrupted = false;
-    let table: string;
+    let availability: string;
     try {
-      const available = availableModels(ctx);
-      const ladder = loadLadder(ladderPath());
-      const self = Object.entries(ladder)
-        .filter(([, entry]) => {
-          const ref = parseReference(entry);
-          return (
-            ref.provider === ctx.model?.provider &&
-            ref.model === ctx.model.id &&
-            ref.thinking === (ctx.thinkingLevel ?? "off")
-          );
-        })
-        .map(([level]) => Number(level));
-      table =
-        `Your configured strength: ${self.length ? Math.max(...self) + "/10" : "unknown"}.\n` +
-        "Configured ladder (minimum level → execution):\n" +
-        routingSummary(ladder, available);
+      const max = availableExecutions(
+        loadLadder(ladderPath()),
+        availableModels(ctx),
+      ).at(-1)?.power;
+      availability = `Available ladder levels (snapshot): ${max ? (max === 1 ? "1" : `1–${max}`) : "none"}.`;
     } catch (error) {
-      table = reason(error);
+      availability = `Delegation unavailable: ${reason(error)}`;
     }
-    event.systemPromptOptions.sections.pi_sub = `${SUBAGENT_GUIDANCE}\n\nOpen tasks (snapshot): ${JSON.stringify(
-      manager()
-        .list()
-        .map((task) => ({
-          id: task.id,
-          description: task.description,
-          status: task.status,
-          outcome: task.outcome,
-          reply: task.reply,
-        })),
-    )}\n\n${table}`;
+    const tasks = manager()
+      .list()
+      .map(({ id, description, status, outcome }) => ({
+        id,
+        description,
+        status,
+        outcome,
+      }));
+    event.systemPromptOptions.sections.pi_sub =
+      `${SUBAGENT_GUIDANCE}\n\n${availability}` +
+      (tasks.length ? `\n\nOpen tasks: ${JSON.stringify(tasks)}` : "");
   });
   pi.on("session_shutdown", async () => {
     lifetime.abort();
@@ -378,7 +382,7 @@ export default function piSub(pi: ExtensionAPI): void {
                 {
                   customType: "pi-sub:stopped",
                   display: true,
-                  content: JSON.stringify(results, null, 2),
+                  content: JSON.stringify(results.map(taskReport)),
                   details: results,
                 },
                 { triggerTurn: false },
@@ -475,7 +479,7 @@ export default function piSub(pi: ExtensionAPI): void {
       exposure: "model-only",
       executionMode: "sequential",
       description:
-        "Read or wait for a response. Complete deliveries collapse the widget row but keep the task available for follow-up. finish:true explicitly accepts/removes it; a timeout only ends the wait.",
+        "Read or wait for a response; the task stays available for follow-up. finish:true accepts/removes it, not merely acknowledges it. A timeout only ends the wait.",
       parameters: Type.Object(
         {
           id: Type.String(),

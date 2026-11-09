@@ -7,7 +7,6 @@ import {
   renderReply,
   renderFailures,
   renderStopped,
-  routingSummary,
 } from "../src/messages.ts";
 import { replyBatch } from "../src/replies.ts";
 import { STRENGTH_GUIDANCE } from "../src/models.ts";
@@ -87,22 +86,6 @@ test("TUI notifications are two-line previews with expandable complete delivery"
       expect(visibleWidth(line)).toBeLessThanOrEqual(width);
 });
 
-test("routing context groups identical outcomes instead of repeating every level", () => {
-  const ladder = {
-    "6": "p/m:off",
-    "9": "p/m:high",
-  };
-  const text = routingSummary(ladder, [
-    { provider: "p", model: "m", thinking: ["off", "high"] },
-  ]);
-  expect(text.split("\n")).toEqual([
-    "1–6: p/m:off · rung 6",
-    "7–9: p/m:high · rung 9",
-    "10: unavailable",
-  ]);
-  expect(routingSummary(ladder, [])).toBe("1–10: unavailable");
-});
-
 test("failure reports retain partial work and pending input without a cleanup tutorial", () => {
   const { status: _status, activity: _activity, ...data } = task;
   const report: TaskResult = {
@@ -117,10 +100,7 @@ test("failure reports retain partial work and pending input without a cleanup tu
   expect(text).toContain("Partial: Question?");
   expect(text).toContain("Pending: Unsent correction");
   expect(text).not.toContain("cleanup tool");
-  expect(SUBAGENT_GUIDANCE).toContain(
-    "Failed work is closed and reported automatically",
-  );
-  expect(SUBAGENT_GUIDANCE).toContain("rather than acknowledging");
+  expect(SUBAGENT_GUIDANCE).toContain("Reports need no acknowledgement");
   expect(SUBAGENT_GUIDANCE.split(STRENGTH_GUIDANCE)).toHaveLength(2);
 });
 
