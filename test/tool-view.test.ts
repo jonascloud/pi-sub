@@ -164,23 +164,58 @@ test("reading is distinct from acceptance and active snapshots do not advertise 
   expect(text(component)).not.toContain("STALE ANSWER");
 });
 
-test("the exact native wait timeout is ordinary feedback, not classification of child text", () => {
-  const component = row("sub_result", {
-    id: "task-123456789",
-    wait: true,
-    timeout: 0,
-  });
-  expect(text(component)).toContain("Wait for response");
-  result(component, "Wait timed out", true);
-  expect(text(component)).toContain("Wait ended");
-  expect(text(component)).toContain("No response yet.");
-  expect(text(component)).not.toContain("Could not");
-  result(
-    component,
-    task({ status: "ready", outcome: "reply", response: "Wait timed out" }),
-  );
-  expect(text(component)).toContain("Response · API review");
-  expect(text(component)).not.toContain("Wait ended");
+test.each([false, true])(
+  "the native wait timeout is ordinary feedback (finish=%s)",
+  (finish) => {
+    const workspace = new Workspace();
+    try {
+      const component = row("sub_result", {
+        id: "task-123456789",
+        wait: true,
+        timeout: 0,
+        finish,
+      });
+      expect(text(component)).toContain("Wait for response");
+      component.updateResult(
+        { ...reportResult("Wait timed out", workspace), isError: true },
+        false,
+      );
+      expect(text(component)).toContain("Wait ended");
+      expect(text(component)).toContain("No response yet.");
+      expect(text(component)).not.toContain("Could not");
+      component.setExpanded(true);
+      expect(text(component)).toContain("Wait ended");
+      expect(text(component)).toContain("Wait timed out");
+      expect(text(component)).not.toContain("Could not");
+    } finally {
+      workspace.dispose();
+    }
+  },
+);
+
+test("child response text is not classified as a wait timeout", () => {
+  const workspace = new Workspace();
+  try {
+    const component = row("sub_result", { id: "task-123456789", wait: true });
+    component.updateResult(
+      {
+        ...reportResult(
+          task({
+            status: "ready",
+            outcome: "reply",
+            response: "Wait timed out",
+          }),
+          workspace,
+        ),
+        isError: false,
+      },
+      false,
+    );
+    expect(text(component)).toContain("Response · API review");
+    expect(text(component)).not.toContain("Wait ended");
+  } finally {
+    workspace.dispose();
+  }
 });
 
 test("acceptance is compact but complete data remains expandable, including stopped receipts", () => {

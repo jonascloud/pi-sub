@@ -223,12 +223,7 @@ function summary(
   partial: boolean,
 ): View {
   // This is the coordinator's exact timeout outcome, not a heuristic over child text.
-  if (
-    error &&
-    tool === "sub_result" &&
-    args.wait &&
-    details === "Wait timed out"
-  )
+  if (error && tool === "sub_result" && args.wait && text === "Wait timed out")
     return {
       action: "Wait ended",
       name: identity(args),
