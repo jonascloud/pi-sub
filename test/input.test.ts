@@ -59,7 +59,7 @@ vi.mock("../src/coordinator.ts", () => ({
       activity: "",
     });
     drainUsage = () => undefined;
-    list = () => [...fake.tasks].reverse();
+    list = () => [...fake.tasks];
     subscribe = () => () => {};
     dispose = fake.dispose;
   },

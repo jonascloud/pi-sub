@@ -170,7 +170,7 @@ describe("widget rendering", () => {
         expect(stripTerminalSequences(lines[0]!)).toBe("thk".slice(0, width));
     }
   });
-  it("prioritizes errors and paused tasks while retaining newest input order", () => {
+  it("prioritizes errors and paused tasks while retaining input order", () => {
     const tasks = [
       task({ description: "new run" }),
       task({ description: "paused", status: "paused" }),
@@ -215,7 +215,7 @@ describe("widget rendering", () => {
     expect(rows.join("\n")).not.toContain("broken");
     expect(render([])).toEqual([]);
   });
-  it("selects newest ordinary rows and does not repeat tokens or models in rows", () => {
+  it("selects the first ordinary rows and does not repeat tokens or models in rows", () => {
     const rows = render(
       [
         task({ description: "Newest" }),

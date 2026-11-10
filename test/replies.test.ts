@@ -344,8 +344,8 @@ test("live replies are selected oldest-first without a second queue or mutations
     { ...ready("failed"), outcome: "error" },
     { ...ready("stopped"), outcome: "stopped" },
     delivered,
-    b,
     a,
+    b,
   ];
   const before = structuredClone(tasks);
   const batch = pendingReplyBatch(tasks, session())!;
@@ -372,7 +372,7 @@ test("native branch announcements suppress even compacted file references", () =
     { id: "a", replyId: "reply-a" },
   ]);
   expect(
-    pendingReplyBatch([b, a], history)!.details.replies.map(({ id }) => id),
+    pendingReplyBatch([a, b], history)!.details.replies.map(({ id }) => id),
   ).toEqual(["b"]);
   expect(a.reply!.delivered).toBe(false);
 });
@@ -419,7 +419,7 @@ test("large batches use one file and need no overflow wakeup after native commit
   const tasks = Array.from({ length: 10 }, (_, i) => ({
     ...ready(String(i)),
     response: "line of results\n".repeat(200),
-  })).reverse();
+  }));
   const first = pendingReplyBatch(tasks, session())!;
   const saved: AgentMessage = { ...first, role: "custom", timestamp: 0 };
   expect(first.details.replies).toHaveLength(tasks.length);
