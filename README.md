@@ -114,7 +114,7 @@ There are no spinners or worker heartbeats. Native events update progress immedi
 
 After process closure, each execution reads the saved native journal, including late shutdown usage. A valid whole-session snapshot replaces the previous snapshot so continuation does not charge earlier executions again. An unreadable, corrupt or identity-mismatched final journal cannot replace confirmed accounting. Unpersisted provider usage cannot be reconstructed.
 
-Acceptance, explicit stop or automatic failure collection transfers original assistant, tool, compaction, branch-summary and native usage. Delivery changes visibility only, not billing. Captured usage is aggregated until the next subagent tool result reports it once. Commands and notifications alone cannot add it to native parent tool-result totals; uncollected work at shutdown is not charged through this extension. Costs are never repriced through the parent model. Streamed widget tokens reconcile with the confirmed saved snapshot after execution.
+Each confirmed snapshot charges its growth: original assistant, tool, compaction, branch-summary and native usage, independent of delivery, acceptance or stop. Charged usage is aggregated until the next subagent tool result reports it once. Pi offers extensions no other way into parent totals: commands and notifications cannot carry usage, and work confirmed after the last subagent tool result of a session is not charged through this extension. Costs are never repriced through the parent model. Streamed widget tokens reconcile with the confirmed saved snapshot after execution.
 
 ## Native boundaries
 

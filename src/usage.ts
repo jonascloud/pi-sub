@@ -30,3 +30,28 @@ export function addUsage(total: Usage | undefined, value: Usage): Usage {
       value.cost.totalFromProvider === true;
   return total;
 }
+
+/** Usage added since an earlier snapshot of the same append-only journal. */
+export function usageDelta(next: Usage, previous: Usage | undefined): Usage {
+  const delta = structuredClone(next);
+  if (!previous) return delta;
+  for (const key of [
+    "input",
+    "output",
+    "cacheRead",
+    "cacheWrite",
+    "totalTokens",
+  ] as const)
+    delta[key] -= previous[key];
+  for (const key of ["reasoning", "cacheWrite1h"] as const)
+    if (delta[key] !== undefined) delta[key] -= previous[key] ?? 0;
+  for (const key of [
+    "input",
+    "output",
+    "cacheRead",
+    "cacheWrite",
+    "total",
+  ] as const)
+    delta.cost[key] -= previous.cost[key];
+  return delta;
+}
