@@ -13,7 +13,12 @@ import * as models from "../src/models.ts";
 import { Workspace } from "../src/workspace.ts";
 import { SUBAGENT_GUIDANCE } from "../src/messages.ts";
 import { replyBatch } from "../src/replies.ts";
-import { taskReport, taskMetadata, reportDetails } from "../src/reports.ts";
+import {
+  taskReport,
+  taskMetadata,
+  reportDetails,
+  reportResult,
+} from "../src/reports.ts";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 
 const fake = vi.hoisted(() => ({
@@ -710,8 +715,7 @@ test("a complete same-turn tool return suppresses its notification without accep
     toolCallId: "read-a",
     timestamp: 0,
     isError: false,
-    details: JSON.parse(JSON.stringify(a)),
-    content: [{ type: "text", text: JSON.stringify(a) }],
+    ...JSON.parse(JSON.stringify(reportResult(a, workspace))),
   };
   const result = emit("turn_end", {
     context: { contextMessages: [message], pendingMessages: [] },

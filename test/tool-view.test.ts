@@ -10,7 +10,7 @@ import {
 } from "@earendil-works/pi-tui";
 import type { TaskView, TaskResult } from "../src/coordinator.ts";
 import { taskToolRenderers } from "../src/tool-view.ts";
-import { reportResult } from "../src/reports.ts";
+import { digest, reportResult } from "../src/reports.ts";
 import { Workspace } from "../src/workspace.ts";
 
 beforeAll(() => initTheme("dark", false));
@@ -246,7 +246,7 @@ test("control titles follow confirmed data rather than the requested action", ()
   result(component, task({ operation: "pausing" }));
   expect(text(component)).toContain("Pausing…");
   expect(text(component)).not.toContain("Paused");
-  result(component, task({ status: "paused", outcome: "stopped" }));
+  result(component, task({ status: "paused" }));
   expect(text(component)).toContain("Paused · API review");
   expect(text(component)).not.toContain("Stopped");
   result(component, task({ status: "ready", outcome: "reply" }));
@@ -354,7 +354,10 @@ test("file-backed tool rows keep full native diagnostics without reading the art
   const content = JSON.stringify({ file: "/not-read/report.txt" });
   result(
     component,
-    { report, handoff: { content, file: "/not-read/report.txt" } },
+    {
+      report,
+      handoff: { file: "/not-read/report.txt", digest: digest(content) },
+    },
     false,
     false,
     content,

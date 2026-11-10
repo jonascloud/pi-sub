@@ -17,9 +17,9 @@ import {
 import {
   availableExecutions,
   availableModels,
+  checkRetained,
   ladderPath,
   loadLadder,
-  parseReference,
   selectExecution,
 } from "./src/models.ts";
 import { Workspace } from "./src/workspace.ts";
@@ -160,36 +160,13 @@ export default function piSub(pi: ExtensionAPI): void {
     if (prepared) scheduleReplies();
     return prepared;
   };
-  const authorizeTask = (task: TaskView, ctx: ExtensionContext) => {
-    const execution = task.execution;
-    if (
-      !availableModels(ctx).some(
-        (model) =>
-          model.provider === execution.provider &&
-          model.model === execution.model &&
-          model.thinking.includes(execution.thinking),
-      )
-    ) {
-      throw new Error(
-        "The retained execution is no longer available. Stop this subagent instead.",
-      );
-    }
-    const retained = Object.entries(loadLadder(ladderPath())).some(
-      ([level, entry]) => {
-        const ref = parseReference(entry);
-        return (
-          Number(level) >= task.level &&
-          ref.provider === execution.provider &&
-          ref.model === execution.model &&
-          ref.thinking === execution.thinking
-        );
-      },
+  const authorizeTask = (task: TaskView, ctx: ExtensionContext) =>
+    checkRetained(
+      loadLadder(ladderPath()),
+      task.level,
+      task.execution,
+      availableModels(ctx),
     );
-    if (!retained)
-      throw new Error(
-        "The retained execution no longer meets the task's minimum level. Stop this subagent instead.",
-      );
-  };
   const authorized = (id: string, ctx: ExtensionContext) =>
     authorizeTask(manager().get(id), ctx);
   const response = (value: Reports, error = false) => {
@@ -378,7 +355,7 @@ export default function piSub(pi: ExtensionAPI): void {
         "Start an asynchronous, self-contained task at the required minimum level.",
       parameters: Type.Object(
         {
-          level: Type.Number({ minimum: 1, maximum: 10, multipleOf: 1 }),
+          level: Type.Integer({ minimum: 1, maximum: 10 }),
           prompt: Type.String({ minLength: 1 }),
           description: Type.Optional(
             Type.String({ description: "Short task label." }),

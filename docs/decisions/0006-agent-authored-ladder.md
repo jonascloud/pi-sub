@@ -12,7 +12,7 @@ pi-sub only reads, validates and routes from that file. Remove `/sub:models`, it
 
 Model choice is an occasional advisory task. A separate setup mode duplicates conversation capabilities and couples configuration editing to task lifetime, interruption and reply delivery. Native agent tools already support research and file editing, including before delegation is configured.
 
-Approval is now an instruction to the agent, not an extension-enforced, revision-bound authorization step. pi-sub no longer provides a configuration writer, cross-process publication lock, private file creation or profile ignore-rule management. The guide requests approval, change checks and safe editing; it does not claim those are runtime guarantees. The extension continues to protect its own project task journals.
+Approval is now an instruction to the agent, not an extension-enforced, revision-bound authorization step. pi-sub no longer provides a configuration writer, cross-process publication lock, private file creation or profile ignore-rule management. The guide requests approval, change checks and safe editing; it does not claim those are runtime guarantees.
 
 Existing configuration remains active until externally edited. Changes affect subsequent admission, including continuations, but do not interrupt an already running execution. The configured execution remains independent of the parent model's cycling scope, with native availability and sufficient ladder membership checked before execution.
 

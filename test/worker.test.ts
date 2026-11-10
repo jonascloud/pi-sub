@@ -116,7 +116,7 @@ process.stdin.on('end', () => {
     await readFile(join(dir, "session.jsonl.args"), "utf8"),
   );
   expect(spawn).toHaveBeenLastCalledWith(
-    "node",
+    process.execPath,
     expect.any(Array),
     expect.any(Object),
   );

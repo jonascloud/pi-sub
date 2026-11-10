@@ -108,8 +108,9 @@ export function createWorker(
     if (stopRequested) return report(aggregateUsage(before.entries));
 
     try {
+      // The parent's runtime, not whichever node happens to be first on PATH.
       child = spawn(
-        "node",
+        process.execPath,
         [
           options.cliPath
             ? resolve(options.cliPath)

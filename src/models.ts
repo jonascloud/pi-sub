@@ -152,3 +152,31 @@ export function selectExecution(
     `No available ladder execution for level ${level}; check ${ladderPath()} and native model availability. ${setupHelp}`,
   );
 }
+
+/** A retained execution stays usable while available and configured at or above its level. */
+export function checkRetained(
+  ladder: Ladder,
+  level: number,
+  execution: Pick<Execution, "provider" | "model" | "thinking">,
+  available: readonly AvailableModel[],
+): void {
+  const same = (entry: Pick<Execution, "provider" | "model">) =>
+    entry.provider === execution.provider && entry.model === execution.model;
+  if (
+    !available.some((a) => same(a) && a.thinking.includes(execution.thinking))
+  )
+    throw new Error(
+      "The retained execution is no longer available. Stop this subagent instead.",
+    );
+  if (
+    !availableExecutions(ladder, available).some(
+      (entry) =>
+        entry.power >= level &&
+        same(entry) &&
+        entry.thinking === execution.thinking,
+    )
+  )
+    throw new Error(
+      "The retained execution no longer meets the task's minimum level. Stop this subagent instead.",
+    );
+}

@@ -199,27 +199,33 @@ test("batches are bounded without losing the full reports or silently dropping l
   expect(replyBatch([])).toBeUndefined();
 });
 
+const toolResult = (
+  value: TaskView | TaskView[],
+  toolName = "sub_result",
+): Extract<AgentMessage, { role: "toolResult" }> => ({
+  role: "toolResult",
+  toolCallId: "call-1",
+  toolName,
+  ...persisted(reportResult(value, workspace)),
+  isError: false,
+  timestamp: 0,
+});
+/** Native history stores tool results as JSON. */
+const persisted = ({ content, details }: ReturnType<typeof reportResult>) => ({
+  content,
+  details: JSON.parse(JSON.stringify(details)),
+});
+
 test("complete tool returns acknowledge replies without accepting tasks", () => {
   const ready = { ...task, reply: { id: "reply-1", delivered: false } };
-  const message = {
-    role: "toolResult" as const,
-    toolCallId: "call-1",
-    toolName: "sub_result",
-    content: [
-      { type: "text" as const, text: JSON.stringify(taskReport(ready)) },
-    ],
-    details: ready,
-    isError: false,
-    timestamp: 0,
-  };
+  const message = toolResult(ready);
   expect(deliveredReplies(message)).toEqual([
     { id: task.id, replyId: "reply-1" },
   ]);
   expect(
     deliveredReplies({
       ...message,
-      details: { ...ready, extra: "diagnostics" },
-      content: [{ type: "text", text: JSON.stringify(ready) }],
+      details: { ...(message.details as object), extra: "diagnostics" },
     }),
   ).toEqual([{ id: task.id, replyId: "reply-1" }]);
   expect(
@@ -228,7 +234,7 @@ test("complete tool returns acknowledge replies without accepting tasks", () => 
       content: [
         {
           type: "text",
-          text: JSON.stringify({ ...ready, response: "shortened" }),
+          text: JSON.stringify({ ...taskReport(ready), response: "shortened" }),
         },
       ],
     }),
@@ -241,17 +247,20 @@ test("complete tool returns acknowledge replies without accepting tasks", () => 
       content: [{ type: "text", text: "[Truncated]" }],
     }),
   ).toEqual([]);
-  const values = [
-    ready,
-    { ...ready, id: "second", reply: { id: "reply-2", delivered: false } },
-  ];
   expect(
-    deliveredReplies({
-      ...message,
-      toolName: "sub_control",
-      details: values,
-      content: [{ type: "text", text: JSON.stringify(values.map(taskReport)) }],
-    }),
+    deliveredReplies(
+      toolResult(
+        [
+          ready,
+          {
+            ...ready,
+            id: "second",
+            reply: { id: "reply-2", delivered: false },
+          },
+        ],
+        "sub_control",
+      ),
+    ),
   ).toEqual([
     { id: task.id, replyId: "reply-1" },
     { id: "second", replyId: "reply-2" },
@@ -383,15 +392,7 @@ test("current boundary messages replace a stale projection without becoming deli
 
 test("complete tool returns suppress announcements; previews and old replies do not", () => {
   const a = ready("a");
-  const result: Extract<AgentMessage, { role: "toolResult" }> = {
-    role: "toolResult",
-    toolName: "sub_result",
-    toolCallId: "call",
-    content: [{ type: "text", text: JSON.stringify(a) }],
-    details: JSON.parse(JSON.stringify(a)),
-    isError: false,
-    timestamp: 0,
-  };
+  const result = toolResult(a);
   expect(pendingReplyBatch([a], session([result]))).toBeUndefined();
   expect(a.reply!.delivered).toBe(false);
   expect(
