@@ -19,7 +19,7 @@ const record = (value: unknown): Record<string, unknown> | undefined =>
     ? (value as Record<string, unknown>)
     : undefined;
 
-/** Live tasks (newest-first, as Coordinator.list) are the inbox; native history
+/** Live tasks in creation order are the inbox; native history
  * records announcements. Recompute at every boundary, never retain a second queue.
  */
 export function pendingReplyBatch(
@@ -31,15 +31,13 @@ export function pendingReplyBatch(
   messages: readonly AgentMessage[] | undefined,
   workspace: Workspace,
 ) {
-  const replies = [...tasks]
-    .reverse()
-    .filter(
-      (task) =>
-        task.status === "ready" &&
-        task.outcome === "reply" &&
-        task.reply &&
-        !task.reply.delivered,
-    );
+  const replies = tasks.filter(
+    (task) =>
+      task.status === "ready" &&
+      task.outcome === "reply" &&
+      task.reply &&
+      !task.reply.delivered,
+  );
   if (!replies.length) return;
   const covered = new Set<string>();
   for (const entry of session.getBranch())

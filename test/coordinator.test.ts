@@ -227,6 +227,24 @@ describe("one session, fresh execution processes", () => {
     await c.dispose();
   });
 
+  it("resumes all paused tasks in creation order across the worker limit", async () => {
+    const { c, workers, start } = setup();
+    const ids = ["first", "second", "third"].map(start);
+    const sessions = ids.map((id) => c.get(id).sessionFile);
+    const interrupted = c.interrupt();
+    workers[0]!.close({ interrupted: true });
+    await interrupted;
+    await c.prompt();
+    for (const task of c.list()) await c.continue(task.id);
+    for (let i = 0; i < ids.length; i++) {
+      expect(workers).toHaveLength(i + 2);
+      expect(workers[i + 1]!.sessionFile).toBe(sessions[i]);
+      workers[i + 1]!.close();
+      await tick();
+    }
+    await c.dispose();
+  });
+
   it("a closed paused execution frees capacity without taking the task", async () => {
     const { c, workers, start } = setup();
     const a = start("a"),

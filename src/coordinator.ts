@@ -171,8 +171,9 @@ export class Coordinator {
     t.status = status;
     this.emit();
   }
+  /** Live tasks in creation order, including across pause and continuation. */
   list(): TaskView[] {
-    return [...this.tasks.values()].reverse().map((t) => this.view(t));
+    return [...this.tasks.values()].map((t) => this.view(t));
   }
   get(id: string): TaskView {
     return this.view(this.task(id));
