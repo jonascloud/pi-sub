@@ -13,7 +13,12 @@ import * as models from "../src/models.ts";
 import { Workspace } from "../src/workspace.ts";
 import { SUBAGENT_GUIDANCE } from "../src/messages.ts";
 import { replyBatch } from "../src/replies.ts";
-import { taskReport, taskMetadata, reportDetails } from "../src/reports.ts";
+import {
+  taskReport,
+  taskMetadata,
+  reportDetails,
+  reportResult,
+} from "../src/reports.ts";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 
 const fake = vi.hoisted(() => ({
@@ -121,7 +126,6 @@ function setup(mode = "rpc") {
   const registerMessageRenderer = vi.fn();
   const notify = vi.fn();
   const abort = vi.fn();
-  let terminalInput: ((data: string) => unknown) | undefined;
   const ctx = {
     cwd,
     mode,
@@ -142,10 +146,6 @@ function setup(mode = "rpc") {
       notify,
       setWidget: vi.fn(),
       setEditorText: vi.fn(),
-      onTerminalInput: (listener: typeof terminalInput) => {
-        terminalInput = listener;
-        return () => {};
-      },
     },
   } as unknown as ExtensionContext;
   piSub({
@@ -196,7 +196,6 @@ function setup(mode = "rpc") {
       fake.tasks = [...fake.tasks.filter((old) => old.id !== task.id), task];
       fake.onReady!(task);
     },
-    key: (data: string) => terminalInput!(data),
   };
 }
 
@@ -565,18 +564,6 @@ test("global /sub:pause interrupts headless work and aborts the parent", async (
   expect(fake.prompt).not.toHaveBeenCalled();
 });
 
-test("TUI Escape is global except while a dialog owns Escape", () => {
-  const { emit, key, abort } = setup("tui");
-  emit("ui_prompt_start", { reason: "ui_prompt", kind: "confirm" });
-  key("\u001b");
-  expect(fake.interrupt).not.toHaveBeenCalled();
-  expect(abort).not.toHaveBeenCalled();
-  emit("ui_prompt_end", { reason: "ui_prompt", kind: "confirm" });
-  key("\u001b");
-  expect(fake.interrupt).toHaveBeenCalledOnce();
-  expect(abort).toHaveBeenCalledOnce();
-});
-
 test("terminal errors notify the human, never trigger the parent LLM", () => {
   const { emit, notify, sendMessage } = setup();
   emit("agent_start"); // Lazily constructs the actual factory's coordinator callbacks.
@@ -728,8 +715,7 @@ test("a complete same-turn tool return suppresses its notification without accep
     toolCallId: "read-a",
     timestamp: 0,
     isError: false,
-    details: JSON.parse(JSON.stringify(a)),
-    content: [{ type: "text", text: JSON.stringify(a) }],
+    ...JSON.parse(JSON.stringify(reportResult(a, workspace))),
   };
   const result = emit("turn_end", {
     context: { contextMessages: [message], pendingMessages: [] },

@@ -119,7 +119,7 @@ describe("reply delivery is not task acceptance", () => {
     });
     expect(first.reply!.delivered).toBe(false); // Snapshots cannot change underneath a carrier.
     expect(c.summary().completed).toBe(0);
-    expect(c.drainUsage()).toBeUndefined();
+    expect(c.drainUsage()).toEqual(usage(25)); // Confirmed work, not acceptance, is charged.
 
     const blocker = start("occupy the slot");
     await c.message(id, "Production");
@@ -141,7 +141,7 @@ describe("reply delivery is not task acceptance", () => {
     await c.collect(id);
     expect(c.markDelivered(id, next.reply!.id)).toBe(false);
     expect(c.summary().completed).toBe(1);
-    expect(c.drainUsage()).toEqual(usage(75));
+    expect(c.drainUsage()).toEqual(usage(50));
     await c.dispose();
   });
 
@@ -360,23 +360,23 @@ describe("input ownership at close", () => {
 
 describe("final reports and receipts", () => {
   it.each(["collect", "stop", "failure"] as const)(
-    "preserves cumulative display and bills once on %s",
+    "preserves cumulative display and charges each execution once before %s",
     async (take) => {
       const { c, workers, start } = setup();
       const id = start();
       workers[0]!.close({ usage: usage(8, 2) });
       await tick();
-      expect(c.drainUsage()).toBeUndefined();
+      expect(c.drainUsage()).toEqual(usage(8, 2));
       await c.message(id, "next");
       workers[1]!.close({
         usage: usage(12, 3, 10),
         ...(take === "failure" ? { error: "failed" } : {}),
       });
       await tick();
+      expect(c.drainUsage()).toEqual(usage(4, 1, 10));
       if (take === "collect") await c.collect(id);
       else if (take === "stop") await c.stop(id);
       else await c.prompt();
-      expect(c.drainUsage()).toEqual(usage(12, 3, 10));
       await c.collect(id);
       await c.stop(id);
       await c.prompt();
@@ -608,7 +608,7 @@ describe("admission and shutdown", () => {
     await c.dispose();
   });
 
-  it("aggregates archived usage once and drains independently", async () => {
+  it("aggregates confirmed usage once and drains independently", async () => {
     const { c, workers, start } = setup();
     const a = start("a");
     workers[0]!.close({
@@ -638,6 +638,25 @@ describe("admission and shutdown", () => {
       cost: { total: 6, totalFromProvider: false },
     });
     expect(c.drainUsage()).toBeUndefined();
+    await c.dispose();
+  });
+
+  it("charges only the growth of optional counters across continuations", async () => {
+    const { c, workers, start } = setup();
+    const id = start();
+    workers[0]!.close({ usage: { ...usage(2), reasoning: 3 } });
+    await tick();
+    c.drainUsage();
+    await c.message(id, "next");
+    workers[1]!.close({
+      usage: { ...usage(5), reasoning: 7, cacheWrite1h: 1 },
+    });
+    await tick();
+    expect(c.drainUsage()).toEqual({
+      ...usage(3),
+      reasoning: 4,
+      cacheWrite1h: 1,
+    });
     await c.dispose();
   });
 

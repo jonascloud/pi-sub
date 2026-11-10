@@ -22,4 +22,4 @@ Line-based truncation of compact JSON can erase the entire report, including ide
 
 Subagents are working context, not a parallel archive. Session ownership bounds retention by a clear user-visible lifetime without timers, reference scanners or restoration services. Storage can still grow within a long active session. Existing historical data is not rewritten, and legacy project-local directories are not automatically removed.
 
-Synchronous local writes avoid asynchronous snapshot coordination, but can delay the event loop for large reports or slow storage. External edits or deletion can invalidate references; pi-sub does not monitor operator changes. See the [delivery contract](../../README.md#replies-and-delivery) for limits and native result shapes.
+Synchronous local writes avoid asynchronous snapshot coordination, but can delay the event loop for large reports or slow storage. External edits or deletion can invalidate references; pi-sub does not monitor operator changes. Output limits and native result shapes live in [`reports.ts`](../../src/reports.ts) and [`replies.ts`](../../src/replies.ts).

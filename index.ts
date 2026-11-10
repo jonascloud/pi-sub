@@ -7,7 +7,7 @@ import {
   type AgentBeforeSettleEvent,
   type TurnEndEvent,
 } from "@earendil-works/pi-coding-agent";
-import { matchesKey, stripTerminalSequences } from "@earendil-works/pi-tui";
+import { stripTerminalSequences } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
   Coordinator,
@@ -17,9 +17,9 @@ import {
 import {
   availableExecutions,
   availableModels,
+  checkRetained,
   ladderPath,
   loadLadder,
-  parseReference,
   selectExecution,
 } from "./src/models.ts";
 import { Workspace } from "./src/workspace.ts";
@@ -47,7 +47,6 @@ export default function piSub(pi: ExtensionAPI): void {
   let context: ExtensionContext | undefined;
   let coordinator: Coordinator | undefined;
   let unmount: (() => void) | undefined;
-  let detachInput: (() => void) | undefined;
   const signals = new WeakSet<AbortSignal>();
   let runInterrupted = false;
   let dialogOpen = false;
@@ -161,36 +160,13 @@ export default function piSub(pi: ExtensionAPI): void {
     if (prepared) scheduleReplies();
     return prepared;
   };
-  const authorizeTask = (task: TaskView, ctx: ExtensionContext) => {
-    const execution = task.execution;
-    if (
-      !availableModels(ctx).some(
-        (model) =>
-          model.provider === execution.provider &&
-          model.model === execution.model &&
-          model.thinking.includes(execution.thinking),
-      )
-    ) {
-      throw new Error(
-        "The retained execution is no longer available. Stop this subagent instead.",
-      );
-    }
-    const retained = Object.entries(loadLadder(ladderPath())).some(
-      ([level, entry]) => {
-        const ref = parseReference(entry);
-        return (
-          Number(level) >= task.level &&
-          ref.provider === execution.provider &&
-          ref.model === execution.model &&
-          ref.thinking === execution.thinking
-        );
-      },
+  const authorizeTask = (task: TaskView, ctx: ExtensionContext) =>
+    checkRetained(
+      loadLadder(ladderPath()),
+      task.level,
+      task.execution,
+      availableModels(ctx),
     );
-    if (!retained)
-      throw new Error(
-        "The retained execution no longer meets the task's minimum level. Stop this subagent instead.",
-      );
-  };
   const authorized = (id: string, ctx: ExtensionContext) =>
     authorizeTask(manager().get(id), ctx);
   const response = (value: Reports, error = false) => {
@@ -207,15 +183,7 @@ export default function piSub(pi: ExtensionAPI): void {
     context = ctx;
     if (ctx.mode === "tui") {
       unmount?.();
-      detachInput?.();
       unmount = mountWidget(ctx.ui, manager());
-      detachInput = ctx.ui.onTerminalInput((data) => {
-        if (!dialogOpen && matchesKey(data, "escape")) {
-          interrupt();
-          ctx.abort();
-        }
-        return undefined;
-      });
     }
   });
   pi.on("ui_prompt_start", () => {
@@ -316,7 +284,6 @@ export default function piSub(pi: ExtensionAPI): void {
   pi.on("session_shutdown", async () => {
     lifetime.abort();
     if (idleDelivery) clearImmediate(idleDelivery);
-    detachInput?.();
     unmount?.();
     await coordinator?.dispose();
     workspace.dispose();
@@ -388,7 +355,7 @@ export default function piSub(pi: ExtensionAPI): void {
         "Start an asynchronous, self-contained task at the required minimum level.",
       parameters: Type.Object(
         {
-          level: Type.Number({ minimum: 1, maximum: 10, multipleOf: 1 }),
+          level: Type.Integer({ minimum: 1, maximum: 10 }),
           prompt: Type.String({ minLength: 1 }),
           description: Type.Optional(
             Type.String({ description: "Short task label." }),

@@ -236,7 +236,7 @@ test("expanded file replies expose a temporary reference, not an archived payloa
     200,
   ).join("\n");
   expect(expanded).not.toContain("END_OF_FULL_REPLY");
-  expect(expanded).toContain("preserve relevant findings");
+  expect(expanded).toMatch(/preserve\s+relevant\s+findings/);
   expect(expanded).toContain(JSON.parse(reply.content).file);
   expect(expanded).toContain("native.jsonl");
 });

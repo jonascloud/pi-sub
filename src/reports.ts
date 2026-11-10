@@ -186,7 +186,7 @@ export function reportResult(value: Reports, workspace: Workspace) {
 
 function artifact(
   details: unknown,
-): { file: string; digest?: string; content?: string } | undefined {
+): { file: string; digest: string } | undefined {
   if (!details || typeof details !== "object" || !("handoff" in details))
     return;
   const value = details.handoff;
@@ -195,10 +195,10 @@ function artifact(
     typeof value === "object" &&
     "file" in value &&
     typeof value.file === "string" &&
-    (("digest" in value && typeof value.digest === "string") ||
-      ("content" in value && typeof value.content === "string"))
+    "digest" in value &&
+    typeof value.digest === "string"
   )
-    return value as { file: string; digest?: string; content?: string };
+    return { file: value.file, digest: value.digest };
 }
 
 export function reportFailure(details: unknown): string | undefined {
@@ -253,11 +253,5 @@ export function reportDetails(details: unknown, content?: string): unknown {
 
 /** Delivery proves the exact saved-file reference was in context, not that its file was read. */
 export function deliveredFile(details: unknown, content: string): boolean {
-  const value = artifact(details);
-  return (
-    !!value &&
-    (value.digest
-      ? value.digest === digest(content)
-      : value.content === content)
-  );
+  return artifact(details)?.digest === digest(content);
 }

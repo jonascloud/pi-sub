@@ -157,22 +157,16 @@ export function deliveredReplies(message: AgentMessage): ReplyReference[] {
     if (deliveredFile(message.details, text)) return announcedReplies(message);
     // Compare exact segments: an answer may itself quote another report.
     let offset = 0;
-    return replyReports(message.details).flatMap((data, index) => {
+    return replyReports(message.details).flatMap((data) => {
       const delivery = record(data.delivery);
-      const segment =
-        typeof data.response === "string"
-          ? (index ? "\n\n" : "") +
-            replyText({ ...data, response: data.response })
-          : "";
-      const length =
-        typeof delivery?.length === "number" ? delivery.length : segment.length;
-      const complete = delivery
-        ? typeof delivery.digest === "string" &&
-          digest(text.slice(offset, offset + length)) === delivery.digest
-        : !!segment && text.startsWith(segment, offset);
-      offset += length;
+      if (
+        typeof delivery?.length !== "number" ||
+        typeof delivery.digest !== "string"
+      )
+        return [];
+      const segment = text.slice(offset, (offset += delivery.length));
       const ref = replyReference(data);
-      return complete && ref ? [ref] : [];
+      return ref && digest(segment) === delivery.digest ? [ref] : [];
     });
   }
   if (
@@ -208,13 +202,10 @@ export function deliveredReplies(message: AgentMessage): ReplyReference[] {
       const data = record(value);
       // Match the actual answer, not serialization whitespace or extra metadata.
       return typeof data?.response === "string" &&
-        (original?.responseHash
-          ? digest(data.response) === original.responseHash &&
-            (typeof data.error === "string"
-              ? digest(data.error)
-              : undefined) === original.errorHash
-          : data.response === original?.response &&
-            data.error === original?.error)
+        typeof original?.responseHash === "string" &&
+        digest(data.response) === original.responseHash &&
+        (typeof data.error === "string" ? digest(data.error) : undefined) ===
+          original.errorHash
         ? [ref]
         : [];
     });

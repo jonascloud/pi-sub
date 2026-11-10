@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
-import { addUsage } from "./usage.ts";
+import { addUsage, usageDelta } from "./usage.ts";
 import type { Usage } from "@earendil-works/pi-ai";
 import {
   createWorker,
@@ -382,7 +382,9 @@ export class Coordinator {
     t.data.response = report.text || t.data.response;
     t.sessionId ??= report.sessionId;
     if (report.usage) {
-      // Whole-session snapshots replace both billing and displayed totals.
+      // Whole-session snapshots replace displayed totals; only their growth is
+      // charged, as soon as it is confirmed rather than on acceptance.
+      this.usage = addUsage(this.usage, usageDelta(report.usage, t.usage));
       t.usage = report.usage;
       t.data.tokens = report.usage.totalTokens;
       t.inputTokens = report.usage.input;
@@ -497,7 +499,6 @@ export class Coordinator {
     const result = this.result(t);
     if (this.tasks.delete(t.data.id)) {
       this.receipts.set(result.id, structuredClone(result));
-      if (t.usage) this.usage = addUsage(this.usage, t.usage);
       this.totals.inputTokens += t.inputTokens;
       this.totals.outputTokens += t.outputTokens;
       if (result.outcome === "reply") this.totals.completed++;

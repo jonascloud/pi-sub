@@ -164,8 +164,7 @@ function taskView(tool: Tool, args: Args, task: DisplayReport): View {
     view.action = "Failed";
     view.error = true;
   } else if (task.outcome === "stopped") {
-    // Interruption has a stopped execution, but retains a paused live task.
-    view.action = live && task.status === "paused" ? "Paused" : "Stopped";
+    view.action = "Stopped";
   } else if (tool === "sub_task") {
     view.action =
       live && task.status === "queued"

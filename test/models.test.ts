@@ -15,6 +15,7 @@ import {
   type Ladder,
   availableExecutions,
   availableModels,
+  checkRetained,
   ladderPath,
   loadLadder,
   parseReference,
@@ -167,6 +168,23 @@ describe("model ladder", () => {
           );
       }
     }
+  });
+
+  it("retains an execution only while available and configured at or above its level", () => {
+    const main = { provider: "p", model: "main", thinking: "low" } as const;
+    expect(() => checkRetained(ladder, 6, main, available)).not.toThrow();
+    expect(() => checkRetained(ladder, 3, main, available)).not.toThrow();
+    expect(() => checkRetained(ladder, 7, main, available)).toThrow(
+      /minimum level/,
+    );
+    expect(() =>
+      checkRetained(ladder, 6, { ...main, thinking: "high" }, [
+        { provider: "p", model: "main", thinking: ["low"] },
+      ]),
+    ).toThrow(/no longer available/);
+    expect(() => checkRetained({}, 1, main, available)).toThrow(
+      /minimum level/,
+    );
   });
 
   it("uses the configured profile and reports a missing ladder without creating files", async () => {
