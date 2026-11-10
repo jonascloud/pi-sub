@@ -36,7 +36,7 @@ Process closure is decisive for execution lifetime, not success or semantic task
 
 Continuation restores saved native history and issues another request. It does not resume an interrupted request, retain extension memory, roll back side effects or guarantee exactly-once actions. The coordinator retains an observed native journal identity across executions. A missing journal, changed identity or detected corruption fails explicitly rather than silently becoming a new session. Identity and structural checks do not prove complete history: valid truncation or substitution retaining the same identity between executions may go undetected. Interruption before any journal was created still permits a genuine first start.
 
-Bare RPC `abort` has no extension event when the parent is idle. The reliable idle global interrupt remains `/sub:pause`; active parent runs additionally use abort signals and `agent_settled.aborted`. Compaction has its own public signal. No parent RPC transport interception or SDK patch is introduced.
+Bare RPC `abort` has no extension event when the parent is idle. Raw TUI input precedes focused components, so an extension cannot tell an idle interrupt from Escape closing a selector, dialog or autocomplete menu. The idle global interrupt is therefore `/sub:pause`; active parent runs additionally use abort signals and `agent_settled.aborted`. Compaction has its own public signal. No parent RPC transport interception or SDK patch is introduced.
 
 ## Rationale
 

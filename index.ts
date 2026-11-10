@@ -7,7 +7,7 @@ import {
   type AgentBeforeSettleEvent,
   type TurnEndEvent,
 } from "@earendil-works/pi-coding-agent";
-import { matchesKey, stripTerminalSequences } from "@earendil-works/pi-tui";
+import { stripTerminalSequences } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
   Coordinator,
@@ -47,7 +47,6 @@ export default function piSub(pi: ExtensionAPI): void {
   let context: ExtensionContext | undefined;
   let coordinator: Coordinator | undefined;
   let unmount: (() => void) | undefined;
-  let detachInput: (() => void) | undefined;
   const signals = new WeakSet<AbortSignal>();
   let runInterrupted = false;
   let dialogOpen = false;
@@ -207,15 +206,7 @@ export default function piSub(pi: ExtensionAPI): void {
     context = ctx;
     if (ctx.mode === "tui") {
       unmount?.();
-      detachInput?.();
       unmount = mountWidget(ctx.ui, manager());
-      detachInput = ctx.ui.onTerminalInput((data) => {
-        if (!dialogOpen && matchesKey(data, "escape")) {
-          interrupt();
-          ctx.abort();
-        }
-        return undefined;
-      });
     }
   });
   pi.on("ui_prompt_start", () => {
@@ -316,7 +307,6 @@ export default function piSub(pi: ExtensionAPI): void {
   pi.on("session_shutdown", async () => {
     lifetime.abort();
     if (idleDelivery) clearImmediate(idleDelivery);
-    detachInput?.();
     unmount?.();
     await coordinator?.dispose();
     workspace.dispose();

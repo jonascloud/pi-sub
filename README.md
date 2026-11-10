@@ -86,7 +86,7 @@ Native `details` retain compact task-state/execution metadata, bounded previews,
 
 An **interrupt** aborts the parent, pauses children and closes admission, including for newly requested tasks. A new **user prompt** resumes only the parent; it decides which children to continue.
 
-Escape also interrupts while the TUI parent is idle, except when an extension dialog owns Escape. Operator commands need no model call:
+Aborting an active parent run, for example with Escape, is an interrupt. While the parent is idle, Escape keeps its native meaning; use `/sub:pause`. Operator commands need no model call:
 
 ```text
 /sub:pause [task-id]

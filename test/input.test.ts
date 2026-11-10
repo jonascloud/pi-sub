@@ -121,7 +121,6 @@ function setup(mode = "rpc") {
   const registerMessageRenderer = vi.fn();
   const notify = vi.fn();
   const abort = vi.fn();
-  let terminalInput: ((data: string) => unknown) | undefined;
   const ctx = {
     cwd,
     mode,
@@ -142,10 +141,6 @@ function setup(mode = "rpc") {
       notify,
       setWidget: vi.fn(),
       setEditorText: vi.fn(),
-      onTerminalInput: (listener: typeof terminalInput) => {
-        terminalInput = listener;
-        return () => {};
-      },
     },
   } as unknown as ExtensionContext;
   piSub({
@@ -196,7 +191,6 @@ function setup(mode = "rpc") {
       fake.tasks = [...fake.tasks.filter((old) => old.id !== task.id), task];
       fake.onReady!(task);
     },
-    key: (data: string) => terminalInput!(data),
   };
 }
 
@@ -563,18 +557,6 @@ test("global /sub:pause interrupts headless work and aborts the parent", async (
   expect(fake.interrupt).toHaveBeenCalled();
   expect(abort).toHaveBeenCalledOnce();
   expect(fake.prompt).not.toHaveBeenCalled();
-});
-
-test("TUI Escape is global except while a dialog owns Escape", () => {
-  const { emit, key, abort } = setup("tui");
-  emit("ui_prompt_start", { reason: "ui_prompt", kind: "confirm" });
-  key("\u001b");
-  expect(fake.interrupt).not.toHaveBeenCalled();
-  expect(abort).not.toHaveBeenCalled();
-  emit("ui_prompt_end", { reason: "ui_prompt", kind: "confirm" });
-  key("\u001b");
-  expect(fake.interrupt).toHaveBeenCalledOnce();
-  expect(abort).toHaveBeenCalledOnce();
 });
 
 test("terminal errors notify the human, never trigger the parent LLM", () => {
