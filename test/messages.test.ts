@@ -4,8 +4,6 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 import type { TaskView, TaskResult } from "../src/coordinator.ts";
 import {
   SUBAGENT_GUIDANCE,
-  pausedReminder,
-  renderPaused,
   renderReply,
   renderStopped,
 } from "../src/messages.ts";
@@ -99,6 +97,9 @@ test("TUI notifications are two-line previews with expandable complete delivery"
 test("operating guidance avoids routine acknowledgements and duplicate workload anchors", () => {
   expect(SUBAGENT_GUIDANCE).toContain("Reports need no acknowledgement");
   expect(SUBAGENT_GUIDANCE).toContain("A failed task keeps its session");
+  expect(SUBAGENT_GUIDANCE).toContain(
+    "Interrupting you leaves children running",
+  );
   expect(SUBAGENT_GUIDANCE.split(STRENGTH_GUIDANCE)).toHaveLength(2);
 });
 
@@ -169,30 +170,6 @@ test("a failed reply names its cause; partial work and metadata stay in the expa
       replies: [{ id: "x", description: "", outcome: "error" }],
     }).join("\n"),
   ).toContain("Execution failed");
-});
-
-test("the paused reminder names its tasks to the model and stays one row for the human", () => {
-  const paused: TaskView = {
-    ...task,
-    status: "paused",
-    outcome: undefined,
-    response: "",
-  };
-  const one = pausedReminder([paused]);
-  expect(one.content).toBe(
-    "Still paused since the interruption: task-1 (Review changes). Continue or stop them unless they should stay paused.",
-  );
-  expect(draw(renderPaused, one.content, one.details)).toEqual([
-    " Still paused · Review changes ",
-  ]);
-  const two = pausedReminder([paused, { ...paused, id: "task-2" }]);
-  expect(two.content).toContain("task-1 (Review changes); task-2 (");
-  expect(draw(renderPaused, two.content, two.details).join("")).toContain(
-    "Still paused · 2 tasks",
-  );
-  expect(
-    draw(renderPaused, two.content, two.details, true).join("\n"),
-  ).toContain("task-2");
 });
 
 test("stop acknowledgements summarize task identities", () => {
@@ -281,7 +258,7 @@ test("renderers handle content arrays and malformed metadata without mutating pa
     [null, 42, []],
     { id: [], description: {}, preview: 4 },
   ];
-  for (const renderer of [renderReply, renderPaused, renderStopped])
+  for (const renderer of [renderReply, renderStopped])
     for (const details of malformed) {
       const before = JSON.stringify({ content, details });
       for (const expanded of [false, true])
@@ -313,7 +290,6 @@ test("all views respect width and output padding, collapsed and expanded", () =>
       "Subagent task-1 failed\nDenied",
       { replies: [{ ...failed, description: "Review 漢字" }] },
     ],
-    [renderPaused, "Still paused", { report: [failure] }],
     [renderStopped, JSON.stringify([failure]), [failure]],
   ];
   for (const [renderer, content, details] of cases)
@@ -358,9 +334,9 @@ test("all views respect width and output padding, collapsed and expanded", () =>
 test("terminal commands and controls are sanitized in previews and full delivery", () => {
   const unsafe =
     "\x1b[31mVisible\x1b[0m\x1b]8;;https://evil.test\x07link\x1b]8;;\x07\x1b_Gpayload\x1b\\\x07\b\r";
-  for (const renderer of [renderReply, renderPaused, renderStopped]) {
+  for (const renderer of [renderReply, renderStopped]) {
     const details =
-      renderer === renderPaused || renderer === renderStopped
+      renderer === renderStopped
         ? [{ ...failure, description: unsafe, error: unsafe }]
         : {
             replies: [

@@ -31,10 +31,6 @@ function reply(context) {
     const results = messages
       .slice(index + 1)
       .filter((message) => message.role === "toolResult");
-    if (text.startsWith("Still paused since the interruption"))
-      return results.length
-        ? { text: "continued" }
-        : { name: "sub_control", args: { action: "continue" } };
     if (text === "integration:batch" && !results.length)
       return {
         calls: [

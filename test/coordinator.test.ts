@@ -219,23 +219,25 @@ describe("one session, fresh execution processes", () => {
     await c.dispose();
   });
 
-  it("paused tasks release capacity without implicit resume on a user prompt", async () => {
+  it("pausing every task holds queued work too, without holding back new work", async () => {
     const { c, workers, start } = setup();
     const a = start(),
       b = start("queued");
-    const interrupted = c.interrupt();
-    const later = start("later");
+    const pausing = Promise.all(c.list().map((task) => c.pause(task.id)));
     expect(c.get(b).status).toBe("paused");
     workers[0]!.close({ interrupted: true });
-    await interrupted;
-    await expect(c.continue(a)).rejects.toThrow("user prompt");
-    await c.prompt();
-    expect(workers).toHaveLength(1);
-    for (const id of [a, b, later]) expect(c.get(id).status).toBe("paused");
+    await pausing;
+    expect(workers).toHaveLength(1); // The freed slot admits nothing paused with it.
+    for (const id of [a, b]) expect(c.get(id).status).toBe("paused");
+    const later = start("later");
+    expect(c.get(later).status).toBe("active");
     await c.continue(b);
-    expect(workers).toHaveLength(2);
-    expect(c.get(a).status).toBe("paused");
+    expect(c.get(b).status).toBe("queued");
     workers[1]!.close();
+    await tick();
+    expect(c.get(b).status).toBe("active");
+    expect(c.get(a).status).toBe("paused");
+    workers[2]!.close();
     await tick();
     await c.dispose();
   });
@@ -244,10 +246,9 @@ describe("one session, fresh execution processes", () => {
     const { c, workers, start } = setup();
     const ids = ["first", "second", "third"].map(start);
     const sessions = ids.map((id) => c.get(id).sessionFile);
-    const interrupted = c.interrupt();
+    const pausing = Promise.all(c.list().map((task) => c.pause(task.id)));
     workers[0]!.close({ interrupted: true });
-    await interrupted;
-    await c.prompt();
+    await pausing;
     for (const task of c.list()) await c.continue(task.id);
     for (let i = 0; i < ids.length; i++) {
       expect(workers).toHaveLength(i + 2);
@@ -363,21 +364,19 @@ describe("input ownership at close", () => {
   );
 
   it.each([false, true])(
-    "interrupt during redirect cancels restart and retains input (%s)",
+    "a pause during redirect cancels restart and retains input (%s)",
     async (inputPersisted) => {
       const { c, workers, start } = setup();
       const id = start("brief");
       const sending = c.message(id, "correction");
-      const interrupted = c.interrupt();
+      const pausing = c.pause(id);
       workers[0]!.close({ interrupted: true, inputPersisted });
-      await Promise.all([sending, interrupted]);
+      await Promise.all([sending, pausing]);
       expect(workers).toHaveLength(1);
       expect(c.get(id)).toMatchObject({
         status: "paused",
         pendingInput: inputPersisted ? ["correction"] : ["brief", "correction"],
       });
-      await c.prompt();
-      expect(workers).toHaveLength(1);
       await c.continue(id);
       expect(workers[1]!.run).toHaveBeenCalledExactlyOnceWith(
         inputPersisted ? "correction" : "brief\n\ncorrection",
@@ -440,7 +439,6 @@ describe("final reports and receipts", () => {
       response: "partial",
       pendingInput: ["valuable brief"],
     });
-    expect(await c.prompt()).toBe(true); // User input leaves failures to the parent.
     expect(c.get(id).outcome).toBe("error");
     expect(c.drainUsage()).toEqual(usage(7));
 
@@ -561,13 +559,12 @@ describe("final reports and receipts", () => {
     await c.dispose();
   });
 
-  it("a pause that cannot confirm termination neither fails the task nor blocks user input", async () => {
+  it("a pause that cannot confirm termination does not fail the task, which pauses once the process exits", async () => {
     const { c, workers, start, onReady } = setup();
     const id = start();
     workers[0]!.stop.mockRejectedValueOnce(Error("did not exit"));
-    await expect(c.interrupt()).rejects.toThrow("Could not terminate");
+    await expect(c.pause(id)).rejects.toThrow("Could not terminate");
     expect(c.get(id)).toMatchObject({ status: "active", operation: "pausing" });
-    expect(await c.prompt()).toBe(true);
     workers[0]!.close({ interrupted: true }); // The process exits after all.
     await tick();
     expect(c.get(id).status).toBe("paused");
@@ -622,65 +619,6 @@ describe("final reports and receipts", () => {
     });
     workers[1]!.close();
     await tick();
-    await c.dispose();
-  });
-});
-
-describe("children an interrupted parent never chose to pause", () => {
-  it("raises once what an implicit interrupt left paused", async () => {
-    const { c, workers, start } = setup(2);
-    const running = start("running"),
-      finishing = start("finishing"),
-      queued = start("queued");
-    const interrupted = c.interrupt(true);
-    workers[0]!.close({ interrupted: true });
-    workers[1]!.close(); // Finished before the signal arrived: a reply, not a pause.
-    await interrupted;
-    await c.prompt();
-    expect(c.get(finishing).status).toBe("ready");
-    expect(c.takeInterrupted().map((task) => task.id)).toEqual([
-      running,
-      queued,
-    ]);
-    expect(c.takeInterrupted()).toEqual([]);
-    await c.dispose();
-  });
-
-  it("omits tasks the parent already resumed or stopped", async () => {
-    const { c, workers, start } = setup(3);
-    const ids = ["continued", "stopped", "left"].map(start);
-    const interrupted = c.interrupt(true);
-    for (const worker of workers) worker.close({ interrupted: true });
-    await interrupted;
-    await c.prompt();
-    await c.continue(ids[0]!);
-    await c.stop(ids[1]!);
-    // Pausing a task it had continued is the parent's own decision.
-    const pausing = c.pause(ids[0]!);
-    workers[3]!.close({ interrupted: true });
-    await pausing;
-    expect(c.get(ids[0]!).status).toBe("paused");
-    expect(c.takeInterrupted().map((task) => task.id)).toEqual([ids[2]]);
-    await c.dispose();
-  });
-
-  it("an explicit pause is a decision, also after an implicit interrupt", async () => {
-    const { c, workers, start } = setup();
-    start();
-    const implicit = c.interrupt(true);
-    const explicit = c.interrupt();
-    workers[0]!.close({ interrupted: true });
-    await Promise.all([implicit, explicit]);
-    await c.prompt();
-    expect(c.takeInterrupted()).toEqual([]);
-
-    await c.continue(c.list()[0]!.id);
-    const again = c.interrupt();
-    const repeated = c.interrupt(true); // Keeps the first interrupt's character.
-    workers[1]!.close({ interrupted: true });
-    await Promise.all([again, repeated]);
-    await c.prompt();
-    expect(c.takeInterrupted()).toEqual([]);
     await c.dispose();
   });
 });

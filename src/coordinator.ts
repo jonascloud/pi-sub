@@ -86,11 +86,6 @@ export class Coordinator {
   };
   private listeners = new Set<() => void>();
   private disposed = false;
-  private suspended = false;
-  private epoch = 0;
-  /** Paused as a side effect of interrupting the parent; raised with it once. */
-  private unresolved = new Set<Task>();
-  private interruption?: Promise<void>;
   private max: number;
   private factory: typeof createWorker;
   private beforeStart?: (task: TaskView) => void;
@@ -110,12 +105,6 @@ export class Coordinator {
     this.factory = options.createWorker ?? createWorker;
     this.beforeStart = options.beforeStart;
     this.onReady = options.onReady;
-  }
-  get interrupted() {
-    return this.suspended;
-  }
-  get runnable() {
-    return !this.disposed && !this.suspended;
   }
   subscribe(listener: () => void) {
     this.listeners.add(listener);
@@ -171,7 +160,6 @@ export class Coordinator {
     }
     if (status === "active" && t.activeSince === undefined)
       t.activeSince = Date.now();
-    if (status === "queued") this.unresolved.delete(t);
     t.status = status;
     this.emit();
   }
@@ -241,7 +229,7 @@ export class Coordinator {
         elapsedMs: 0,
         response: "",
       },
-      status: this.suspended ? "paused" : "queued",
+      status: "queued",
       activity: "",
       options: request.worker,
       pending: [request.prompt],
@@ -272,7 +260,7 @@ export class Coordinator {
     if (!this.disposed && !t.take) this.ready(t);
   }
   private admit() {
-    if (!this.runnable) return;
+    if (this.disposed) return;
     while ([...this.tasks.values()].filter((t) => t.run).length < this.max) {
       const t = [...this.tasks.values()].find(
         (t) => t.status === "queued" && !t.take,
@@ -406,8 +394,7 @@ export class Coordinator {
       t.outcome = "stopped";
       this.status(t, "ready");
     } else if (report.interrupted || t.pending.length) {
-      const redirect = run.intent === "redirect" && !this.suspended;
-      this.status(t, redirect ? "queued" : "paused");
+      this.status(t, run.intent === "redirect" ? "queued" : "paused");
     } else {
       t.outcome = "reply";
       t.reply = { id: randomUUID(), delivered: false };
@@ -441,8 +428,6 @@ export class Coordinator {
   async message(id: string, text: string): Promise<void> {
     if (!text.trim()) throw new Error("Message must not be empty");
     const t = this.task(id);
-    if (this.suspended)
-      throw new Error("Send a user prompt before continuing subagents");
     if (t.take || t.outcome === "stopped" || t.run?.intent === "stop")
       throw new Error("Task is stopping and cannot accept input");
     if (t.lost)
@@ -468,40 +453,10 @@ export class Coordinator {
     }
     await this.end(t, "pause");
   }
-  /** Implicit: the parent was aborted, which need not mean its children should rest. */
-  interrupt(implicit = false): Promise<void> {
-    const tasks = [...this.tasks.values()];
-    // An explicit pause is a decision. A repeated interrupt keeps the first one's character.
-    if (!implicit) this.unresolved.clear();
-    else if (!this.suspended)
-      for (const t of tasks)
-        if (t.status === "queued" || t.run) this.unresolved.add(t);
-    this.suspended = true;
-    this.epoch++;
-    for (const t of tasks) if (t.status === "queued") this.status(t, "paused");
-    const current = Promise.all(tasks.map((t) => this.pause(t.data.id))).then(
-      () => {},
-    );
-    this.interruption = Promise.all([
-      this.interruption?.catch(() => {}),
-      current,
-    ]).then(() => {});
-    return this.interruption;
-  }
-  /** Tasks an implicit interrupt left paused. Each interruption is raised once. */
-  takeInterrupted(): TaskView[] {
-    const tasks = [...this.unresolved].filter(
-      (t) => t.status === "paused" && !t.run && !t.take,
-    );
-    this.unresolved.clear();
-    return tasks.map((t) => this.view(t));
-  }
   async continue(id: string): Promise<void> {
     const t = this.task(id);
     if (t.status !== "paused" || t.run || t.take)
       throw new Error("Task is not paused and available");
-    if (this.suspended)
-      throw new Error("Send a user prompt before continuing subagents");
     if (!t.pending.length) t.pending.push("Continue the task.");
     t.outcome = undefined;
     this.status(t, "queued");
@@ -553,15 +508,6 @@ export class Coordinator {
       }
     })();
     return taking.promise;
-  }
-  /** Real user input reopens admission once pauses in flight have settled or given up. */
-  async prompt(): Promise<boolean> {
-    const epoch = this.epoch;
-    await this.interruption?.catch(() => {});
-    if (this.disposed || epoch !== this.epoch) return false;
-    this.suspended = false;
-    this.admit();
-    return true;
   }
   wait(
     id: string,
@@ -622,11 +568,9 @@ export class Coordinator {
   }
   async dispose(): Promise<void> {
     this.disposed = true;
-    this.epoch++;
     await Promise.all([...this.tasks.values()].map((t) => this.end(t, "stop")));
     this.tasks.clear();
     this.receipts.clear();
-    this.unresolved.clear();
     this.usage = undefined;
     this.emit();
   }

@@ -56,9 +56,9 @@ A wait only observes. It ends with a reply or failure, when its task pauses, at 
 
 Replies and failures arrive on their own. At the next safe turn boundary, or once when the parent is idle, pi-sub batches unannounced ones into one message; a complete tool return already counts as delivery. Large reports and batches are handed off as a reference to a private temporary file instead of being clipped. These files expire on session switch, fork, reload or shutdown, so preserve relevant findings before leaving the session.
 
-## Interrupt and continue
+## Pause and continue
 
-An **interrupt** pauses all children and closes admission until the next user prompt. Aborting an active parent run, for example with Escape, is an interrupt. While the parent is idle, Escape keeps its native meaning; use `/sub:pause`. A new user prompt resumes only the parent, which decides which children to continue. If it would finish while children paused by its abort are still paused, it is reminded once.
+Aborting the parent, for example with Escape, stops only the parent. Children keep running; their replies wait and do not wake the parent until your next prompt. To stop children, pause them:
 
 ```text
 /sub:pause [task-id]
@@ -66,7 +66,7 @@ An **interrupt** pauses all children and closes admission until the next user pr
 /sub:stop [task-id]
 ```
 
-No ID means all applicable tasks; `/sub:pause` without an ID is the global interrupt. In RPC, send `prompt("/sub:pause")`: an idle RPC `abort` emits no extension event.
+No ID means all applicable tasks. `/sub:pause` without an ID stops everything: it pauses every child and aborts the parent. Paused children stay paused until `/sub:continue`, a `sub_control` continue or a message. In RPC, send `prompt("/sub:pause")`.
 
 Pausing terminates the process (SIGTERM, then SIGKILL) and continuation restarts it on the same session. It does not undo writes or external effects.
 

@@ -9,7 +9,7 @@ A subagent is an assignment with one native Pi session. Each execution is a fres
 ```text
 queued -- admission --> active -- reply or failure + process exit --> ready(reply | error)
    |                      |                                             |
-   | interrupt            | interrupt + process exit                    +-- message --> queued
+   | pause                | pause + process exit                        +-- message --> queued
    v                      v                                             +-- accept or stop --> removed
  paused <-----------------+
    +-- explicit continue --> queued
@@ -19,14 +19,13 @@ Reply/error/stopped are outcomes, not additional states. Retries and automatic c
 
 A failure is the outcome of one execution, not the end of its task. A crash, a non-zero exit, a provider error or a missing response leaves the journal as an interruption does, so the task stays open: a message continues its session and resends input the journal does not prove. Admission failures are the same; nothing ran. Only a lost session is final: a journal that is corrupt, rewritten, substituted or gone after it was observed. Such a task rejects input and can only be read, accepted or stopped. A journal that never existed loses nothing, so a first start may repeat. Nothing retries on its own: the parent receives the failure like a reply and decides.
 
-Active redirection retains the correction, interrupts the old process, waits for closure and final capture, then queues a new process on the same session. It never injects input into a busy native session. An interrupt between these steps prevents restart and retains the correction. Only new saved native user entries prove input persistence, not streamed message events emitted before the write. Instructions without that evidence are retained after interruption or failure; transformed inputs may be conservatively replayed.
+Active redirection retains the correction, interrupts the old process, waits for closure and final capture, then queues a new process on the same session. It never injects input into a busy native session. A pause between these steps prevents restart and retains the correction. Only new saved native user entries prove input persistence, not streamed message events emitted before the write. Instructions without that evidence are retained after interruption or failure; transformed inputs may be conservatively replayed.
 
-The controller accepts two user inputs:
+Aborting the parent stops the parent. Its children are separate work and keep running: an abort is most often the user interjecting, and stopping work as a side effect would have to be undone by someone. The coordinator therefore holds no interruption state, closes no admission and never delays, cancels or aborts user input or a parent run.
 
-- **Interrupt:** block admission first, pause queued tasks, then terminate active processes. Request native SIGTERM shutdown, escalate to SIGKILL on a bounded deadline and await exit. Failed termination retains ownership and its slot for retry and is reported to the caller; not exiting in time says nothing about the work and is not an outcome of the task. Later replies cannot restart an interrupted parent.
-- **Prompt:** before forwarding real interactive/RPC input, wait for pauses in flight to settle or give up, then reopen admission but leave paused tasks paused. An intervening interrupt cancels the prompt. No process state holds user input beyond that bounded wait. Explicit operator continue commands use the same preparation.
+One consequence is kept: an aborted parent stays stopped. Replies and failures that arrive afterwards wait in the inbox and do not wake it until real interactive or RPC input, or an operator continue. They join that run at its boundaries.
 
-Aborting the parent is an implicit interrupt: it stops everything, but need not mean the children should rest. If the parent's next completed run would settle while such tasks are still paused, it is told once and gets one more request to continue or stop them. The global `/sub:pause` is an explicit decision and raises nothing. The reminder lives in coordinator memory, not in native history.
+Pausing is always explicit, for one task or for all. It requests native SIGTERM shutdown, escalates to SIGKILL on a bounded deadline and awaits exit. Failed termination retains ownership and its slot for retry and is reported to the caller; not exiting in time says nothing about the work and is not an outcome of the task. A paused task stays paused until it is continued or messaged. The global `/sub:pause` is the one command that stops everything: it pauses every task, aborts the parent and holds replies like an abort does.
 
 Replies and failures await an explicit parent decision, not an idle process. Delivery is independent of that decision: a complete handoff (text or the saved-file reference; see [0007](0007-file-backed-handoffs.md)) in the parent's native context is acknowledged by its reply identity and folds its widget row without removing the task. Proposing or announcing a batch without delivery into model context does not acknowledge the reply; an older delivery cannot acknowledge a successor. A new execution produces a fresh reply identity. Accepting or stopping removes the live task and retains a complete idempotent result receipt without workers, promises or listeners for the coordinator's lifetime. Receipts, including responses and pending input, are not bounded in count or size.
 
@@ -38,7 +37,7 @@ Process exit is decisive for execution lifetime, not success or semantic task co
 
 Continuation restores saved native history and issues another request. It does not resume an interrupted request, retain extension memory, roll back side effects or guarantee exactly-once actions. The coordinator retains an observed native journal identity across executions. A missing journal, changed identity or detected corruption fails explicitly and finally rather than silently becoming a new session. Identity and structural checks do not prove complete history: valid truncation or substitution retaining the same identity between executions may go undetected. Interruption before any journal was created still permits a genuine first start.
 
-Bare RPC `abort` has no extension event when the parent is idle. Raw TUI input precedes focused components, so an extension cannot tell an idle interrupt from Escape closing a selector, dialog or autocomplete menu. The idle global interrupt is therefore `/sub:pause`; active parent runs additionally use abort signals and `agent_settled.aborted`. Compaction has its own public signal. No parent RPC transport interception or SDK patch is introduced.
+An abort is observed only as `agent_settled.aborted`. Bare RPC `abort` has no extension event when the parent is idle, and raw TUI input precedes focused components, so an idle Escape cannot be told from one closing a selector, dialog or autocomplete menu: an idle parent has nothing to stop, and replies wake it as usual. No abort signals are watched, and no parent RPC transport interception or SDK patch is introduced.
 
 ## Rationale
 

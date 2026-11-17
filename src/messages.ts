@@ -6,8 +6,7 @@ import {
 } from "@earendil-works/pi-tui";
 import { replyReports } from "./replies.ts";
 import { STRENGTH_GUIDANCE } from "./models.ts";
-import type { TaskView } from "./coordinator.ts";
-import { reportDetails, reportFailure, taskMetadata } from "./reports.ts";
+import { reportDetails, reportFailure } from "./reports.ts";
 
 /** One stable instruction section; notifications carry observations, not a manual. */
 export const SUBAGENT_GUIDANCE = `Delegate bounded work when the result justifies briefing and integration overhead. Give the smallest sufficient brief: goal, scope, constraints, success criteria and decisive context. Prefer paths to copied content; do not repeat loaded instructions. Children share files and load native global/project instructions, not your conversation or UI. Follow-ups add new information with enough context to interpret it.
@@ -15,7 +14,7 @@ Choose the minimum sufficient level; do not lower it to fit availability. The co
 ${STRENGTH_GUIDANCE}
 Replies arrive asynchronously and may be questions. Reports and child sessions are temporary: preserve relevant findings before session switch, reload or shutdown. A file reference delivers the full report; read it as needed.
 A failed task keeps its session: a message continues it and resends unsent instructions, unless the error says the session cannot continue. Do not repeat a retry that failed the same way.
-User interruption pauses children; a new prompt resumes only you, so continue or stop them.
+Interrupting you leaves children running. Children the user paused stay paused until continued.
 Use reports internally; surface only material results, blockers or user decisions. Reports need no acknowledgement; stale reports alone are not a reason to revisit accepted/stopped tasks.`;
 
 type Message = Parameters<MessageRenderer>[0];
@@ -201,33 +200,6 @@ function reportWarning(message: Message) {
         },
       ];
 }
-
-/** Raised once when the parent would rest while an interruption still holds its children. */
-export function pausedReminder(tasks: readonly TaskView[]) {
-  const report = tasks.map(taskMetadata);
-  return {
-    customType: "pi-sub:paused",
-    display: true,
-    content: `Still paused since the interruption: ${report.map((task) => `${task.id} (${task.description})`).join("; ")}. Continue or stop them unless they should stay paused.`,
-    details: { report },
-  };
-}
-
-/** The reminder names the tasks; their state lives in the widget. */
-export const renderPaused: MessageRenderer = (message, options, theme) => {
-  if (options.expanded) return fullDelivery(message, options);
-  const tasks = reports(message);
-  return compact(
-    [
-      {
-        text: `Still paused · ${tasks.length === 1 ? identity(tasks[0]!) : `${tasks.length} tasks`}`,
-        style: "title",
-      },
-    ],
-    options,
-    theme,
-  );
-};
 
 /** Stop acknowledgements identify work, rather than dumping report JSON. */
 export const renderStopped: MessageRenderer = (message, options, theme) => {

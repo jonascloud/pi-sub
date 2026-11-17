@@ -556,7 +556,9 @@ test("delegates from a file-authored ladder and reports original child usage onc
     try {
       await client.prompt("integration:pause");
       await created.promise;
-      await client.abort();
+      const settled = client.waitForIdle(15000);
+      expect(await client.prompt("/sub:pause")).toBe("handled");
+      await settled;
     } finally {
       created.dispose();
     }
@@ -761,18 +763,36 @@ test.each([false, true])(
   60000,
 );
 
-test("RPC abort during native retry backoff interrupts the children", async () => {
+test("an RPC abort stops the parent only: its child finishes and the reply waits for the user", async () => {
   const { client, marker, dispose } = await host({
     WORKER_TEST_SLOW_CHILD: "1",
   });
+  // Retry backoff has no live signal; only settlement reports this abort.
   const retry = nextEvent(client, (event) => event.type === "auto_retry_start");
+  const responses = async () =>
+    (await client.getMessages()).filter(
+      (message) =>
+        message.role === "custom" && message.customType === "pi-sub:response",
+    );
   try {
     await client.prompt("integration:retry");
     await retry.promise;
     await eventually(() => readFile(marker));
     await client.abort();
+    const stopped = (await client.getSessionStats()).assistantMessages;
+    // The child answers after ten seconds without anyone continuing it.
+    await new Promise((resolve) => setTimeout(resolve, 12000));
+    expect((await client.getState()).isStreaming).toBe(false);
+    expect((await client.getSessionStats()).assistantMessages).toBe(stopped);
+    expect(await responses()).toHaveLength(0);
+    await client.promptAndWait("And now?", undefined, 20000);
+    expect(await responses()).toHaveLength(1);
     await client.promptAndWait("integration:inspect", undefined, 20000);
-    expect(await latestResult(client)).toMatchObject({ status: "paused" });
+    expect(await latestResult(client)).toMatchObject({
+      status: "ready",
+      outcome: "reply",
+      reply: { delivered: true },
+    });
   } finally {
     retry.dispose();
     await dispose();
@@ -820,46 +840,6 @@ test("a steering message ends the parent's wait at once and leaves the child run
   }
 }, 60000);
 
-test("a parent aborted over its children is reminded before it rests, and continues them", async () => {
-  const { client, marker, dispose } = await host({
-    WORKER_TEST_SLOW_CHILD: "1",
-  });
-  const waiting = nextEvent(
-    client,
-    (event) =>
-      event.type === "tool_execution_start" && event.toolName === "sub_result",
-  );
-  try {
-    await client.prompt("integration:read-via-wait");
-    await waiting.promise;
-    await eventually(() => readFile(marker));
-    const aborted = client.waitForIdle(15000);
-    await client.abort();
-    await aborted;
-    // The user asks something unrelated; the parent answers and would stop there.
-    await client.promptAndWait("An unrelated question.", undefined, 20000);
-    const messages = await client.getMessages();
-    const reminders = messages.filter(
-      (message) =>
-        message.role === "custom" && message.customType === "pi-sub:paused",
-    );
-    expect(reminders).toHaveLength(1);
-    const control = messages.findLast(
-      (message) =>
-        message.role === "toolResult" && message.toolName === "sub_control",
-    );
-    if (!control || control.role !== "toolResult")
-      throw new Error("The reminder did not reach the parent model");
-    const [task] = reportDetails(control.details) as TaskView[];
-    expect(JSON.stringify(reminders[0])).toContain(task!.id);
-    expect(task).toMatchObject({ status: "active" });
-    expect(await client.getLastAssistantText()).toBe("continued");
-  } finally {
-    waiting.dispose();
-    await dispose();
-  }
-}, 60000);
-
 test("a manual ladder edit cannot resume a retained execution below its minimum level", async () => {
   const { client, marker, agentDir, dispose } = await host({
     WORKER_TEST_SLOW_CHILD: "1",
@@ -885,7 +865,7 @@ test("a manual ladder edit cannot resume a retained execution below its minimum 
   }
 }, 60000);
 
-test("the idle RPC operator interrupt pauses children without calling the parent model", async () => {
+test("the idle RPC operator pause pauses children without calling the parent model", async () => {
   const { client, marker, dispose } = await host({
     WORKER_TEST_SLOW_CHILD: "1",
   });
