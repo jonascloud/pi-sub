@@ -459,6 +459,8 @@ test("one stable guidance section is replaced, not appended as repeated chat ins
     "levels (snapshot): 1–8.",
   );
   expect(systemPromptOptions.sections.pi_sub).not.toContain("1–6.");
+  // Task state would rewrite the cached prompt prefix on every change.
+  const stable = systemPromptOptions.sections.pi_sub;
   fake.tasks = [
     {
       ...failure,
@@ -468,16 +470,7 @@ test("one stable guidance section is replaced, not appended as repeated chat ins
     },
   ];
   emit("before_agent_start", { systemPromptOptions });
-  const snapshot =
-    systemPromptOptions.sections.pi_sub.split("\n\nOpen tasks: ")[1]!;
-  expect(JSON.parse(snapshot)).toEqual([
-    {
-      id: failure.id,
-      description: failure.description,
-      status: "ready",
-      outcome: "error",
-    },
-  ]);
+  expect(systemPromptOptions.sections.pi_sub).toBe(stable);
   expect(sendMessage).not.toHaveBeenCalled();
   expect(
     [...tools.values()].reduce((n, tool) => n + tool.description.length, 0),

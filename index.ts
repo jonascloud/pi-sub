@@ -302,17 +302,9 @@ export default function piSub(pi: ExtensionAPI): void {
     } catch (error) {
       availability = `Delegation unavailable: ${reason(error)}`;
     }
-    const tasks = manager()
-      .list()
-      .map(({ id, description, status, outcome }) => ({
-        id,
-        description,
-        status,
-        outcome,
-      }));
-    event.systemPromptOptions.sections.pi_sub =
-      `${SUBAGENT_GUIDANCE}\n\n${availability}` +
-      (tasks.length ? `\n\nOpen tasks: ${JSON.stringify(tasks)}` : "");
+    // Providers cache the prompt as a prefix and some resend the whole
+    // conversation when it changes: task state never belongs here.
+    event.systemPromptOptions.sections.pi_sub = `${SUBAGENT_GUIDANCE}\n\n${availability}`;
   });
   pi.on("session_shutdown", async () => {
     lifetime.abort();
