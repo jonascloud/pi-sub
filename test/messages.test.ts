@@ -4,8 +4,9 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 import type { TaskView, TaskResult } from "../src/coordinator.ts";
 import {
   SUBAGENT_GUIDANCE,
+  pausedReminder,
+  renderPaused,
   renderReply,
-  renderFailures,
   renderStopped,
 } from "../src/messages.ts";
 import { replyBatch as buildBatch } from "../src/replies.ts";
@@ -97,6 +98,7 @@ test("TUI notifications are two-line previews with expandable complete delivery"
 
 test("operating guidance avoids routine acknowledgements and duplicate workload anchors", () => {
   expect(SUBAGENT_GUIDANCE).toContain("Reports need no acknowledgement");
+  expect(SUBAGENT_GUIDANCE).toContain("A failed task keeps its session");
   expect(SUBAGENT_GUIDANCE.split(STRENGTH_GUIDANCE)).toHaveLength(2);
 });
 
@@ -129,47 +131,68 @@ const failure: TaskResult = {
   pendingInput: ["Unsent correction"],
 };
 
-test("failed tasks expose every cause without expanding partial work or metadata", () => {
-  const failures = [
-    failure,
-    {
-      ...failure,
-      id: "task-2",
-      description: "Verify",
-      error: "Permission denied",
-    },
-  ];
-  const content = JSON.stringify(failures);
-  const collapsed = draw(renderFailures, content, failures).join("\n");
-  expect(collapsed).toContain("Failed · Review changes");
-  expect(collapsed).not.toContain("task-1");
+const failed: TaskView = {
+  ...task,
+  outcome: "error",
+  error: "Worker exited before delivery",
+  response: "Partial investigation\nSource: https://example.test/report",
+  reply: { id: "failure-1", delivered: false },
+};
+
+test("a failed reply names its cause; partial work and metadata stay in the expansion", () => {
+  const batch = replyBatch([
+    failed,
+    { ...task, id: "task-2", description: "Verify" },
+    { ...failed, id: "task-3", description: "Deploy", error: "Denied" },
+  ])!;
+  const collapsed = draw(renderReply, batch.content, batch.details).join("\n");
+  expect(collapsed).toContain("Review changes · failed");
   expect(collapsed).toContain("Worker exited before delivery");
-  expect(collapsed).toContain("Failed · Verify");
-  expect(collapsed).toContain("Permission denied");
+  expect(collapsed).toContain("Verify · response");
+  expect(collapsed).toContain("Deploy · failed");
+  expect(collapsed).toContain("Denied");
+  expect(collapsed).not.toContain("task-1");
   expect(collapsed).not.toContain("Partial investigation");
-  expect(collapsed).not.toContain("pendingInput");
-  const expanded = draw(renderFailures, content, failures, true).join("\n");
+  const expanded = draw(renderReply, batch.content, batch.details, true).join(
+    "\n",
+  );
   for (const text of [
-    "Partial investigation",
+    "Subagent task-1 (Review changes) failed",
+    "Last response:",
     "https://example.test/report",
-    "Unsent correction",
     "native.jsonl",
     '"outcome": "error"',
   ])
     expect(expanded).toContain(text);
-  expect(draw(renderFailures, "failure", [{ id: "x" }]).join("\n")).toContain(
-    "Execution failed",
-  );
+  expect(
+    draw(renderReply, "failure", {
+      replies: [{ id: "x", description: "", outcome: "error" }],
+    }).join("\n"),
+  ).toContain("Execution failed");
 });
 
-test("failure notices expose both execution and report-storage errors", () => {
-  const details = { report: [failure], reportError: "ENOSPC: no space left" };
-  const text = draw(renderFailures, "Report unavailable", details).join("\n");
-  expect(text).toContain("Worker exited before delivery");
-  expect(text).toContain("Report unavailable: ENOSPC");
+test("the paused reminder names its tasks to the model and stays one row for the human", () => {
+  const paused: TaskView = {
+    ...task,
+    status: "paused",
+    outcome: undefined,
+    response: "",
+  };
+  const one = pausedReminder([paused]);
+  expect(one.content).toBe(
+    "Still paused since the interruption: task-1 (Review changes). Continue or stop them unless they should stay paused.",
+  );
+  expect(draw(renderPaused, one.content, one.details)).toEqual([
+    " Still paused · Review changes ",
+  ]);
+  const two = pausedReminder([paused, { ...paused, id: "task-2" }]);
+  expect(two.content).toContain("task-1 (Review changes); task-2 (");
+  expect(draw(renderPaused, two.content, two.details).join("")).toContain(
+    "Still paused · 2 tasks",
+  );
   expect(
-    draw(renderFailures, "Report unavailable", details, true).join("\n"),
-  ).toContain("Unsent correction");
+    draw(renderPaused, two.content, two.details, true).join("\n"),
+  ).toContain("task-2");
 });
 
 test("stop acknowledgements summarize task identities", () => {
@@ -258,7 +281,7 @@ test("renderers handle content arrays and malformed metadata without mutating pa
     [null, 42, []],
     { id: [], description: {}, preview: 4 },
   ];
-  for (const renderer of [renderReply, renderFailures, renderStopped])
+  for (const renderer of [renderReply, renderPaused, renderStopped])
     for (const details of malformed) {
       const before = JSON.stringify({ content, details });
       for (const expanded of [false, true])
@@ -270,7 +293,7 @@ test("renderers handle content arrays and malformed metadata without mutating pa
   );
   // A malformed element must not suppress an otherwise usable task report.
   expect(
-    draw(renderFailures, "failure", [null, [], failure]).join("\n"),
+    draw(renderStopped, "stopped", [null, [], failure]).join("\n"),
   ).toContain(failure.error);
 });
 
@@ -285,7 +308,12 @@ test("all views respect width and output padding, collapsed and expanded", () =>
         ],
       },
     ],
-    [renderFailures, JSON.stringify([failure]), [failure]],
+    [
+      renderReply,
+      "Subagent task-1 failed\nDenied",
+      { replies: [{ ...failed, description: "Review 漢字" }] },
+    ],
+    [renderPaused, "Still paused", { report: [failure] }],
     [renderStopped, JSON.stringify([failure]), [failure]],
   ];
   for (const [renderer, content, details] of cases)
@@ -314,9 +342,13 @@ test("all views respect width and output padding, collapsed and expanded", () =>
   // A long identity cannot consume the separate, immediately visible cause row.
   expect(
     draw(
-      renderFailures,
+      renderReply,
       "failure",
-      [{ ...failure, description: "x".repeat(1000), error: "Denied" }],
+      {
+        replies: [
+          { ...failed, description: "x".repeat(1000), error: "Denied" },
+        ],
+      },
       false,
       12,
     ).join("\n"),
@@ -326,9 +358,9 @@ test("all views respect width and output padding, collapsed and expanded", () =>
 test("terminal commands and controls are sanitized in previews and full delivery", () => {
   const unsafe =
     "\x1b[31mVisible\x1b[0m\x1b]8;;https://evil.test\x07link\x1b]8;;\x07\x1b_Gpayload\x1b\\\x07\b\r";
-  for (const renderer of [renderReply, renderFailures, renderStopped]) {
+  for (const renderer of [renderReply, renderPaused, renderStopped]) {
     const details =
-      renderer === renderFailures || renderer === renderStopped
+      renderer === renderPaused || renderer === renderStopped
         ? [{ ...failure, description: unsafe, error: unsafe }]
         : {
             replies: [
@@ -338,6 +370,7 @@ test("terminal commands and controls are sanitized in previews and full delivery
                 response: unsafe,
                 preview: unsafe,
               },
+              { ...failed, description: unsafe, error: unsafe },
             ],
           };
     for (const expanded of [false, true]) {

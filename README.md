@@ -2,7 +2,7 @@
 
 A small coordinator for native [Pi](https://pi.dev) subagents. Pi owns conversation history, tools, compaction and retries; pi-sub owns model routing, task and process lifetime, and compact presentation.
 
-A **task** owns a native Pi session. Each **execution** is a fresh `pi --mode json --print` process on that session. A reply may be a question: a follow-up continues the session, and explicit acceptance removes the task. Ready and paused tasks hold no process.
+A **task** owns a native Pi session. Each **execution** is a fresh `pi --mode json --print` process on that session. A reply may be a question, and an execution may fail: a follow-up continues the session either way, and explicit acceptance removes the task. Ready and paused tasks hold no process.
 
 ## Install
 
@@ -38,12 +38,12 @@ pi @instructions/create-model-ladder.md "Help me create or revise my pi-sub mode
 
 ## Parent tools
 
-| Tool          | Contract                                                                                                                                                                            |
-| ------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `sub_task`    | Start bounded work with required `level` (integer 1–10) and `prompt`, plus optional `description`. Returns an ID immediately.                                                       |
-| `sub_message` | Send `{ id, message }`. Updates queued input or stops active execution, waits for closure, then continues the same session with the correction. Also answers ready or paused tasks. |
-| `sub_result`  | Inspect `{ id }`. Optional `wait` and timeout in seconds only observe. `finish: true` explicitly accepts/removes a ready task.                                                      |
-| `sub_control` | `pause`, `continue` or `stop`, with optional `id`; omit it to control all applicable tasks. Stopping never rolls back side effects.                                                 |
+| Tool          | Contract                                                                                                                                                                                    |
+| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `sub_task`    | Start bounded work with required `level` (integer 1–10) and `prompt`, plus optional `description`. Returns an ID immediately.                                                               |
+| `sub_message` | Send `{ id, message }`. Updates queued input or stops active execution, waits for closure, then continues the same session with the correction. Also answers ready, failed or paused tasks. |
+| `sub_result`  | Inspect `{ id }`. Optional `wait` and timeout in seconds only observe. `finish: true` explicitly accepts/removes a ready task.                                                              |
+| `sub_control` | `pause`, `continue` or `stop`, with optional `id`; omit it to control all applicable tasks. Stopping never rolls back side effects.                                                         |
 
 ```text
 sub_task({ level: 3, prompt: "Inspect the authentication entry points without modifying files.", description: "Review auth" })
@@ -52,13 +52,13 @@ sub_message({ id: "<task-id>", message: "Use the production schema, then continu
 sub_result({ id: "<task-id>", finish: true })
 ```
 
-A wait timeout does not stop work. Reading a reply does not accept it, and a delivered reply needs no acknowledgement: the task stays open for follow-up until accepted or stopped. Accepted and stopped tasks cannot resume, but their results remain retrievable in the active parent session.
+A wait only observes. It ends with a reply or failure, when its task pauses, at its timeout, or as soon as the user sends a message, so a waiting parent never holds the user back. None of these stops work. Reading a reply does not accept it, and a delivered reply needs no acknowledgement: the task stays open for follow-up until accepted or stopped. Accepted and stopped tasks cannot resume, but their results remain retrievable in the active parent session.
 
-Replies arrive on their own. At the next safe turn boundary, or once when the parent is idle, pi-sub batches unannounced replies into one message; a complete tool return already counts as delivery. Large reports and batches are handed off as a reference to a private temporary file instead of being clipped. These files expire on session switch, fork, reload or shutdown, so preserve relevant findings before leaving the session.
+Replies and failures arrive on their own. At the next safe turn boundary, or once when the parent is idle, pi-sub batches unannounced ones into one message; a complete tool return already counts as delivery. Large reports and batches are handed off as a reference to a private temporary file instead of being clipped. These files expire on session switch, fork, reload or shutdown, so preserve relevant findings before leaving the session.
 
 ## Interrupt and continue
 
-An **interrupt** pauses all children and closes admission until the next user prompt. Aborting an active parent run, for example with Escape, is an interrupt. While the parent is idle, Escape keeps its native meaning; use `/sub:pause`. A new user prompt resumes only the parent, which decides which children to continue.
+An **interrupt** pauses all children and closes admission until the next user prompt. Aborting an active parent run, for example with Escape, is an interrupt. While the parent is idle, Escape keeps its native meaning; use `/sub:pause`. A new user prompt resumes only the parent, which decides which children to continue. If it would finish while children paused by its abort are still paused, it is reminded once.
 
 ```text
 /sub:pause [task-id]
@@ -68,13 +68,15 @@ An **interrupt** pauses all children and closes admission until the next user pr
 
 No ID means all applicable tasks; `/sub:pause` without an ID is the global interrupt. In RPC, send `prompt("/sub:pause")`: an idle RPC `abort` emits no extension event.
 
-Pausing terminates the process (SIGTERM, then SIGKILL) and continuation restarts it on the same session. It does not undo writes or external effects. Failed tasks are closed and their reports handed to the parent before the next user prompt, without a model cleanup turn.
+Pausing terminates the process (SIGTERM, then SIGKILL) and continuation restarts it on the same session. It does not undo writes or external effects.
+
+A failed execution leaves its task open. The parent receives the failure like a reply, and a message continues the session, resending instructions that never reached it. Nothing retries on its own. Only a lost session is final: a journal that is corrupt, replaced or gone.
 
 Up to four executions run concurrently. Queued, paused and ready tasks hold no process. Shutdown, reload and session replacement close all executions and delete the temporary workspace; reopening a saved conversation starts without tasks.
 
 ## Views and usage
 
-Tool rows and transcript messages show task names, confirmed outcomes and compact previews; expand them for requests, full delivered text, IDs, execution and usage. The widget above the editor shows outstanding work: active, paused, failed and undelivered tasks. Delivered replies fold into a count; the summary shows native `↑input ↓output` tokens of all subagents.
+Tool rows and transcript messages show task names, confirmed outcomes and compact previews; expand them for requests, full delivered text, IDs, execution and usage. The widget above the editor shows outstanding work: active and paused tasks, and replies or failures the parent has not seen. Delivered ones fold into a count; the summary shows native `↑input ↓output` tokens of all subagents.
 
 Usage is read from each child's saved journal after every execution and charged to the parent session with the next subagent tool result, independent of acceptance. Pi offers extensions no other way into session totals, so work confirmed after a session's last subagent tool result is missing from them.
 

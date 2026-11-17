@@ -14,13 +14,17 @@ import {
 } from "./reports.ts";
 import type { Workspace } from "./workspace.ts";
 
+/** An answer and a failure both await the parent's decision. A stop is its own. */
+const handedOff = (outcome: unknown) =>
+  outcome === "reply" || outcome === "error";
 const record = (value: unknown): Record<string, unknown> | undefined =>
   value !== null && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : undefined;
 
-/** Live tasks in creation order are the inbox; native history
- * records announcements. Recompute at every boundary, never retain a second queue.
+/** Live tasks in creation order are the inbox, for answers and failures alike;
+ * native history records announcements. Recompute at every boundary, never
+ * retain a second queue.
  */
 export function pendingReplyBatch(
   tasks: readonly TaskView[],
@@ -34,7 +38,7 @@ export function pendingReplyBatch(
   const replies = tasks.filter(
     (task) =>
       task.status === "ready" &&
-      task.outcome === "reply" &&
+      handedOff(task.outcome) &&
       task.reply &&
       !task.reply.delivered,
   );
@@ -57,12 +61,15 @@ export function pendingReplyBatch(
 export function replyText(
   task: Pick<TaskView, "id" | "description" | "response" | "error">,
 ): string {
-  const response = stripTerminalSequences(task.error ?? task.response);
+  const response = stripTerminalSequences(task.response);
   const description = truncateToWidth(
     stripTerminalSequences(task.description).replace(/\s+/g, " ").trim(),
     160,
   );
-  return `Subagent ${task.id} (${description})\n${response}`;
+  // A failure never hides behind the last text its execution produced.
+  return task.error === undefined
+    ? `Subagent ${task.id} (${description})\n${response}`
+    : `Subagent ${task.id} (${description}) failed\n${stripTerminalSequences(task.error)}${response ? `\n\nLast response:\n${response}` : ""}`;
 }
 
 /** One bounded message: complete text or one saved file for the entire batch. */
@@ -106,7 +113,7 @@ function replyReference(value: unknown): ReplyReference | undefined {
   const data = record(value);
   const reply = record(data?.reply);
   return data?.status === "ready" &&
-    data.outcome === "reply" &&
+    handedOff(data.outcome) &&
     typeof data.id === "string" &&
     typeof reply?.id === "string"
     ? { id: data.id, replyId: reply.id }

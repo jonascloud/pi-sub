@@ -35,11 +35,13 @@ export interface WorkerReport {
   // Exact prompt evidence only. Native input transformations may make this
   // unprovable; interrupted/failed executions then conservatively replay input.
   inputPersisted: boolean;
+  /** The journal is corrupt, substituted, rewritten or gone: nothing can continue it. */
+  sessionLost: boolean;
   /** Native journal identity retained across fresh execution processes. */
   sessionId?: string;
 }
 export interface Worker {
-  /** Resolves after drained process close, or without spawning on preflight failure. */
+  /** Resolves after process exit and bounded draining, or without spawning on preflight failure. */
   run(prompt: string): Promise<WorkerReport>;
   stop(): Promise<void>;
   onEvent(listener: (event: WorkerEvent) => void): () => void;
@@ -50,6 +52,7 @@ const stderrLimit = 16 * 1024;
 const recordLimit = 16 * 1024 * 1024;
 const terminateGrace = 1000;
 const killGrace = 2000;
+const drainGrace = 1000;
 
 /** One execution owns one child; only the native session survives continuations. */
 export function createWorker(
@@ -69,6 +72,7 @@ export function createWorker(
     let lastAssistant: AssistantMessage | undefined;
     let inputPersisted = false;
     let failure: string | undefined;
+    let sessionLost = false;
     let stderr = "";
     const fail = (message: string) => {
       failure ??= message;
@@ -87,6 +91,7 @@ export function createWorker(
       ...(failure ? { error: failure } : {}),
       interrupted: stopRequested,
       inputPersisted,
+      sessionLost,
       ...(sessionId ? { sessionId } : {}),
     });
     // Only a genuinely new task may start without a journal. Never let the
@@ -95,6 +100,8 @@ export function createWorker(
       before.error ||
       (expectedSessionId && before.id !== expectedSessionId)
     ) {
+      // A read error may pass; damage and substitution of known history do not.
+      sessionLost = before.corrupt === true || !before.error;
       fail(
         before.error ??
           (before.missing
@@ -155,6 +162,7 @@ export function createWorker(
       const diagnostics = new StringDecoder("utf8");
       let pending = "";
       let discarding = false;
+      let undrained = false;
       let protocolFailed = false;
       const protocolFailure = (message: string) => {
         fail(message);
@@ -217,9 +225,10 @@ export function createWorker(
         if (stdoutEnded) return;
         stdoutEnded = true;
         consume(stdout.end());
-        // Killing a writer can truncate its last progress frame. The saved
-        // journal still must validate; genuine protocol failures remain errors.
-        if (!stopRequested && (pending || discarding))
+        // Killing a writer or abandoning a held pipe can truncate the last
+        // progress frame. The saved journal still must validate; genuine
+        // protocol failures remain errors.
+        if (!stopRequested && !undrained && (pending || discarding))
           protocolFailure("Incomplete native JSON output at EOF");
       };
       const outcome = await new Promise<{
@@ -247,7 +256,18 @@ export function createWorker(
         child!.on("error", (error: Error) =>
           fail(`Native process: ${error.message}`),
         );
+        // The journal is final once the process is gone. Output is progress
+        // only, so a descendant holding an inherited pipe gets a bounded wait.
+        let drain: ReturnType<typeof setTimeout> | undefined;
+        child!.once("exit", () => {
+          drain = setTimeout(() => {
+            undrained = true;
+            child!.stdout.destroy();
+            child!.stderr.destroy();
+          }, drainGrace);
+        });
         child!.once("close", (code, signal) => {
+          clearTimeout(drain);
           processClosed = true;
           notifyClosed();
           finishStdout();
@@ -264,7 +284,7 @@ export function createWorker(
             deadline = setTimeout(() => {
               rejectStop(
                 new Error(
-                  "Native process did not close after SIGKILL; stop may be retried",
+                  "Native process did not exit after SIGKILL; stop may be retried",
                 ),
               );
             }, terminateGrace + killGrace);
@@ -293,7 +313,8 @@ export function createWorker(
           child!.stdin.destroy();
         }
       });
-      // close, not exit/agent_settled, is the boundary: both pipes are drained.
+      // close, not agent_settled, is the boundary: the process has exited and
+      // its pipes are drained or abandoned.
       if (!stopRequested && (outcome.code !== 0 || outcome.signal)) {
         fail(
           `Native process exited ${outcome.signal ?? outcome.code}${stderr.trim() ? `: ${stderr.trim()}` : ""}`,
@@ -320,6 +341,12 @@ export function createWorker(
       fail("Native session file is missing");
     if (sessionId && saved.id && saved.id !== sessionId)
       fail("Native session identity changed");
+    // A journal that never existed loses nothing: a first start may repeat.
+    if (
+      saved.corrupt ||
+      (sessionId && (saved.missing || (saved.id && saved.id !== sessionId)))
+    )
+      sessionLost = true;
     sessionId ??= saved.id;
     // A damaged or foreign snapshot is not evidence for any of its records.
     // Even a valid snapshot must not replace an already confirmed entry.
@@ -327,8 +354,10 @@ export function createWorker(
       const previous = entries.get(entry.id);
       return previous && JSON.stringify(previous) !== JSON.stringify(entry);
     });
-    if (changed && !saved.error && saved.id === sessionId)
+    if (changed && !saved.error && saved.id === sessionId) {
       fail("Native session entry changed");
+      sessionLost = true;
+    }
     const trusted =
       !saved.error && !saved.missing && saved.id === sessionId && !changed;
     for (const entry of trusted ? saved.entries : []) {
@@ -384,6 +413,7 @@ async function readSession(file: string): Promise<{
   entries: SessionEntry[];
   id?: string;
   missing?: boolean;
+  corrupt?: boolean;
   error?: string;
 }> {
   let contents: string;
@@ -441,7 +471,9 @@ async function readSession(file: string): Promise<{
   return {
     entries,
     id: header,
-    ...(!header || corrupt ? { error: "Corrupt native session file" } : {}),
+    ...(!header || corrupt
+      ? { corrupt: true, error: "Corrupt native session file" }
+      : {}),
   };
 }
 
