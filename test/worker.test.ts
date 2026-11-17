@@ -74,6 +74,22 @@ async function setup(body: string, options: Partial<WorkerOptions> = {}) {
   workers.push(worker);
   return { worker, session, dir, config };
 }
+/** The next spawned process ignores signals until released, like one stuck in the kernel. */
+function unkillable() {
+  let release = () => {};
+  vi.mocked(spawn).mockImplementationOnce(((
+    ...args: Parameters<typeof spawn>
+  ) => {
+    const child = (vi.mocked(spawn).getMockImplementation() ?? spawn)(...args);
+    const kill = child.kill.bind(child);
+    child.kill = () => true;
+    release = () => {
+      child.kill = kill;
+    };
+    return child;
+  }) as typeof spawn);
+  return () => release();
+}
 function nextEvent(worker: Worker, type = "agent_start") {
   return new Promise<void>((resolve) => {
     const off = worker.onEvent((event) => {
@@ -263,7 +279,7 @@ setInterval(()=>{},1000);
   10000,
 );
 
-test("even exit is not close while an inherited stdout pipe is open", async () => {
+test("output inherited by a descendant still drains within the bound after exit", async () => {
   const { worker } = await setup(`
 require('node:child_process').spawn(process.execPath,['-e',"setTimeout(()=>console.log(JSON.stringify({type:'message_end',message:"+JSON.stringify(assistant)+"})),150)"],{stdio:['ignore',process.stdout,'ignore']});
 process.exit(0);
@@ -274,11 +290,64 @@ process.exit(0);
   });
 });
 
-test("failed bounded stop can be retried without settling run before close", async () => {
+test("a descendant holding the pipes cannot keep an exited execution open", async () => {
   const { worker } = await setup(`
-require('node:child_process').spawn(process.execPath,['-e',"setTimeout(()=>process.exit(0),4500)"],{stdio:['ignore',process.stdout,'ignore']});
+append(entry('u',user)); append(entry('a',assistant));
+process.stdout.write('{"type":"agent_st');
+require('node:child_process').spawn(process.execPath,['-e',"setTimeout(()=>{},6000)"],{stdio:['ignore','inherit','inherit'],detached:true}).unref();
+process.exit(0);
+`);
+  const start = Date.now();
+  const report = await worker.run("hello");
+  // The journal decides; the abandoned progress frame is not a protocol error.
+  expect(report).toMatchObject({
+    text: "new response",
+    interrupted: false,
+    inputPersisted: true,
+    sessionLost: false,
+  });
+  expect(report).not.toHaveProperty("error");
+  expect(Date.now() - start).toBeLessThan(3000);
+}, 10000);
+
+test("a stop arriving while an exited execution drains does not turn its reply into an interruption", async () => {
+  const { worker } = await setup(`
+append(entry('u',user)); append(entry('a',assistant));
+emit({type:'agent_settled',aborted:false});
+require('node:child_process').spawn(process.execPath,['-e',"setTimeout(()=>{},6000)"],{stdio:['ignore','inherit','inherit'],detached:true}).unref();
+process.exit(0);
+`);
+  const settled = nextEvent(worker, "agent_settled");
+  const running = worker.run("hello");
+  await settled;
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  await worker.stop();
+  const report = await running;
+  expect(report).toMatchObject({
+    text: "new response",
+    interrupted: false,
+    inputPersisted: true,
+  });
+  expect(report).not.toHaveProperty("error");
+}, 10000);
+
+test("stop is bounded by exit, not by a descendant holding the pipes", async () => {
+  const { worker } = await setup(`
+require('node:child_process').spawn(process.execPath,['-e',"setTimeout(()=>{},6000)"],{stdio:['ignore','inherit','inherit'],detached:true}).unref();
 emit({type:'agent_start'}); setInterval(()=>{},1000);
 `);
+  const ready = nextEvent(worker);
+  const running = worker.run("hello");
+  await ready;
+  await worker.stop();
+  expect(await running).toMatchObject({ interrupted: true });
+}, 10000);
+
+test("failed bounded stop can be retried without settling run before exit", async () => {
+  const release = unkillable();
+  const { worker } = await setup(
+    `emit({type:'agent_start'}); setInterval(()=>{},1000);`,
+  );
   const ready = nextEvent(worker);
   let completed = false;
   const running = worker.run("hello").then((report) => {
@@ -288,15 +357,16 @@ emit({type:'agent_start'}); setInterval(()=>{},1000);
   await ready;
   await expect(worker.stop()).rejects.toThrow("stop may be retried");
   expect(completed).toBe(false);
+  release();
   await worker.stop();
   expect(await running).toMatchObject({ interrupted: true });
 }, 10000);
 
 test("failed internal termination stays pending and external stop can retry", async () => {
-  const { worker } = await setup(`
-require('node:child_process').spawn(process.execPath,['-e',"setTimeout(()=>process.exit(0),4500)"],{stdio:['ignore',process.stdout,'ignore']});
-emit({type:'agent_start'}); process.stdout.write('{broken}\\n'); setInterval(()=>{},1000);
-`);
+  const release = unkillable();
+  const { worker } = await setup(
+    `emit({type:'agent_start'}); process.stdout.write('{broken}\\n'); setInterval(()=>{},1000);`,
+  );
   const ready = nextEvent(worker);
   let completed = false;
   const running = worker.run("hello").then((report) => {
@@ -304,10 +374,11 @@ emit({type:'agent_start'}); process.stdout.write('{broken}\\n'); setInterval(()=
     return report;
   });
   await ready;
-  // The internal bounded attempt times out while the inherited pipe stays open.
+  // The internal bounded attempt times out while the process ignores signals.
   // Vitest also fails this test if its rejected stop promise goes unhandled.
   await new Promise((resolve) => setTimeout(resolve, 3300));
   expect(completed).toBe(false);
+  release();
   await worker.stop();
   expect(await running).toMatchObject({
     error: "Invalid native JSON output",
@@ -413,6 +484,7 @@ setInterval(()=>{},1000);
   expect(await running).toMatchObject({
     interrupted: true,
     error: "Corrupt native session file",
+    sessionLost: true,
   });
 });
 
@@ -461,6 +533,7 @@ emit({type:'agent_start'}); setInterval(()=>{},1000);
     error: "Native session file is missing",
     interrupted: true,
     inputPersisted: false,
+    sessionLost: true,
     sessionId: "session",
   });
 });
@@ -483,6 +556,7 @@ test.each(["missing", "replaced"])(
           ? "Native session file is missing"
           : "Native session identity changed",
       inputPersisted: false,
+      sessionLost: true,
     });
     expect(await worker.stop()).toBeUndefined();
     expect(vi.mocked(spawn).mock.calls.length).toBe(spawned);
@@ -554,6 +628,7 @@ test("no stale restored assistant; cumulative native usage counts every entry on
     text: "",
     error: "No new assistant response",
     inputPersisted: false,
+    sessionLost: false,
     usage: {
       input: 50,
       reasoning: 10,
@@ -637,7 +712,12 @@ test.each([
         .join("\n") + "\n",
     );
     const report = await worker.run("hello");
-    expect(report).toMatchObject({ error, usage, inputPersisted: false });
+    expect(report).toMatchObject({
+      error,
+      usage,
+      inputPersisted: false,
+      sessionLost: true,
+    });
   },
 );
 
@@ -676,15 +756,35 @@ test("corrupt saved session is not passed to native loader or rewritten", async 
   expect(await worker.run("hello")).toMatchObject({
     error: "Corrupt native session file",
     inputPersisted: false,
+    sessionLost: true,
   });
   expect(await readFile(session, "utf8")).toBe("{broken}\n");
 });
 
-test("missing saved session and spawn failure resolve failure reports", async () => {
+test("a first start that leaves no journal fails without losing a session", async () => {
   const { worker } = await setup(`fs.unlinkSync(file);`);
-  expect((await worker.run("hello")).error).toMatch(/missing/);
+  expect(await worker.run("hello")).toMatchObject({
+    error: expect.stringMatching(/missing/),
+    sessionLost: false,
+  });
   const { worker: failed } = await setup("", {
     cwd: "/nonexistent/pi-worker-test",
   });
-  expect((await failed.run("hello")).error).toMatch(/ENOENT/);
+  expect(await failed.run("hello")).toMatchObject({
+    error: expect.stringMatching(/ENOENT/),
+    sessionLost: false,
+  });
+});
+
+test("a crash after saved work fails the execution but keeps its session", async () => {
+  const { worker } = await setup(
+    `append(entry('u',user)); assistant.stopReason='toolUse'; append(entry('a',assistant)); console.error('AbortError: The operation was aborted'); process.exit(1);`,
+  );
+  expect(await worker.run("hello")).toMatchObject({
+    error: expect.stringContaining("Native process exited 1: AbortError"),
+    inputPersisted: true,
+    sessionLost: false,
+    sessionId: "session",
+    usage,
+  });
 });

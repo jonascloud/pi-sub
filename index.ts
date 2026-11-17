@@ -9,11 +9,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { stripTerminalSequences } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import {
-  Coordinator,
-  type TaskView,
-  type TaskResult,
-} from "./src/coordinator.ts";
+import { Coordinator, type TaskView } from "./src/coordinator.ts";
 import {
   availableExecutions,
   availableModels,
@@ -27,8 +23,9 @@ import { taskToolRenderers } from "./src/tool-view.ts";
 import { mountWidget } from "./src/widget.ts";
 import {
   SUBAGENT_GUIDANCE,
+  pausedReminder,
+  renderPaused,
   renderReply,
-  renderFailures,
   renderStopped,
 } from "./src/messages.ts";
 import { pendingReplyBatch, deliveredReplies } from "./src/replies.ts";
@@ -41,7 +38,7 @@ export default function piSub(pi: ExtensionAPI): void {
   // Children load normal Pi resources, but must not recursively install their coordinator.
   if (process.env.PI_SUB_CHILD === "1") return;
   pi.registerMessageRenderer("pi-sub:response", renderReply);
-  pi.registerMessageRenderer("pi-sub:failures", renderFailures);
+  pi.registerMessageRenderer("pi-sub:paused", renderPaused);
   pi.registerMessageRenderer("pi-sub:stopped", renderStopped);
   const workspace = new Workspace();
   let context: ExtensionContext | undefined;
@@ -52,6 +49,23 @@ export default function piSub(pi: ExtensionAPI): void {
   let dialogOpen = false;
   const lifetime = new AbortController();
   let idleDelivery: ReturnType<typeof setImmediate> | undefined;
+  // Steering messages reach the parent only after its current tool calls, so
+  // observing a child must not hold them back.
+  let steers = 0;
+  const waits = new Set<AbortController>();
+  let steerWatch: ReturnType<typeof setInterval> | undefined;
+  // Pi queues a steering message once every input handler has returned and
+  // announces that to no extension: look while one is expected and a wait is open.
+  const yieldToSteering = () => {
+    if (steers && context?.hasPendingMessages())
+      for (const wait of waits) wait.abort();
+    const expected = steers > 0 && waits.size > 0;
+    if (expected && !steerWatch) steerWatch = setInterval(yieldToSteering, 100);
+    if (!expected && steerWatch) {
+      clearInterval(steerWatch);
+      steerWatch = undefined;
+    }
+  };
 
   const replyBatchFor = (ctx: ExtensionContext, messages?: AgentMessage[]) =>
     lifetime.signal.aborted || !coordinator?.runnable
@@ -105,14 +119,7 @@ export default function piSub(pi: ExtensionAPI): void {
         checkContext(context);
         authorizeTask(task, context);
       },
-      onReady(task) {
-        if (lifetime.signal.aborted) return;
-        if (task.outcome === "error") {
-          notify(`${task.description} · failed\n${task.error}`, "error");
-          return;
-        }
-        scheduleReplies();
-      },
+      onReady: scheduleReplies,
     }));
   const checkContext = (ctx: ExtensionContext) => {
     if (lifetime.signal.aborted)
@@ -121,11 +128,11 @@ export default function piSub(pi: ExtensionAPI): void {
       throw new Error("Trust this project before starting native subagents.");
     context = ctx;
   };
-  const interrupt = () => {
+  const interrupt = (implicit: boolean) => {
     if (lifetime.signal.aborted) return Promise.resolve();
     runInterrupted = true;
     const pending = manager()
-      .interrupt()
+      .interrupt(implicit)
       .catch((error) =>
         notify(
           `Could not confirm subagent interruption: ${reason(error)}`,
@@ -138,25 +145,13 @@ export default function piSub(pi: ExtensionAPI): void {
     if (!signal || signals.has(signal)) return;
     signals.add(signal);
     const aborted = () => {
-      if (compaction || !runInterrupted) interrupt();
+      if (compaction || !runInterrupted) interrupt(true);
     };
     signal.addEventListener("abort", aborted, { once: true });
     if (signal.aborted) aborted();
   };
   const preparePrompt = async () => {
-    const prepared = await manager().prompt((failures: TaskResult[]) => {
-      if (!failures.length) return;
-      const result = reportResult(failures, workspace);
-      pi.sendMessage(
-        {
-          customType: "pi-sub:failures",
-          display: true,
-          content: result.content[0]!.text,
-          details: result.details,
-        },
-        { triggerTurn: false },
-      );
-    });
+    const prepared = await manager().prompt();
     if (prepared) scheduleReplies();
     return prepared;
   };
@@ -169,6 +164,30 @@ export default function piSub(pi: ExtensionAPI): void {
     );
   const authorized = (id: string, ctx: ExtensionContext) =>
     authorizeTask(manager().get(id), ctx);
+  const observeTask = async (
+    id: string,
+    signal: AbortSignal | undefined,
+    timeoutMs: number,
+    ctx: ExtensionContext,
+  ) => {
+    if (steers && ctx.hasPendingMessages()) return manager().inspect(id);
+    const yielded = new AbortController();
+    waits.add(yielded);
+    yieldToSteering();
+    try {
+      return await manager().wait(
+        id,
+        signal ? AbortSignal.any([signal, yielded.signal]) : yielded.signal,
+        timeoutMs,
+      );
+    } catch (error) {
+      if (yielded.signal.aborted && !signal?.aborted)
+        return manager().inspect(id);
+      throw error;
+    } finally {
+      waits.delete(yielded);
+    }
+  };
   const response = (value: Reports, error = false) => {
     const result = reportResult(value, workspace);
     const usage = coordinator?.drainUsage();
@@ -196,12 +215,13 @@ export default function piSub(pi: ExtensionAPI): void {
   pi.on("input", async (event, ctx) => {
     if (event.source !== "interactive" && event.source !== "rpc") return;
     context = ctx;
-    try {
-      if (!(await preparePrompt())) return { action: "handled" };
-    } catch (error) {
-      notify(`Could not prepare user input: ${reason(error)}`, "error");
-      return { action: "handled" };
-    }
+    if (!(await preparePrompt())) return { action: "handled" };
+    if (event.streamingBehavior !== "steer") return;
+    steers++;
+    setImmediate(yieldToSteering);
+  });
+  pi.on("message_start", (event) => {
+    if (event.message.role === "user" && steers) steers--;
   });
   // Only complete model-visible context acknowledges a reply. Announcements
   // and boundary proposals alone must not collapse its outstanding widget row.
@@ -222,11 +242,23 @@ export default function piSub(pi: ExtensionAPI): void {
       ...event.context.contextMessages,
       ...event.context.pendingMessages,
     ]);
-    if (!batch) return;
+    // The parent is about to rest while children it never chose to pause still do.
+    const paused =
+      event.type === "agent_before_settle" && coordinator?.runnable
+        ? coordinator.takeInterrupted()
+        : [];
+    const messages = [
+      ...(batch ? [batch] : []),
+      ...(paused.length ? [pausedReminder(paused)] : []),
+    ];
+    if (!messages.length) return;
     return {
       entries: [
         ...event.entries,
-        { type: "custom_message" as const, ...batch },
+        ...messages.map((message) => ({
+          type: "custom_message" as const,
+          ...message,
+        })),
       ],
       // Natural tool/queue continuation satisfies this request; Pi does not add
       // another turn on top of it.
@@ -245,8 +277,9 @@ export default function piSub(pi: ExtensionAPI): void {
   });
   pi.on("agent_settled", (event, ctx) => {
     context = ctx;
+    steers = 0;
     if (event.aborted) {
-      if (!runInterrupted) interrupt();
+      if (!runInterrupted) interrupt(true);
     } else scheduleReplies(); // Includes replies arriving after the final boundary.
   });
   pi.on("session_before_compact", (event) => {
@@ -284,6 +317,7 @@ export default function piSub(pi: ExtensionAPI): void {
   pi.on("session_shutdown", async () => {
     lifetime.abort();
     if (idleDelivery) clearImmediate(idleDelivery);
+    clearInterval(steerWatch);
     unmount?.();
     await coordinator?.dispose();
     workspace.dispose();
@@ -299,7 +333,7 @@ export default function piSub(pi: ExtensionAPI): void {
           if (action === "pause") {
             if (id) await manager().pause(id);
             else {
-              const pending = interrupt();
+              const pending = interrupt(false);
               ctx.abort();
               await pending;
             }
@@ -425,7 +459,7 @@ export default function piSub(pi: ExtensionAPI): void {
       exposure: "model-only",
       executionMode: "sequential",
       description:
-        "Read or wait for a response; the task stays available for follow-up. finish:true accepts/removes it, not merely acknowledges it. A timeout only ends the wait.",
+        "Read or wait for a response; the task stays available for follow-up. finish:true accepts/removes it, not merely acknowledges it. A timeout, pause or user message only ends the wait.",
       parameters: Type.Object(
         {
           id: Type.String(),
@@ -445,10 +479,19 @@ export default function piSub(pi: ExtensionAPI): void {
         try {
           checkContext(ctx);
           const task = args.wait
-            ? await manager().wait(args.id, signal, (args.timeout ?? 30) * 1000)
+            ? await observeTask(
+                args.id,
+                signal,
+                (args.timeout ?? 30) * 1000,
+                ctx,
+              )
             : manager().inspect(args.id);
+          // A wait that ended early has nothing to accept yet.
+          const open = "status" in task && task.status !== "ready";
           return response(
-            args.finish ? await manager().collect(task.id) : task,
+            args.finish && !(args.wait && open)
+              ? await manager().collect(task.id)
+              : task,
           );
         } catch (error) {
           return response(reason(error), true);

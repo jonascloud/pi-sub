@@ -255,7 +255,14 @@ describe("widget rendering", () => {
     const text = render(
       [
         reply,
-        { ...reply, id: "failed", outcome: "error", error: "Provider failed" },
+        {
+          ...reply,
+          id: "failed",
+          outcome: "error",
+          error: "Provider failed",
+          reply: { id: "failure-1", delivered: false },
+        },
+        { ...reply, id: "told", outcome: "error", error: "Parent knows" },
         { ...reply, id: "paused", status: "paused" },
         task({ description: "Still running" }),
       ],
@@ -265,7 +272,8 @@ describe("widget rendering", () => {
     expect(text).toContain("Provider failed");
     expect(text).toContain("pse");
     expect(text).toContain("Still running");
-    expect(text).toContain("1 delivered");
+    expect(text).not.toContain("Parent knows"); // The decision is the parent's now.
+    expect(text).toContain("2 delivered");
     expect(text).not.toContain("+1");
   });
   it("shows paused and reply states", () => {

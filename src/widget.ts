@@ -14,9 +14,7 @@ import type { Coordinator, Summary, TaskView } from "./coordinator.ts";
 type WidgetTheme = Pick<Theme, "fg" | "bold">;
 const active = (task: TaskView) => task.status === "active";
 const delivered = (task: TaskView) =>
-  task.status === "ready" &&
-  task.outcome === "reply" &&
-  task.reply?.delivered === true;
+  task.status === "ready" && task.reply?.delivered === true;
 const clean = (text: string) =>
   stripTerminalSequences(text)
     .replace(/[\r\n\t\x00-\x1f\x7f-\x9f]+/g, " ")

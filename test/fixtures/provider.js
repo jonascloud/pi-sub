@@ -1,5 +1,5 @@
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai/utils/event-stream";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 
 function reply(context) {
@@ -31,6 +31,10 @@ function reply(context) {
     const results = messages
       .slice(index + 1)
       .filter((message) => message.role === "toolResult");
+    if (text.startsWith("Still paused since the interruption"))
+      return results.length
+        ? { text: "continued" }
+        : { name: "sub_control", args: { action: "continue" } };
     if (text === "integration:batch" && !results.length)
       return {
         calls: [
@@ -218,6 +222,11 @@ export default function (pi) {
             context.messages.some((message) => message.role === "assistant"))
         )
           process.exit(42);
+        const crashed = process.env.WORKER_TEST_CRASH_ONCE;
+        if (crashed && !existsSync(crashed)) {
+          writeFileSync(crashed, "crashed");
+          process.exit(42);
+        }
         if (options?.signal?.aborted) {
           message.stopReason = "aborted";
           message.errorMessage = "aborted";

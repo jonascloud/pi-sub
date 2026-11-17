@@ -30,7 +30,7 @@ export interface TaskView extends TaskData {
   outcome?: Outcome;
   operation?: "pausing" | "closing";
   activity: string;
-  /** Delivery belongs to this reply, not to the task's eventual acceptance. */
+  /** The latest execution's answer or failure. Delivery belongs to it, not to the task's eventual acceptance. */
   reply?: { id: string; delivered: boolean };
   pendingInput?: string[];
 }
@@ -66,6 +66,8 @@ type Task = {
   inputTokens: number;
   outputTokens: number;
   sessionId?: string;
+  /** Without its journal a task can only be read, accepted or stopped. */
+  lost: boolean;
   elapsed: number;
   activeSince?: number;
 };
@@ -85,8 +87,9 @@ export class Coordinator {
   private listeners = new Set<() => void>();
   private disposed = false;
   private suspended = false;
-  private preparing = 0;
   private epoch = 0;
+  /** Paused as a side effect of interrupting the parent; raised with it once. */
+  private unresolved = new Set<Task>();
   private interruption?: Promise<void>;
   private max: number;
   private factory: typeof createWorker;
@@ -112,7 +115,7 @@ export class Coordinator {
     return this.suspended;
   }
   get runnable() {
-    return !this.disposed && !this.suspended && !this.preparing;
+    return !this.disposed && !this.suspended;
   }
   subscribe(listener: () => void) {
     this.listeners.add(listener);
@@ -168,6 +171,7 @@ export class Coordinator {
     }
     if (status === "active" && t.activeSince === undefined)
       t.activeSince = Date.now();
+    if (status === "queued") this.unresolved.delete(t);
     t.status = status;
     this.emit();
   }
@@ -182,13 +186,12 @@ export class Coordinator {
     const receipt = this.receipts.get(id);
     return receipt ? structuredClone(receipt) : this.get(id);
   }
-  /** A parent context contains this exact handoff; keep its task resumable. */
+  /** A parent context contains this exact handoff; its task stays open. */
   markDelivered(id: string, replyId: string): boolean {
     const t = this.tasks.get(id);
     if (
       !t ||
       t.status !== "ready" ||
-      t.outcome !== "reply" ||
       t.run ||
       !t.reply ||
       t.reply.id !== replyId ||
@@ -244,6 +247,7 @@ export class Coordinator {
       pending: [request.prompt],
       inputTokens: 0,
       outputTokens: 0,
+      lost: false,
       elapsed: 0,
     };
     this.tasks.set(id, t);
@@ -258,13 +262,14 @@ export class Coordinator {
       /* observer */
     }
   }
+  /** A failure is an outcome of one closed execution. The task stays open for the parent's decision. */
   private fail(t: Task, error: unknown) {
-    t.data.error = message(error);
+    t.data.error =
+      message(error) + (t.lost ? "; the session cannot continue" : "");
     t.outcome = "error";
-    if (!t.run) {
-      this.status(t, "ready");
-      if (!this.disposed && !t.take) this.ready(t);
-    } else this.emit();
+    t.reply = { id: randomUUID(), delivered: false };
+    this.status(t, "ready");
+    if (!this.disposed && !t.take) this.ready(t);
   }
   private admit() {
     if (!this.runnable) return;
@@ -309,16 +314,13 @@ export class Coordinator {
                 error: message(error),
                 interrupted: false,
                 inputPersisted: false,
+                sessionLost: false,
               });
               finished.resolve();
             };
             try {
               await worker.stop();
-            } catch (stopError) {
-              this.fail(
-                t,
-                `Execution failed: ${message(error)}; stop failed: ${message(stopError)}`,
-              );
+            } catch {
               return;
             }
             run.recover?.();
@@ -382,6 +384,7 @@ export class Coordinator {
     t.run = undefined;
     t.data.response = report.text || t.data.response;
     t.sessionId ??= report.sessionId;
+    t.lost ||= report.sessionLost;
     if (report.usage) {
       // Whole-session snapshots replace displayed totals; only their growth is
       // charged, as soon as it is confirmed rather than on acceptance.
@@ -397,8 +400,8 @@ export class Coordinator {
       t.pending.unshift(run.input);
     t.activity = "";
     if (this.disposed) return;
-    if (t.outcome === "error" || report.error) {
-      this.fail(t, t.data.error ?? report.error ?? "Execution failed");
+    if (report.error) {
+      this.fail(t, report.error);
     } else if (run.intent === "stop") {
       t.outcome = "stopped";
       this.status(t, "ready");
@@ -428,8 +431,11 @@ export class Coordinator {
       run.recover?.();
       await run.done;
     } catch (error) {
-      this.fail(t, `Could not terminate execution: ${message(error)}`);
-      throw error;
+      // The execution keeps its process and slot. Not exiting in time says
+      // nothing about its work, so it is not recorded as the task's outcome.
+      throw new Error(`Could not terminate execution: ${message(error)}`, {
+        cause: error,
+      });
     }
   }
   async message(id: string, text: string): Promise<void> {
@@ -437,13 +443,12 @@ export class Coordinator {
     const t = this.task(id);
     if (this.suspended)
       throw new Error("Send a user prompt before continuing subagents");
-    if (
-      t.take ||
-      t.outcome === "error" ||
-      t.outcome === "stopped" ||
-      t.run?.intent === "stop"
-    )
-      throw new Error("Task cannot accept input");
+    if (t.take || t.outcome === "stopped" || t.run?.intent === "stop")
+      throw new Error("Task is stopping and cannot accept input");
+    if (t.lost)
+      throw new Error(
+        "Task cannot continue: its session is lost. Stop it and start a new task if the work is still needed.",
+      );
     t.pending.push(text);
     if (t.run) {
       await this.end(t, "redirect");
@@ -463,10 +468,16 @@ export class Coordinator {
     }
     await this.end(t, "pause");
   }
-  interrupt(): Promise<void> {
+  /** Implicit: the parent was aborted, which need not mean its children should rest. */
+  interrupt(implicit = false): Promise<void> {
+    const tasks = [...this.tasks.values()];
+    // An explicit pause is a decision. A repeated interrupt keeps the first one's character.
+    if (!implicit) this.unresolved.clear();
+    else if (!this.suspended)
+      for (const t of tasks)
+        if (t.status === "queued" || t.run) this.unresolved.add(t);
     this.suspended = true;
     this.epoch++;
-    const tasks = [...this.tasks.values()];
     for (const t of tasks) if (t.status === "queued") this.status(t, "paused");
     const current = Promise.all(tasks.map((t) => this.pause(t.data.id))).then(
       () => {},
@@ -476,6 +487,14 @@ export class Coordinator {
       current,
     ]).then(() => {});
     return this.interruption;
+  }
+  /** Tasks an implicit interrupt left paused. Each interruption is raised once. */
+  takeInterrupted(): TaskView[] {
+    const tasks = [...this.unresolved].filter(
+      (t) => t.status === "paused" && !t.run && !t.take,
+    );
+    this.unresolved.clear();
+    return tasks.map((t) => this.view(t));
   }
   async continue(id: string): Promise<void> {
     const t = this.task(id);
@@ -535,35 +554,14 @@ export class Coordinator {
     })();
     return taking.promise;
   }
-  /** Real user input sweeps failures without a model cleanup roundtrip. */
-  async prompt(
-    deliver: (failures: TaskResult[]) => void = () => {},
-  ): Promise<boolean> {
+  /** Real user input reopens admission once pauses in flight have settled or given up. */
+  async prompt(): Promise<boolean> {
     const epoch = this.epoch;
-    this.preparing++;
-    try {
-      await this.interruption?.catch(() => {});
-      const failed = new Set<Task>();
-      for (;;) {
-        const next = [...this.tasks.values()].filter(
-          (t) => t.outcome === "error" && !failed.has(t),
-        );
-        if (!next.length) break;
-        for (const t of next) failed.add(t);
-        await Promise.all(next.map((t) => this.end(t, "stop")));
-      }
-      if (this.disposed || epoch !== this.epoch) return false;
-      const pending = [...failed].filter(
-        (t) => this.tasks.has(t.data.id) && !t.take,
-      );
-      deliver(pending.map((t) => this.result(t)));
-      for (const t of pending) this.archive(t);
-      this.suspended = false;
-      return true;
-    } finally {
-      this.preparing--;
-      this.admit();
-    }
+    await this.interruption?.catch(() => {});
+    if (this.disposed || epoch !== this.epoch) return false;
+    this.suspended = false;
+    this.admit();
+    return true;
   }
   wait(
     id: string,
@@ -584,7 +582,12 @@ export class Coordinator {
           return;
         }
         const value = this.inspect(id);
-        if (!("status" in value) || value.status === "ready") {
+        // A paused task makes no progress either: both await a decision.
+        if (
+          !("status" in value) ||
+          value.status === "ready" ||
+          value.status === "paused"
+        ) {
           cleanup();
           resolve(value);
         }
@@ -623,6 +626,7 @@ export class Coordinator {
     await Promise.all([...this.tasks.values()].map((t) => this.end(t, "stop")));
     this.tasks.clear();
     this.receipts.clear();
+    this.unresolved.clear();
     this.usage = undefined;
     this.emit();
   }

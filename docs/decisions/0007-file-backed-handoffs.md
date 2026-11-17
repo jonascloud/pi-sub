@@ -14,7 +14,7 @@ On session switch, fork/clone, reload or orderly shutdown, close owned processes
 
 Native message details retain compact state/execution diagnostics, bounded previews and delivery hashes, not duplicate full reports or unsent instructions. Delivered inline text remains ordinary conversation content. Renderers expose that text or the temporary reference without loading file contents. An expired historical reference does not change the recorded task outcome.
 
-Report storage is not a prerequisite for user input. On a storage error, expose the confirmed task state and retain the complete report only in the active coordinator's task or receipt for retry. Failure cleanup can finish without blocking the next prompt. This fallback is neither rollback nor complete reply delivery; ready-reply notifications still require a complete handoff. Process-closure failures still prevent workspace deletion.
+Report storage is not a prerequisite for user input. On a storage error, expose the confirmed task state and retain the complete report only in the active coordinator's task or receipt for retry. This fallback is neither rollback nor complete reply delivery; reply and failure notifications still require a complete handoff. Process-closure failures still prevent workspace deletion.
 
 ## Rationale and consequences
 

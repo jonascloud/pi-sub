@@ -689,135 +689,72 @@ test("two working directories share the profile ladder without project overrides
 }, 60000);
 
 test.each([false, true])(
-  "user input collects failures without a cleanup call, even with broken report storage (%s)",
-  async (brokenStorage) => {
+  "a failed child wakes the idle parent, and a message retries on its session (file handoff=%s)",
+  async (large) => {
     const { client, dispose } = await host(
-      brokenStorage ? { WORKER_TEST_LARGE_CHILD: "1" } : {},
+      large ? { WORKER_TEST_LARGE_CHILD: "1" } : {},
     );
-    const failed = nextEvent(client, (event) => {
-      const ui = event as unknown as {
-        type: string;
-        method?: string;
-        message?: string;
-      };
-      return (
-        ui.type === "extension_ui_request" &&
-        ui.method === "notify" &&
-        !!ui.message?.includes("fatal synthetic failure")
-      );
-    });
     try {
-      await client.promptAndWait("integration:failure", undefined, 20000);
-      await failed.promise;
-      const before = await client.getMessages();
-      const count = before.filter(
-        (message) => message.role === "toolResult",
-      ).length;
-      expect((await client.getState()).isStreaming).toBe(false);
-      const taskMessage = before.find(
-        (message) =>
-          message.role === "toolResult" && message.toolName === "sub_task",
-      );
-      if (!taskMessage || taskMessage.role !== "toolResult")
-        throw new Error("Missing task");
-      const storage = join(
-        dirname(
-          dirname(
-            (reportDetails(taskMessage.details) as TaskResult).sessionFile,
-          ),
-        ),
-        "reports",
-      );
-      if (brokenStorage) await writeFile(storage, "not a directory");
-      await client.promptAndWait(
-        "integration:failure-cleanup",
-        undefined,
-        20000,
-      );
-      const after = await client.getMessages();
-      expect(
-        after.filter((message) => message.role === "toolResult"),
-      ).toHaveLength(count);
-      const notice = after.find(
-        (message) =>
-          message.role === "custom" && message.customType === "pi-sub:failures",
-      );
-      if (!notice || notice.role !== "custom")
-        throw new Error(
-          "Failure was not transferred into native parent history",
-        );
-      const reports = reportDetails(notice.details) as TaskResult[];
-      expect(reports).toEqual([
-        expect.objectContaining({
-          outcome: "error",
-          error: expect.stringContaining("fatal synthetic failure"),
-          sessionFile: expect.stringMatching(/\.jsonl$/),
-        }),
-      ]);
-      expect(
-        after.some(
-          (message) =>
-            message.role === "user" &&
-            JSON.stringify(message.content).includes(
-              "integration:failure-cleanup",
-            ),
-        ),
-      ).toBe(true);
-      expect(after.at(-1)?.role).toBe("assistant");
-      if (brokenStorage) {
-        expect(JSON.parse(String(notice.content))).toMatchObject({
-          id: reports[0]!.id,
-          archived: true,
-          reportError: expect.any(String),
+      const delivered = (previous?: string) =>
+        eventually(async () => {
+          const messages = await client.getMessages();
+          const index = messages.findLastIndex(
+            (message) =>
+              message.role === "custom" &&
+              message.customType === "pi-sub:response" &&
+              (message.details as { replies: { reply: { id: string } }[] })
+                .replies[0]?.reply.id !== previous,
+          );
+          expect(index).toBeGreaterThanOrEqual(0);
+          // The native parent has made a request containing the notification.
+          expect(
+            messages
+              .slice(index + 1)
+              .some((message) => message.role === "assistant"),
+          ).toBe(true);
+          const message = messages[index]!;
+          if (message.role !== "custom") throw new Error("No notification");
+          const reply = (
+            message.details as {
+              replies: (TaskView & { reply: { id: string } })[];
+            }
+          ).replies[0]!;
+          return { content: String(message.content), reply };
         });
-        expect(JSON.stringify(notice.details)).not.toContain(
-          "END_OF_FAILURE_REPORT",
-        );
-        await rm(storage);
-      }
-      const pending = await client.getSessionStats();
-      expect(pending.cost).toBe(pending.assistantMessages * 10); // failure usage awaits a tool result
-      await client.promptAndWait(
-        "integration:failure-receipt",
-        undefined,
-        20000,
-      );
-      const receipt = await latestResult(client);
-      expect(receipt).toMatchObject({
-        id: reports[0]!.id,
+      await client.promptAndWait("integration:failure", undefined, 20000);
+      // No further user input: the failure itself reaches the parent model.
+      const failure = await delivered();
+      expect(failure.reply).toMatchObject({
+        status: "ready",
         outcome: "error",
-        error: reports[0]!.error,
+        error: expect.stringContaining("fatal synthetic failure"),
       });
-      expect(receipt).not.toHaveProperty("status");
-      if (brokenStorage) {
-        const message = (await client.getMessages()).findLast(
-          (m) => m.role === "toolResult" && m.toolName === "sub_result",
+      if (large)
+        expect(
+          await readFile(JSON.parse(failure.content).file, "utf8"),
+        ).toContain("END_OF_FAILURE_REPORT");
+      else
+        expect(failure.content).toContain(
+          "(Test task) failed\nfatal synthetic failure",
         );
-        if (!message || message.role !== "toolResult")
-          throw new Error("Missing receipt");
-        const file = JSON.parse(
-          message.content.find((part) => part.type === "text")!.text,
-        ).file;
-        expect(await readFile(file, "utf8")).toContain("END_OF_FAILURE_REPORT");
-      }
-      const delivered = await client.getSessionStats();
-      expect(delivered.cost).toBe(delivered.assistantMessages * 10 + 10);
-      await client.promptAndWait(
-        "integration:failure-receipt",
-        undefined,
-        20000,
-      );
-      const repeated = await client.getSessionStats();
-      expect(repeated.cost).toBe(repeated.assistantMessages * 10 + 10);
-      expect(
-        (await client.getMessages()).filter(
-          (message) =>
-            message.role === "custom" &&
-            message.customType === "pi-sub:failures",
-        ),
-      ).toHaveLength(1);
+      await client.promptAndWait("integration:inspect", undefined, 20000);
+      expect(await latestResult(client)).toMatchObject({
+        id: failure.reply.id,
+        status: "ready",
+        outcome: "error",
+        reply: { id: failure.reply.reply.id, delivered: true },
+      });
+
+      await client.promptAndWait("integration:refine-task", undefined, 20000);
+      const retried = await delivered(failure.reply.reply.id);
+      expect(retried.reply).toMatchObject({
+        id: failure.reply.id,
+        sessionFile: failure.reply.sessionFile,
+        status: "ready",
+        outcome: "reply",
+      });
+      expect(retried.reply.error).toBeUndefined();
     } finally {
-      failed.dispose();
       await dispose();
     }
   },
@@ -838,6 +775,87 @@ test("RPC abort during native retry backoff interrupts the children", async () =
     expect(await latestResult(client)).toMatchObject({ status: "paused" });
   } finally {
     retry.dispose();
+    await dispose();
+  }
+}, 60000);
+
+test("a steering message ends the parent's wait at once and leaves the child running", async () => {
+  const { client, marker, dispose } = await host({
+    WORKER_TEST_SLOW_CHILD: "1",
+  });
+  const waiting = nextEvent(
+    client,
+    (event) =>
+      event.type === "tool_execution_start" && event.toolName === "sub_result",
+  );
+  try {
+    await client.prompt("integration:read-via-wait");
+    await waiting.promise;
+    await eventually(() => readFile(marker));
+    // The child answers after ten seconds and the wait would last fifteen.
+    const settled = client.waitForIdle(8000);
+    expect(await client.steer("One more thing.")).toBe("queued");
+    await settled;
+    const messages = await client.getMessages();
+    const index = messages.findLastIndex(
+      (message) =>
+        message.role === "toolResult" && message.toolName === "sub_result",
+    );
+    expect(await latestResult(client)).toMatchObject({ status: "active" });
+    expect(JSON.stringify(messages[index + 1])).toContain("One more thing.");
+    expect(messages.at(-1)?.role).toBe("assistant");
+    // Never interrupted: the reply still arrives on its own.
+    await eventually(async () =>
+      expect(
+        (await client.getMessages()).some(
+          (message) =>
+            message.role === "custom" &&
+            message.customType === "pi-sub:response",
+        ),
+      ).toBe(true),
+    );
+  } finally {
+    waiting.dispose();
+    await dispose();
+  }
+}, 60000);
+
+test("a parent aborted over its children is reminded before it rests, and continues them", async () => {
+  const { client, marker, dispose } = await host({
+    WORKER_TEST_SLOW_CHILD: "1",
+  });
+  const waiting = nextEvent(
+    client,
+    (event) =>
+      event.type === "tool_execution_start" && event.toolName === "sub_result",
+  );
+  try {
+    await client.prompt("integration:read-via-wait");
+    await waiting.promise;
+    await eventually(() => readFile(marker));
+    const aborted = client.waitForIdle(15000);
+    await client.abort();
+    await aborted;
+    // The user asks something unrelated; the parent answers and would stop there.
+    await client.promptAndWait("An unrelated question.", undefined, 20000);
+    const messages = await client.getMessages();
+    const reminders = messages.filter(
+      (message) =>
+        message.role === "custom" && message.customType === "pi-sub:paused",
+    );
+    expect(reminders).toHaveLength(1);
+    const control = messages.findLast(
+      (message) =>
+        message.role === "toolResult" && message.toolName === "sub_control",
+    );
+    if (!control || control.role !== "toolResult")
+      throw new Error("The reminder did not reach the parent model");
+    const [task] = reportDetails(control.details) as TaskView[];
+    expect(JSON.stringify(reminders[0])).toContain(task!.id);
+    expect(task).toMatchObject({ status: "active" });
+    expect(await client.getLastAssistantText()).toBe("continued");
+  } finally {
+    waiting.dispose();
     await dispose();
   }
 }, 60000);

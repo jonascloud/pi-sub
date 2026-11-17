@@ -59,6 +59,37 @@ test("replies carry identity and new information, not repeated operating instruc
   expect(long.content.length).toBeLessThan(1000);
 });
 
+test("a failure is handed off like an answer: named, complete and acknowledged by its identity", () => {
+  const failed: TaskView = {
+    ...task,
+    outcome: "error",
+    error: "Native process exited 1",
+    response: "Read three files.",
+    reply: { id: "failure-1", delivered: false },
+  };
+  const batch = replyBatch([
+    failed,
+    { ...failed, id: "task-2", response: "" },
+  ])!;
+  expect(batch.content).toBe(
+    "Subagent task-1 (Review changes) failed\nNative process exited 1\n\nLast response:\nRead three files.\n\n" +
+      "Subagent task-2 (Review changes) failed\nNative process exited 1",
+  );
+  expect(batch.details.replies[0]).toMatchObject({
+    outcome: "error",
+    preview: "Native process exited 1",
+  });
+  const identities = [
+    { id: "task-1", replyId: "failure-1" },
+    { id: "task-2", replyId: "failure-1" },
+  ];
+  expect(deliveredReplies({ ...batch, role: "custom", timestamp: 0 })).toEqual(
+    identities,
+  );
+  // Reading the failure through a tool is the same complete delivery.
+  expect(deliveredReplies(toolResult(failed))).toEqual([identities[0]]);
+});
+
 test("only complete native reply notifications acknowledge their exact reply", () => {
   const ready = { ...task, reply: { id: "reply-1", delivered: false } };
   const message = {
@@ -349,7 +380,12 @@ test("live replies are selected oldest-first without a second queue or mutations
   ];
   const before = structuredClone(tasks);
   const batch = pendingReplyBatch(tasks, session())!;
-  expect(batch.details.replies.map(({ id }) => id)).toEqual(["a", "b"]);
+  // A failure awaits the parent's decision like an answer; a stop does not.
+  expect(batch.details.replies.map(({ id }) => id)).toEqual([
+    "failed",
+    "a",
+    "b",
+  ]);
   expect(tasks).toEqual(before);
   expect(pendingReplyBatch([], session())).toBeUndefined();
 });

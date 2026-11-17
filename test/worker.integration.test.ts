@@ -150,10 +150,13 @@ test("native continuation refuses a deleted journal and keeps prior task usage",
     );
     expect(await coordinator.wait(id, undefined, 15000)).toMatchObject({
       outcome: "error",
-      error: "Native session file is missing",
+      error: "Native session file is missing; the session cannot continue",
       tokens: 16,
       pendingInput: ["Continue without losing the original instruction."],
     });
+    await expect(coordinator.message(id, "Again.")).rejects.toThrow(
+      "session is lost",
+    );
     await expect(readFile(first.sessionFile)).rejects.toMatchObject({
       code: "ENOENT",
     });
@@ -163,6 +166,49 @@ test("native continuation refuses a deleted journal and keeps prior task usage",
     await coordinator.dispose();
   }
 }, 20000);
+
+test("a crashed native child continues on its session once its failure is answered", async () => {
+  const { options, dir } = await setup();
+  const readies: string[] = [];
+  const coordinator = new Coordinator({
+    onReady: (task) => readies.push(task.outcome!),
+  });
+  try {
+    const id = coordinator.start({
+      prompt: "Keep this original instruction.",
+      description: "transient crash",
+      level: 1,
+      worker: {
+        ...options,
+        sessionDir: join(dir, "sessions"),
+        env: { ...options.env, WORKER_TEST_CRASH_ONCE: join(dir, "crashed") },
+      },
+    });
+    const failed = await coordinator.wait(id, undefined, 15000);
+    expect(failed).toMatchObject({
+      status: "ready",
+      outcome: "error",
+      error: expect.stringMatching(/^Native process exited 42/),
+      reply: { delivered: false },
+    });
+    expect(failed.error).not.toContain("cannot continue");
+    expect(failed.pendingInput).toBeUndefined(); // The journal holds it.
+
+    await coordinator.message(id, "Continue.");
+    expect(await coordinator.wait(id, undefined, 15000)).toMatchObject({
+      outcome: "reply",
+      response: "fake response",
+      sessionFile: failed.sessionFile,
+      tokens: 16,
+    });
+    const journal = await readFile(failed.sessionFile, "utf8");
+    for (const input of ["Keep this original instruction.", "Continue."])
+      expect(journal.split(JSON.stringify(input))).toHaveLength(2);
+    expect(readies).toEqual(["error", "reply"]);
+  } finally {
+    await coordinator.dispose();
+  }
+}, 30000);
 
 test("the native child refuses history lost between parent preflight and CLI startup", async () => {
   const { make, dir } = await setup();

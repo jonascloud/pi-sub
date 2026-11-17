@@ -26,9 +26,11 @@ const fake = vi.hoisted(() => ({
   runnable: true,
   idle: true,
   tasks: [] as TaskView[],
-  prompt:
-    vi.fn<(deliver: (failures: TaskResult[]) => void) => Promise<boolean>>(),
-  interrupt: vi.fn<() => Promise<void>>(),
+  pendingMessages: false,
+  prompt: vi.fn<() => Promise<boolean>>(),
+  interrupt: vi.fn<(implicit?: boolean) => Promise<void>>(),
+  takeInterrupted: vi.fn<() => TaskView[]>(),
+  wait: vi.fn<(id: string, signal: AbortSignal) => Promise<TaskView>>(),
   onReady: undefined as ((task: TaskView) => void) | undefined,
   start: vi.fn(),
   stop: vi.fn(),
@@ -48,6 +50,9 @@ vi.mock("../src/coordinator.ts", () => ({
     }
     prompt = fake.prompt;
     interrupt = fake.interrupt;
+    takeInterrupted = fake.takeInterrupted;
+    wait = fake.wait;
+    inspect = () => ({ ...failure, status: "active", outcome: undefined });
     start = fake.start;
     stop = fake.stop;
     markDelivered = fake.markDelivered;
@@ -87,7 +92,20 @@ beforeEach(() => {
   fake.interrupted = false;
   fake.runnable = true;
   fake.idle = true;
+  fake.pendingMessages = false;
   fake.tasks = [];
+  fake.takeInterrupted.mockReset().mockReturnValue([]);
+  // Like the coordinator: pending until its task settles or the signal aborts.
+  fake.wait
+    .mockReset()
+    .mockImplementation(
+      (_id, signal) =>
+        new Promise((_resolve, reject) =>
+          signal.addEventListener("abort", () =>
+            reject(new DOMException("Wait aborted", "AbortError")),
+          ),
+        ),
+    );
   fake.start.mockReset().mockReturnValue("new-task");
   fake.stop.mockReset();
   fake.markDelivered.mockReset().mockImplementation((id, replyId) => {
@@ -132,6 +150,7 @@ function setup(mode = "rpc") {
     hasUI: true,
     abort,
     isIdle: () => fake.idle,
+    hasPendingMessages: () => fake.pendingMessages,
     sessionManager: {
       getBranch: () =>
         messages.flatMap((message, index) =>
@@ -222,7 +241,7 @@ test("every subagent tool and transcript message has a native renderer", () => {
   }
   expect(
     registerMessageRenderer.mock.calls.map(([name]) => name).sort(),
-  ).toEqual(["pi-sub:failures", "pi-sub:response", "pi-sub:stopped"]);
+  ).toEqual(["pi-sub:paused", "pi-sub:response", "pi-sub:stopped"]);
 });
 
 test("operator stop preserves machine-readable content and supplies presentation metadata", async () => {
@@ -313,53 +332,14 @@ test("operator stop reports confirmed outcomes even when report publication fail
 });
 
 test.each(["interactive", "rpc"])(
-  "%s input delegates cleanup and forwards its report without a model turn",
+  "%s input reopens admission and sends nothing of its own",
   async (source) => {
     const { emit, sendMessage } = setup();
-    fake.prompt.mockImplementation(async (deliver) => {
-      deliver([failure]);
-      return true;
-    });
     expect(await emit("input", { source, text: "continue" })).toBeUndefined();
     expect(fake.prompt).toHaveBeenCalledOnce();
-    expect(sendMessage).toHaveBeenCalledExactlyOnceWith(
-      expect.objectContaining({
-        customType: "pi-sub:failures",
-        details: { report: [taskMetadata(failure)] },
-        content: JSON.stringify([taskReport(failure)]),
-      }),
-      { triggerTurn: false },
-    );
+    expect(sendMessage).not.toHaveBeenCalled();
   },
 );
-
-test("report-storage errors preserve failed work in history without blocking user input", async () => {
-  const { emit, sendMessage } = setup();
-  const report = {
-    ...failure,
-    response: "Partial work\n".repeat(6000),
-    pendingInput: ["Unsent correction"],
-  };
-  fake.prompt.mockImplementation(async (deliver) => {
-    deliver([report]);
-    return true;
-  });
-  vi.spyOn(Workspace.prototype, "saveReport").mockImplementation(() => {
-    throw new Error("ENOSPC");
-  });
-  expect(
-    await emit("input", { source: "rpc", text: "fix report storage" }),
-  ).toBeUndefined();
-  const message = sendMessage.mock.calls[0]![0];
-  expect(JSON.parse(message.content)).toMatchObject({
-    id: report.id,
-    archived: true,
-    outcome: "error",
-    reportError: expect.any(String),
-  });
-  expect(JSON.parse(message.content)).not.toHaveProperty("file");
-  expect(reportDetails(message.details)).toEqual([taskMetadata(report)]);
-});
 
 test("task admission reads current configuration and respects prior cancellation", async () => {
   const { ctx, tools } = setup();
@@ -386,7 +366,7 @@ test("task admission reads current configuration and respects prior cancellation
   expect(fake.start).toHaveBeenCalledOnce();
 });
 
-test("extension input neither sweeps failures nor reopens admission", async () => {
+test("extension input does not reopen admission", async () => {
   const { emit, sendMessage } = setup();
   fake.interrupted = true;
   await emit("input", { source: "extension", text: "notification" });
@@ -412,7 +392,7 @@ test("settled abort interrupts without a live signal (retry backoff)", () => {
   emit("agent_settled", { aborted: false });
   expect(fake.interrupt).not.toHaveBeenCalled();
   emit("agent_settled", { aborted: true });
-  expect(fake.interrupt).toHaveBeenCalledOnce();
+  expect(fake.interrupt).toHaveBeenCalledExactlyOnceWith(true); // Pausing is a side effect.
 });
 
 test("signal abort and settlement do not duplicate the interruption fallback", () => {
@@ -544,36 +524,46 @@ test.each(["interactive", "rpc"])(
   },
 );
 
-test("failed input cleanup reports the failure and does not forward the prompt", async () => {
-  const { emit, notify } = setup();
-  fake.prompt.mockRejectedValue(new Error("Could not close worker"));
-  expect(await emit("input", { source: "rpc", text: "accept" })).toEqual({
-    action: "handled",
-  });
-  expect(notify).toHaveBeenCalledWith(
-    expect.stringContaining("Could not close worker"),
-    "error",
-  );
-});
-
 test("global /sub:pause interrupts headless work and aborts the parent", async () => {
   const { commands, ctx, abort } = setup();
   await commands.get("sub:pause")!.handler("", ctx);
-  expect(fake.interrupt).toHaveBeenCalled();
+  expect(fake.interrupt).toHaveBeenCalledExactlyOnceWith(false); // An explicit decision.
   expect(abort).toHaveBeenCalledOnce();
   expect(fake.prompt).not.toHaveBeenCalled();
 });
 
-test("terminal errors notify the human, never trigger the parent LLM", () => {
-  const { emit, notify, sendMessage } = setup();
+test("a failure wakes an idle parent like a reply, only while runnable", async () => {
+  const { emit, notify, sendMessage, ready } = setup();
   emit("agent_start"); // Lazily constructs the actual factory's coordinator callbacks.
+  const failed: TaskView = {
+    ...failure,
+    response: "Read three files.",
+    status: "ready",
+    activity: "",
+    reply: { id: "failure-reply", delivered: false },
+  };
   fake.runnable = false;
-  fake.onReady!({ ...failure, status: "ready", level: 1, activity: "" });
-  expect(notify).toHaveBeenCalledExactlyOnceWith(
-    expect.stringContaining("worker exited"),
-    "error",
-  );
+  ready(failed);
+  await flushReplies();
   expect(sendMessage).not.toHaveBeenCalled();
+  fake.runnable = true;
+  ready(failed);
+  await flushReplies();
+  expect(sendMessage).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining({
+      customType: "pi-sub:response",
+      content:
+        "Subagent failed (test task) failed\nworker exited\n\nLast response:\nRead three files.",
+    }),
+    { triggerTurn: true },
+  );
+  expect(notify).not.toHaveBeenCalled();
+  const delivered = { ...sendMessage.mock.calls[0]![0], role: "custom" };
+  emit("context", { messages: [delivered] });
+  expect(fake.markDelivered).toHaveBeenCalledExactlyOnceWith(
+    "failed",
+    "failure-reply",
+  );
 });
 
 const flushReplies = () =>
@@ -882,3 +872,140 @@ test("shutdown cancels a scheduled idle flush", async () => {
   await flushReplies();
   expect(sendMessage).not.toHaveBeenCalled();
 });
+
+test("children an interrupted parent never chose to pause are raised once at settlement", () => {
+  const { emit } = setup();
+  emit("agent_start");
+  fake.idle = false;
+  const paused: TaskView = {
+    ...failure,
+    id: "paused-task",
+    description: "Review\nauth",
+    outcome: undefined,
+    error: undefined,
+    status: "paused",
+    activity: "",
+  };
+  fake.takeInterrupted.mockReturnValueOnce([paused]);
+  expect(emit("turn_end")).toBeUndefined(); // The parent may still continue them itself.
+  expect(emit("agent_before_settle", { outcome: "aborted" })).toBeUndefined();
+  fake.runnable = false;
+  expect(emit("agent_before_settle")).toBeUndefined();
+  expect(fake.takeInterrupted).not.toHaveBeenCalled();
+  fake.runnable = true;
+  expect(emit("agent_before_settle")).toEqual({
+    entries: [
+      {
+        type: "custom_message",
+        customType: "pi-sub:paused",
+        display: true,
+        content:
+          "Still paused since the interruption: paused-task (Review auth). Continue or stop them unless they should stay paused.",
+        details: { report: [taskMetadata(paused)] },
+      },
+    ],
+    continue: true,
+  });
+  expect(emit("agent_before_settle")).toBeUndefined();
+});
+
+test("a steering message ends waits and keeps the parent from blocking until it arrives", async () => {
+  const { emit, tools, ctx } = setup();
+  emit("agent_start");
+  fake.idle = false;
+  const wait = (signal?: AbortSignal) =>
+    tools
+      .get("sub_result")!
+      .execute("call", { id: "failed", wait: true }, signal, () => {}, ctx);
+  const active = { id: "failed", status: "active" };
+
+  let yielded = false;
+  const followed = wait().then((result) => {
+    yielded = true;
+    return result;
+  });
+  await emit("input", {
+    source: "interactive",
+    text: "afterwards",
+    streamingBehavior: "followUp",
+  });
+  await flushReplies();
+  expect(yielded).toBe(false); // A follow-up asks to be read after the work.
+  const first = wait();
+  await emit("input", {
+    source: "interactive",
+    text: "one more thing",
+    streamingBehavior: "steer",
+  });
+  fake.pendingMessages = true; // Pi queues it once the handlers have returned.
+  for (const result of await Promise.all([followed, first])) {
+    expect(result.isError).toBeUndefined();
+    expect(JSON.parse(result.content[0].text)).toMatchObject(active);
+  }
+  expect(fake.wait).toHaveBeenCalledTimes(2);
+  // A sequential sibling wait starts before the message is delivered. Its
+  // acceptance has nothing to accept yet.
+  const sibling = await tools
+    .get("sub_result")!
+    .execute(
+      "call",
+      { id: "failed", wait: true, finish: true },
+      undefined,
+      () => {},
+      ctx,
+    );
+  expect(sibling.isError).toBeUndefined();
+  expect(JSON.parse(sibling.content[0].text)).toMatchObject(active);
+  expect(fake.wait).toHaveBeenCalledTimes(2);
+
+  emit("message_start", { message: { role: "assistant" } });
+  expect(JSON.parse((await wait()).content[0].text)).toMatchObject(active);
+  // Delivered. The follow-up still queued behind it holds nothing back.
+  emit("message_start", { message: { role: "user" } });
+  const aborted = new AbortController();
+  const blocking = wait(aborted.signal);
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  expect(fake.wait).toHaveBeenCalledTimes(3);
+  aborted.abort(); // Escape remains an interruption, not a yield.
+  expect(await blocking).toMatchObject({
+    isError: true,
+    content: [{ text: "Wait aborted" }],
+  });
+});
+
+test.each([false, true])(
+  "a steering message another input handler delays ends a later wait once queued, and never if withdrawn (queued=%s)",
+  async (queued) => {
+    const { emit, tools, ctx } = setup();
+    emit("agent_start");
+    await emit("input", {
+      source: "rpc",
+      text: "one more thing",
+      streamingBehavior: "steer",
+    });
+    await flushReplies();
+    const aborted = new AbortController();
+    let settled = false;
+    const waiting = tools
+      .get("sub_result")!
+      .execute(
+        "call",
+        { id: "failed", wait: true },
+        aborted.signal,
+        () => {},
+        ctx,
+      )
+      .then((result: { isError?: boolean }) => {
+        settled = true;
+        return result;
+      });
+    await flushReplies();
+    expect(fake.wait).toHaveBeenCalledOnce();
+    expect(settled).toBe(false);
+    fake.pendingMessages = queued;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    expect(settled).toBe(queued);
+    aborted.abort();
+    expect((await waiting).isError).toBe(queued ? undefined : true);
+  },
+);
