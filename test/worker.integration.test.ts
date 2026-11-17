@@ -2,7 +2,7 @@ import { afterEach, expect, test, vi } from "vitest";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { assistantTokens } from "./fixtures/journal.ts";
 import { Coordinator } from "../src/coordinator.ts";
 import {
   createWorker,
@@ -55,7 +55,7 @@ function nextEvent(worker: Worker, type: string) {
 }
 
 test("native CLI: continuation retains conversation and loads global/project instructions once", async () => {
-  const { make, dir, options } = await setup();
+  const { make, dir, options, session } = await setup();
   // Public context hook observes what the native CLI actually restores, rather
   // than inferring continuity just from the presence of a session file.
   const observer = join(dir, "observe.ts");
@@ -86,13 +86,10 @@ test("native CLI: continuation retains conversation and loads global/project ins
     interrupted: false,
     saved: true,
     sessionLost: false,
-    usage: {
-      input: 10,
-      reasoning: 2,
-      cacheWrite1h: 1,
-      cost: { total: 10, totalFromProvider: true },
-    },
   });
+  const firstUsage = await assistantTokens(session);
+  expect(firstUsage).toBeGreaterThan(0);
+  expect(report.usage?.totalTokens).toBe(firstUsage);
   expect(report.error).toBeUndefined();
   expect(events).toContain("message_update");
   const initialPrompt = JSON.parse(await readFile(promptLog, "utf8")) as string;
@@ -107,13 +104,10 @@ test("native CLI: continuation retains conversation and loads global/project ins
   expect(continued).toMatchObject({
     text: "fake response",
     inputPersisted: true,
-    usage: {
-      input: 20,
-      reasoning: 4,
-      cacheWrite1h: 2,
-      cost: { total: 20, totalFromProvider: true },
-    },
   });
+  const continuedUsage = await assistantTokens(session);
+  expect(continuedUsage).toBeGreaterThan(firstUsage);
+  expect(continued.usage?.totalTokens).toBe(continuedUsage);
   expect(continued.error).toBeUndefined();
   const continuedPrompt = JSON.parse(
     await readFile(promptLog, "utf8"),
@@ -141,7 +135,9 @@ test("native continuation refuses a deleted journal and keeps prior task usage",
       worker: { ...options, sessionDir: join(dir, "sessions") },
     });
     const first = await coordinator.wait(id, undefined, 15000);
-    expect(first.tokens).toBe(16);
+    const usage = await assistantTokens(first.sessionFile);
+    expect(usage).toBeGreaterThan(0);
+    expect(first.tokens).toBe(usage);
     await rm(first.sessionFile);
     await coordinator.message(
       id,
@@ -150,7 +146,7 @@ test("native continuation refuses a deleted journal and keeps prior task usage",
     expect(await coordinator.wait(id, undefined, 15000)).toMatchObject({
       status: "failed",
       error: "Native session file is missing; the session cannot continue",
-      tokens: 16,
+      tokens: usage,
       unsent: 1,
     });
     await expect(coordinator.message(id, "Again.")).rejects.toThrow(
@@ -160,7 +156,8 @@ test("native continuation refuses a deleted journal and keeps prior task usage",
       code: "ENOENT",
     });
     expect(coordinator.accept(id).status).toBe("accepted");
-    expect(coordinator.drainUsage()?.totalTokens).toBe(16);
+    expect(coordinator.drainUsage()?.totalTokens).toBe(usage);
+    expect(coordinator.drainUsage()).toBeUndefined();
   } finally {
     await coordinator.dispose();
   }
@@ -189,14 +186,20 @@ test("a crashed native child continues on its session once its failure is answer
       delivered: false,
     });
     expect(failed.error).not.toContain("cannot continue");
+    const before = await assistantTokens(failed.sessionFile);
+    expect(coordinator.drainUsage()?.totalTokens ?? 0).toBe(before);
 
     await coordinator.message(id, "Continue.");
-    expect(await coordinator.wait(id, undefined, 15000)).toMatchObject({
+    const resumed = await coordinator.wait(id, undefined, 15000);
+    expect(resumed).toMatchObject({
       status: "ready",
       response: "fake response",
       sessionFile: failed.sessionFile,
-      tokens: 16,
     });
+    expect(resumed.tokens).toBe(await assistantTokens(failed.sessionFile));
+    expect(resumed.tokens).toBeGreaterThan(before);
+    expect(coordinator.drainUsage()?.totalTokens).toBe(resumed.tokens - before);
+    expect(coordinator.drainUsage()).toBeUndefined();
     const journal = await readFile(failed.sessionFile, "utf8");
     for (const input of ["Keep this original instruction.", "Continue."])
       expect(journal.split(JSON.stringify(input))).toHaveLength(2);
@@ -207,7 +210,7 @@ test("a crashed native child continues on its session once its failure is answer
 }, 30000);
 
 test("native JSON can exit zero on provider error; report still fails", async () => {
-  const { make } = await setup({ WORKER_TEST_INTEGRATION: "1" });
+  const { make } = await setup();
   expect(await make().run("integration:child-error")).toMatchObject({
     error: "fatal synthetic failure",
     inputPersisted: true,
@@ -284,7 +287,6 @@ test("native tool permission denial prevents the protected side effect", async (
   await writeFile(
     extension,
     `
-import { createAssistantMessageEventStream } from ${JSON.stringify(fileURLToPath(import.meta.resolve("@earendil-works/pi-ai/utils/event-stream")))};
 import { writeFileSync } from 'node:fs';
 import { Type } from 'typebox';
 export default pi => {
@@ -296,32 +298,17 @@ export default pi => {
       return {content:[{type:'text',text:approved?'approved':'denied'}],details:{approved}};
     }
   });
-  pi.registerProvider('permission-test',{
-    baseUrl:'http://localhost',apiKey:'test',api:'permission-test-api',
-    models:[{id:'fake',name:'Fake permission test',reasoning:false,input:['text'],cost:{input:0,output:0,cacheRead:0,cacheWrite:0},contextWindow:100000,maxTokens:1000}],
-    streamSimple(model,context) {
-      const stream=createAssistantMessageEventStream();
-      const done=context.messages.some(message=>message.role==='toolResult');
-      const message={role:'assistant',api:model.api,provider:model.provider,model:model.id,timestamp:Date.now(),
-        content:done?[{type:'text',text:'Permission denied'}]:[{type:'toolCall',id:'protected-call',name:'protected_action',arguments:{}}],
-        stopReason:done?'stop':'toolUse',
-        usage:{input:1,output:1,cacheRead:0,cacheWrite:0,totalTokens:2,cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0}}};
-      queueMicrotask(()=>{stream.push({type:'done',reason:message.stopReason,message});stream.end();});
-      return stream;
-    }
-  });
 };
 `,
   );
   const worker = make({
-    provider: "permission-test",
     args: [...options.args!, "-e", extension],
   });
   const events: string[] = [];
   worker.onEvent((event) => {
     if (event.type === "tool_execution_start") events.push(event.toolName);
   });
-  const report = await worker.run("Try the protected action.");
+  const report = await worker.run("integration:permission");
   expect(report.error).toBeUndefined();
   expect(report.text).toBe("Permission denied");
   expect(events).toContain("protected_action");
@@ -343,8 +330,9 @@ test("dialog-only input without a new assistant response is an error", async () 
 }, 15000);
 
 test("native crash after restoration cannot return the old answer", async () => {
-  const { make, options } = await setup();
+  const { make, options, session } = await setup();
   expect((await make().run("first")).text).toBe("fake response");
+  const before = await assistantTokens(session);
   const report = await make({
     env: { ...options.env, WORKER_TEST_CRASH_AFTER_RESPONSE: "1" },
   }).run("second");
@@ -352,7 +340,7 @@ test("native crash after restoration cannot return the old answer", async () => 
     text: "",
     interrupted: false,
     inputPersisted: true,
-    usage: { input: 10, cost: { total: 10 } },
   });
   expect(report.error).toMatch(/42/);
+  expect(report.usage?.totalTokens).toBe(before);
 }, 20000);

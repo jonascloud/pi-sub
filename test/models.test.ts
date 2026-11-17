@@ -1,32 +1,16 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  mkdtemp,
-  mkdir,
-  readFile,
-  readdir,
-  rm,
-  writeFile,
-} from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { describe, expect, it } from "vitest";
 import type { Model } from "@earendil-works/pi-ai";
+import { MODEL_THINKING_LEVELS } from "@earendil-works/pi-ai/providers/model-schema";
 import {
   type AvailableModel,
   type Ladder,
   availableExecutions,
   availableModels,
-  ladderPath,
   loadLadder,
   selectExecution,
 } from "../src/models.ts";
 
-let dir: string;
-const config = {
-  "2": "p/cheap:off",
-  "6": "p/main:low",
-  "8": "p/main:high",
-  "10": "p/top:max",
-};
+const configured = (ladder: unknown) => loadLadder({ piSub: { ladder } });
 const ladder: Ladder = [
   { provider: "p", model: "cheap", thinking: "off", power: 2 },
   { provider: "p", model: "main", thinking: "low", power: 6 },
@@ -39,27 +23,14 @@ const available: AvailableModel[] = [
   { provider: "p", model: "top", thinking: ["max"] },
   { provider: "p", model: "outside", thinking: ["off"] },
 ];
-beforeEach(async () => {
-  dir = await mkdtemp(join(tmpdir(), "ladder-"));
-  vi.stubEnv("PI_CODING_AGENT_DIR", join(dir, "profile"));
-});
-afterEach(async () => {
-  vi.unstubAllEnvs();
-  await rm(dir, { recursive: true, force: true });
-});
-
 describe("model ladder", () => {
-  it("validates every rung and parses references at the file boundary", async () => {
-    const path = ladderPath();
-    await mkdir(dirname(path));
-    await writeFile(
-      path,
-      JSON.stringify({
+  it("validates every effective rung and parses exact references", () => {
+    expect(
+      configured({
         "10": "openrouter/vendor/model:free:high",
         "1": "p/m:off",
       }),
-    );
-    expect(loadLadder(path)).toEqual([
+    ).toEqual([
       { provider: "p", model: "m", thinking: "off", power: 1 },
       {
         provider: "openrouter",
@@ -68,17 +39,8 @@ describe("model ladder", () => {
         power: 10,
       },
     ]);
-    for (const thinking of [
-      "off",
-      "minimal",
-      "low",
-      "medium",
-      "high",
-      "xhigh",
-      "max",
-    ]) {
-      await writeFile(path, JSON.stringify({ "1": `p/m:${thinking}` }));
-      expect(loadLadder(path)[0].thinking).toBe(thinking);
+    for (const thinking of MODEL_THINKING_LEVELS) {
+      expect(configured({ "1": `p/m:${thinking}` })[0].thinking).toBe(thinking);
     }
     for (const key of [
       "0",
@@ -93,8 +55,9 @@ describe("model ladder", () => {
       "1.5",
       "version",
     ]) {
-      await writeFile(path, JSON.stringify({ [key]: "p/m:low" }));
-      expect(() => loadLadder(path), key).toThrow(/Invalid ladder rung/);
+      expect(() => configured({ [key]: "p/m:low" }), key).toThrow(
+        /Invalid ladder rung/,
+      );
     }
     for (const entry of [
       null,
@@ -114,12 +77,26 @@ describe("model ladder", () => {
       "p\t/m:low",
       "p/m:\u00a0low",
     ]) {
-      await writeFile(path, JSON.stringify({ "1": "p/m:off", "10": entry }));
-      expect(() => loadLadder(path), String(entry)).toThrow(/Invalid model/);
+      expect(
+        () => configured({ "1": "p/m:off", "10": entry }),
+        String(entry),
+      ).toThrow(/Invalid model/);
     }
-    for (const value of [null, [], "{}", 1]) {
-      await writeFile(path, JSON.stringify(value));
-      expect(() => loadLadder(path)).toThrow(/Expected ladder object/);
+    for (const value of [false, null, [], "{}", 1]) {
+      expect(() => configured(value)).toThrow(
+        /Expected piSub\.ladder to be an object/,
+      );
+      expect(() => loadLadder({ piSub: value })).toThrow(
+        /Expected piSub to be an object/,
+      );
+    }
+  });
+
+  it("reports missing or empty effective configuration with setup guidance", () => {
+    for (const settings of [{}, { piSub: {} }, { piSub: { ladder: {} } }]) {
+      expect(() => loadLadder(settings)).toThrow(
+        /No model ladder configured.*piSub\.ladder.*create-model-ladder\.md/,
+      );
     }
   });
 
@@ -181,59 +158,6 @@ describe("model ladder", () => {
           );
       }
     }
-  });
-
-  it("uses the configured profile and reports a missing ladder without creating files", async () => {
-    const path = ladderPath();
-    expect(path).toBe(join(dir, "profile", "pi-sub-config.json"));
-    expect(() => loadLadder(path)).toThrow(path);
-    expect(() => loadLadder(path)).toThrow(
-      /instructions\/create-model-ladder\.md/,
-    );
-    expect(await readdir(dir)).toEqual([]);
-  });
-
-  it("reads external edits on every load without changing configuration or profile files", async () => {
-    const path = ladderPath();
-    await mkdir(dirname(path));
-    const ignore = join(dirname(path), ".gitignore");
-    await writeFile(ignore, "# operator rules\nsettings.json\n");
-    for (const [value, expected] of [
-      [config, ladder],
-      [
-        { "7": "p/main:high" },
-        [{ provider: "p", model: "main", thinking: "high", power: 7 }],
-      ],
-      [{}, []],
-    ] as const) {
-      const source = JSON.stringify(value);
-      await writeFile(path, source);
-      expect(loadLadder(path)).toEqual(expected);
-      expect(await readFile(path, "utf8")).toBe(source);
-    }
-    expect(await readFile(ignore, "utf8")).toBe(
-      "# operator rules\nsettings.json\n",
-    );
-    expect((await readdir(dirname(path))).sort()).toEqual([
-      ".gitignore",
-      "pi-sub-config.json",
-    ]);
-    await rm(path);
-    expect(() => loadLadder(path)).toThrow(/missing/);
-  });
-
-  it("reports malformed sources without repairing them or hiding the cause", async () => {
-    const path = ladderPath();
-    await mkdir(dirname(path));
-    for (const source of ["{", '{"6":"p/m:auto"}', "null", "[]"]) {
-      await writeFile(path, source);
-      expect(() => loadLadder(path)).toThrow(/Invalid model ladder/);
-      expect(() => loadLadder(path)).toThrow(path);
-      expect(await readFile(path, "utf8")).toBe(source);
-    }
-    await writeFile(path, '{"11":"p/m:off"}');
-    expect(() => loadLadder(path)).toThrow(/Invalid ladder rung: 11/);
-    expect(() => loadLadder(dirname(path))).toThrow();
   });
 });
 

@@ -1,4 +1,5 @@
 import { expect, test } from "vitest";
+import { assistantTokens } from "./fixtures/journal.ts";
 import {
   access,
   mkdtemp,
@@ -32,15 +33,21 @@ async function eventually<T>(
   } while (Date.now() < deadline);
   throw last;
 }
-async function host(env: Record<string, string> = {}, profile?: string) {
+async function host(
+  env: Record<string, string> = {},
+  options: { ladder?: unknown; project?: unknown } = {},
+) {
   const cwd = await mkdtemp(join(tmpdir(), "pi-sub-extension-"));
-  const agentDir = profile ?? join(cwd, "agent");
+  const agentDir = join(cwd, "agent");
   await mkdir(agentDir, { recursive: true });
   await writeFile(
     join(agentDir, "settings.json"),
     JSON.stringify({
       extensions: [resolve("test/fixtures/provider.js"), resolve("index.ts")],
       enabledModels: ["worker-test/fake"],
+      ...(Object.hasOwn(options, "ladder")
+        ? { piSub: { ladder: options.ladder } }
+        : { piSub: { ladder: { "6": "worker-test/fake:off" } } }),
       retry: {
         enabled: true,
         maxRetries: 2,
@@ -49,11 +56,13 @@ async function host(env: Record<string, string> = {}, profile?: string) {
       },
     }),
   );
-  if (!profile)
+  if (options.project !== undefined) {
+    await mkdir(join(cwd, ".pi"), { recursive: true });
     await writeFile(
-      join(agentDir, "pi-sub-config.json"),
-      JSON.stringify({ "6": "worker-test/fake:off" }),
+      join(cwd, ".pi/settings.json"),
+      JSON.stringify(options.project),
     );
+  }
   const marker = join(cwd, "child-started");
   const client = new RpcClient({
     cliPath: join(getPackageDir(), "dist/cli.js"),
@@ -64,7 +73,6 @@ async function host(env: Record<string, string> = {}, profile?: string) {
     env: {
       PI_CODING_AGENT_DIR: agentDir,
       PI_SUB_CHILD: "",
-      WORKER_TEST_INTEGRATION: "1",
       WORKER_TEST_CHILD_MARKER: marker,
       ...env,
     },
@@ -272,7 +280,9 @@ test("a large child failure is bounded and remains readable by report reference"
       );
       expect(message).toBeDefined();
     });
-    await client.waitForIdle(15000);
+    await eventually(async () =>
+      expect((await client.getState()).isStreaming).toBe(false),
+    );
     await client.promptAndWait("integration:inspect", undefined, 20000);
     const failed = await latestResult(client);
     expect(failed).toMatchObject({
@@ -332,18 +342,21 @@ test("delegates from a file-authored ladder and reports original child usage onc
   try {
     await client.promptAndWait("integration:delegate", undefined, 20000);
     const messages = await client.getMessages();
-    expect(
-      messages.some(
-        (message) =>
-          message.role === "toolResult" &&
-          message.toolName === "sub_task" &&
-          !message.isError,
-      ),
-    ).toBe(true);
     expect(await latestResult(client)).toMatchObject({ status: "accepted" });
     const stats = await client.getSessionStats();
-    expect(stats.cost).toBe(stats.assistantMessages * 10 + 10); // delegated task
-    expect(stats.tokens.input).toBe(stats.assistantMessages * 10 + 10);
+    const task = messages.findLast(
+      (message) =>
+        message.role === "toolResult" && message.toolName === "sub_task",
+    );
+    if (!task || task.role !== "toolResult") throw new Error("Missing task");
+    const childTokens = await assistantTokens(details(task).sessionFile);
+    const parentTokens = messages.reduce(
+      (sum, message) =>
+        sum + (message.role === "assistant" ? message.usage.totalTokens : 0),
+      0,
+    );
+    expect(childTokens).toBeGreaterThan(0);
+    expect(stats.tokens.total).toBe(parentTokens + childTokens);
     const exported = await client.exportHtml(join(cwd, "views.html"));
     const html = await readFile(exported.path, "utf8");
     const embedded =
@@ -381,47 +394,78 @@ test("delegates from a file-authored ladder and reports original child usage onc
   }
 }, 60000);
 
-test("the configured ladder delegates outside the main session's model scope", async () => {
-  const { client, agentDir, dispose } = await host({
-    WORKER_TEST_TWO_MODELS: "1",
-  });
+test("trusted project settings merge ladder rungs and delegate outside model scope", async () => {
+  const { client, agentDir, cwd, dispose } = await host(
+    { WORKER_TEST_TWO_MODELS: "1" },
+    {
+      ladder: { "4": "worker-test/fake:off", "6": "worker-test/fake:off" },
+      project: {
+        piSub: {
+          ladder: { "4": "worker-test/other:off", "7": "worker-test/fake:off" },
+        },
+      },
+    },
+  );
   try {
-    await writeFile(
-      join(agentDir, "pi-sub-config.json"),
-      JSON.stringify({ "6": "worker-test/other:off" }),
-    );
+    const global = join(agentDir, "settings.json");
+    const local = join(cwd, ".pi/settings.json");
+    const before = await Promise.all([
+      readFile(global, "utf8"),
+      readFile(local, "utf8"),
+    ]);
     expect((await client.getState()).model?.id).toBe("fake");
-    expect(
-      JSON.parse(await readFile(join(agentDir, "settings.json"), "utf8"))
-        .enabledModels,
-    ).toEqual(["worker-test/fake"]);
     await client.promptAndWait("integration:delegate", undefined, 20000);
-    expect(await latestResult(client)).toMatchObject({
-      status: "accepted",
-    });
+    expect(await latestResult(client)).toMatchObject({ status: "accepted" });
     const created = (await client.getMessages()).findLast(
-      (message) =>
-        message.role === "toolResult" && message.toolName === "sub_task",
+      (m) => m.role === "toolResult" && m.toolName === "sub_task",
     );
-    if (!created || created.role !== "toolResult")
-      throw new Error("Missing task");
+    if (!created || created.role !== "toolResult") throw Error("Missing task");
     expect(details(created).execution).toBe("worker-test/other:off");
+    for (const level of [5, 7]) {
+      await client.promptAndWait(
+        `integration:level:${level}`,
+        undefined,
+        20000,
+      );
+      const task = (await client.getMessages()).findLast(
+        (m) => m.role === "toolResult" && m.toolName === "sub_task",
+      );
+      if (!task || task.role !== "toolResult") throw Error("Missing task");
+      expect(task.isError).toBe(false);
+      expect(details(task).execution).toBe("worker-test/fake:off");
+    }
+    expect(
+      await Promise.all([readFile(global, "utf8"), readFile(local, "utf8")]),
+    ).toEqual(before);
   } finally {
     await dispose();
   }
 }, 30000);
 
-test("ladder edits affect new tasks, not continuations", async () => {
+test("an empty project ladder inherits the global ladder", async () => {
+  const { client, dispose } = await host(
+    {},
+    { project: { piSub: { ladder: {} } } },
+  );
+  try {
+    await client.promptAndWait("integration:delegate", undefined, 20000);
+    expect(await latestResult(client)).toMatchObject({ status: "accepted" });
+  } finally {
+    await dispose();
+  }
+}, 30000);
+
+test("task routing remains frozen despite manual settings edits", async () => {
   const { client, agentDir, dispose } = await host({
     WORKER_TEST_TWO_MODELS: "1",
   });
   try {
     await client.promptAndWait("integration:read-via-wait", undefined, 20000);
     const first = await latestResult(client);
-    await writeFile(
-      join(agentDir, "pi-sub-config.json"),
-      JSON.stringify({ "6": "worker-test/other:off" }),
-    );
+    const path = join(agentDir, "settings.json");
+    const settings = JSON.parse(await readFile(path, "utf8"));
+    settings.piSub.ladder = { "6": "worker-test/other:off" };
+    await writeFile(path, JSON.stringify(settings));
     await client.promptAndWait("integration:refine-task", undefined, 20000);
     await client.promptAndWait("integration:accept", undefined, 20000);
     const continued = (await client.getMessages()).findLast(
@@ -433,84 +477,36 @@ test("ladder edits affect new tasks, not continuations", async () => {
       id: first.id,
       execution: "worker-test/fake:off",
     });
-    await client.promptAndWait("integration:delegate", undefined, 20000);
-    const created = (await client.getMessages()).findLast(
-      (m) => m.role === "toolResult" && m.toolName === "sub_task",
-    );
-    if (!created || created.role !== "toolResult") throw Error("Missing task");
-    expect(details(created)).toMatchObject({
-      execution: "worker-test/other:off",
-    });
   } finally {
     await dispose();
   }
 }, 40000);
 
-test("normal conversation never creates or repairs a ladder and confirmation words reach the parent", async () => {
-  const { client, agentDir, dispose } = await host();
-  try {
-    const path = join(agentDir, "pi-sub-config.json");
-    await rm(path);
-    await client.promptAndWait("accept", undefined, 20000);
-    await expect(readFile(path)).rejects.toMatchObject({ code: "ENOENT" });
-    await writeFile(path, "{broken");
-    await client.promptAndWait("cancel", undefined, 20000);
-    expect(await readFile(path, "utf8")).toBe("{broken");
-    expect((await client.getSessionStats()).assistantMessages).toBe(2);
-    await client.promptAndWait("integration:probe-global", undefined, 20000);
-    const result = (await client.getMessages()).findLast(
-      (message) =>
-        message.role === "toolResult" && message.toolName === "sub_task",
-    );
-    expect(result).toMatchObject({ isError: true });
-    expect(JSON.stringify(result)).toContain("Invalid model ladder");
-    expect(JSON.stringify(result)).toContain(
-      "instructions/create-model-ladder.md",
-    );
-    expect(await readFile(path, "utf8")).toBe("{broken");
-    await writeFile(path, JSON.stringify({ "7": "worker-test/fake:off" }));
-    await client.promptAndWait("integration:delegate", undefined, 20000);
-    expect(await latestResult(client)).toMatchObject({ status: "accepted" });
-    expect(await readFile(path, "utf8")).toBe('{"7":"worker-test/fake:off"}');
-  } finally {
-    await dispose();
-  }
-}, 30000);
-
-test("two working directories share the profile ladder without project overrides", async () => {
-  const first = await host();
-  let second: Awaited<ReturnType<typeof host>> | undefined;
-  try {
-    second = await host({}, first.agentDir);
-    const local = join(second.cwd, ".pi/pi-sub-config.json");
-    await mkdir(join(second.cwd, ".pi"), { recursive: true });
-    await writeFile(local, "not a ladder");
-    await second.client.promptAndWait("integration:delegate", undefined, 20000);
-    expect(await latestResult(second.client)).toMatchObject({
-      status: "accepted",
-    });
-    await expect(access(join(second.cwd, ".pi/pi-sub"))).rejects.toThrow();
-    const global = join(first.agentDir, "pi-sub-config.json");
-    await writeFile(local, await readFile(global));
-    await rm(global);
-    await second.client.promptAndWait(
-      "integration:probe-global",
-      undefined,
-      20000,
-    );
-    const result = (await second.client.getMessages()).findLast(
-      (message) =>
-        message.role === "toolResult" && message.toolName === "sub_task",
-    );
-    expect(result).toMatchObject({ isError: true });
-    expect(JSON.stringify(result)).toContain(
-      "instructions/create-model-ladder.md",
-    );
-  } finally {
-    await second?.dispose();
-    await first.dispose();
-  }
-}, 60000);
+test.each([
+  ["missing", undefined, "No model ladder configured"],
+  ["empty", {}, "No model ladder configured"],
+  ["false", false, "Invalid model ladder"],
+])(
+  "%s effective ladder is rejected without changing settings",
+  async (_label, ladder, diagnostic) => {
+    const { client, agentDir, dispose } = await host({}, { ladder });
+    try {
+      const path = join(agentDir, "settings.json");
+      const before = await readFile(path, "utf8");
+      await client.promptAndWait("accept", undefined, 20000);
+      await client.promptAndWait("integration:probe-global", undefined, 20000);
+      const result = (await client.getMessages()).findLast(
+        (m) => m.role === "toolResult" && m.toolName === "sub_task",
+      );
+      expect(result).toMatchObject({ isError: true });
+      expect(JSON.stringify(result)).toContain(diagnostic);
+      expect(await readFile(path, "utf8")).toBe(before);
+    } finally {
+      await dispose();
+    }
+  },
+  30000,
+);
 
 test("an RPC abort stops the parent only: its child finishes and the reply waits for the user", async () => {
   const { client, marker, dispose } = await host({

@@ -1,11 +1,6 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
-import {
-  getAgentDir,
-  type ExtensionContext,
-} from "@earendil-works/pi-coding-agent";
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { fileURLToPath } from "node:url";
 
 export type { ThinkingLevel };
@@ -25,7 +20,8 @@ export interface Execution {
   power: number;
 }
 
-const thinkingLevels = new Set<string>([
+// Pi's extension loader does not expose pi-ai/providers/model-schema.
+const thinkingLevels = [
   "off",
   "minimal",
   "low",
@@ -33,10 +29,7 @@ const thinkingLevels = new Set<string>([
   "high",
   "xhigh",
   "max",
-]);
-
-export const ladderPath = (): string =>
-  join(getAgentDir(), "pi-sub-config.json");
+] as const;
 
 const setupGuide = fileURLToPath(
   new URL("../instructions/create-model-ladder.md", import.meta.url),
@@ -57,36 +50,35 @@ export function availableModels(
 function parseReference(
   text: string,
 ): Pick<Execution, "provider" | "model" | "thinking"> {
-  if (typeof text !== "string" || /\s/u.test(text))
+  if (/\s/u.test(text))
     throw new Error(
       "Invalid model reference: expected provider/model:thinking without whitespace",
     );
   const slash = text.indexOf("/");
   const colon = text.lastIndexOf(":");
-  if (
-    slash <= 0 ||
-    colon <= slash + 1 ||
-    !thinkingLevels.has(text.slice(colon + 1))
-  )
+  const thinking = thinkingLevels.find(
+    (level) => level === text.slice(colon + 1),
+  );
+  if (slash <= 0 || colon <= slash + 1 || !thinking)
     throw new Error(
       "Invalid model reference: expected provider/model:thinking with explicit native thinking",
     );
   return {
     provider: text.slice(0, slash),
     model: text.slice(slash + 1, colon),
-    thinking: text.slice(colon + 1) as ThinkingLevel,
+    thinking,
   };
 }
 
-function object(value: unknown): Record<string, unknown> {
+function object(value: unknown, key: string): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value))
-    throw new Error("Expected ladder object");
+    throw new Error(`Expected ${key} to be an object`);
   return value as Record<string, unknown>;
 }
 
 function validateLadder(value: unknown): Ladder {
   const result: Execution[] = [];
-  for (const [rung, raw] of Object.entries(object(value))) {
+  for (const [rung, raw] of Object.entries(object(value, "piSub.ladder"))) {
     if (!/^(?:[1-9]|10)$/.test(rung))
       throw new Error(`Invalid ladder rung: ${rung}`);
     if (typeof raw !== "string")
@@ -96,26 +88,25 @@ function validateLadder(value: unknown): Ladder {
   return result.sort((a, b) => a.power - b.power);
 }
 
-/** Runtime configuration is read-only; changes apply to the next new task. */
-export function loadLadder(path: string): Ladder {
-  let source: string;
+/** Pi owns settings scope, trust, merging and reload. */
+export function loadLadder(settings: object): Ladder {
   try {
-    source = readFileSync(path, "utf8");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT")
-      throw new Error(`Model ladder missing at ${path}. ${setupHelp}`, {
-        cause: error,
-      });
-    throw error;
-  }
-  try {
-    return validateLadder(JSON.parse(source));
+    if ("piSub" in settings) {
+      const { ladder } = object(settings.piSub, "piSub");
+      if (ladder !== undefined) {
+        const entries = validateLadder(ladder);
+        if (entries.length) return entries;
+      }
+    }
   } catch (error) {
     throw new Error(
-      `Invalid model ladder at ${path}: ${error instanceof Error ? error.message : String(error)}. ${setupHelp}`,
+      `Invalid model ladder in settings.json: ${error instanceof Error ? error.message : String(error)}. ${setupHelp}`,
       { cause: error },
     );
   }
+  throw new Error(
+    `No model ladder configured (piSub.ladder in settings.json). ${setupHelp}`,
+  );
 }
 
 /** Filter the validated ladder without changing its strength order. */
@@ -145,6 +136,6 @@ export function selectExecution(
   );
   if (execution) return execution;
   throw new Error(
-    `No available ladder execution for level ${level}; check ${ladderPath()} and native model availability. ${setupHelp}`,
+    `No available ladder execution for level ${level}; check piSub.ladder in settings.json and native model availability. ${setupHelp}`,
   );
 }

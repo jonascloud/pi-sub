@@ -1,151 +1,177 @@
-import { createAssistantMessageEventStream } from "@earendil-works/pi-ai/utils/event-stream";
+import {
+  contentText,
+  createFauxCore,
+  fauxAssistantMessage,
+  fauxToolCall,
+} from "@earendil-works/pi-ai";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 
-function reply(context) {
-  const messages = context.messages;
-  const index = messages.findLastIndex((message) => message.role === "user");
-  const user = messages[index];
-  const text =
-    typeof user?.content === "string"
-      ? user.content
-      : (user?.content ?? [])
-          .filter((part) => part.type === "text")
-          .map((part) => part.text)
-          .join("");
-  if (
-    process.env.WORKER_TEST_INTEGRATION &&
-    process.env.PI_SUB_CHILD === "1" &&
-    text === "integration:child-error"
-  )
-    return {
-      error:
+const child = process.env.PI_SUB_CHILD === "1";
+const large = child && process.env.WORKER_TEST_LARGE_CHILD;
+const call = (...tools) =>
+  fauxAssistantMessage(tools, { stopReason: "toolUse" });
+const task = (
+  level = 3,
+  prompt = "Return a test response.",
+  description = "Test task",
+) => fauxToolCall("sub_task", { level, prompt, description });
+
+function reply({ messages }) {
+  const user = messages.findLastIndex((m) => m.role === "user");
+  const prompt = contentText(messages[user]?.content ?? "", "");
+  const last = messages
+    .slice(user + 1)
+    .findLast((m) => m.role === "toolResult");
+  const taskId = () =>
+    JSON.parse(
+      contentText(
+        messages.findLast(
+          (m) => m.role === "toolResult" && m.toolName === "sub_task",
+        ).content,
+      ),
+    ).id;
+
+  if (child) {
+    if (prompt === "integration:child-error")
+      throw new Error(
         "fatal synthetic failure" +
-        (process.env.WORKER_TEST_LARGE_CHILD
-          ? "\n" +
-            "Failure evidence 漢字\n".repeat(4000) +
-            "END_OF_FAILURE_REPORT"
-          : ""),
-    };
-  if (process.env.WORKER_TEST_INTEGRATION && process.env.PI_SUB_CHILD !== "1") {
-    const results = messages
-      .slice(index + 1)
-      .filter((message) => message.role === "toolResult");
-    if (text.startsWith("integration:report:") && !results.length) {
-      const [, , report, offset] = text.split(":");
-      return {
-        name: "sub_result",
-        args: { report, offset: Number(offset), limit: 4096 },
-      };
-    }
-    if (text === "integration:batch" && !results.length)
-      return {
-        calls: [
-          ...["First review", "Second review"].map((description) => ({
-            name: "sub_task",
-            args: {
-              level: 3,
-              prompt: "Return a test response.",
-              description,
-            },
-          })),
-          {
-            name: "bash",
-            args: {
+          (large
+            ? "\n" +
+              "Failure evidence 漢字\n".repeat(4000) +
+              "END_OF_FAILURE_REPORT"
+            : ""),
+      );
+    if (prompt === "integration:permission")
+      return last
+        ? fauxAssistantMessage("Permission denied")
+        : call(fauxToolCall("protected_action", {}));
+    if (large)
+      return fauxAssistantMessage(
+        "Large report\n" +
+          "Evidence line 漢字\n".repeat(4000) +
+          "END_OF_LARGE_REPORT",
+      );
+  } else if (prompt.startsWith("integration:")) {
+    const [, scenario, arg, offset] = prompt.split(":");
+    if (!last) {
+      switch (scenario) {
+        case "batch":
+          return call(
+            task(3, undefined, "First review"),
+            task(3, undefined, "Second review"),
+            fauxToolCall("bash", {
               command: "while [ ! -f parent-release ]; do sleep 0.05; done",
               timeout: 20,
-            },
-          },
-        ],
-      };
-    if (
-      [
-        "integration:delegate",
-        "integration:read-via-wait",
-        "integration:notify",
-        "integration:probe-global",
-        "integration:pause",
-        "integration:failure",
-        "integration:retry",
-      ].includes(text) &&
-      !results.length
-    )
-      return {
-        name: "sub_task",
-        args: {
-          level: 3,
-          prompt:
-            text === "integration:failure"
-              ? "integration:child-error"
-              : "Return a test response.",
-          description: "Test task",
-        },
-      };
-    if (
-      [
-        "integration:inspect",
-        "integration:continue",
-        "integration:refine-task",
-        "integration:accept",
-      ].includes(text) &&
-      !results.length
-    ) {
-      const previous = messages.findLast(
-        (message) =>
-          message.role === "toolResult" && message.toolName === "sub_task",
-      );
-      const task = JSON.parse(
-        previous.content.find((part) => part.type === "text").text,
-      );
-      return text === "integration:continue"
-        ? { name: "sub_control", args: { id: task.id, action: "continue" } }
-        : text === "integration:refine-task"
-          ? {
-              name: "sub_message",
-              args: { id: task.id, message: "Check the production schema." },
-            }
-          : {
-              name: "sub_result",
-              args: {
-                id: task.id,
-                ...(text === "integration:accept"
-                  ? { wait: true, timeout: 15, finish: true }
-                  : {}),
-              },
-            };
+            }),
+          );
+        case "report":
+          return call(
+            fauxToolCall("sub_result", {
+              report: arg,
+              offset: Number(offset),
+              limit: 4096,
+            }),
+          );
+        case "inspect":
+          return call(fauxToolCall("sub_result", { id: taskId() }));
+        case "continue":
+          return call(
+            fauxToolCall("sub_control", { id: taskId(), action: "continue" }),
+          );
+        case "refine-task":
+          return call(
+            fauxToolCall("sub_message", {
+              id: taskId(),
+              message: "Check the production schema.",
+            }),
+          );
+        case "accept":
+          return call(
+            fauxToolCall("sub_result", {
+              id: taskId(),
+              wait: true,
+              timeout: 15,
+              finish: true,
+            }),
+          );
+        case "level":
+          return call(task(Number(arg)));
+        case "failure":
+          return call(task(3, "integration:child-error"));
+        case "delegate":
+        case "read-via-wait":
+        case "notify":
+        case "probe-global":
+        case "pause":
+        case "retry":
+          return call(task());
+        default:
+          throw new Error(`Unknown test scenario: ${scenario}`);
+      }
     }
-    if (text === "integration:retry" && results.at(-1)?.toolName === "sub_task")
-      return { error: "429 rate limit test" };
-    if (
-      ["integration:delegate", "integration:read-via-wait"].includes(text) &&
-      results.at(-1)?.toolName === "sub_task"
-    ) {
-      const task = JSON.parse(
-        results.at(-1).content.find((part) => part.type === "text").text,
-      );
-      return {
-        name: "sub_result",
-        args: {
-          id: task.id,
-          wait: true,
-          timeout: 15,
-          finish: text === "integration:delegate",
-        },
-      };
+    if (last.toolName === "sub_task") {
+      if (scenario === "retry") throw new Error("429 rate limit test");
+      if (scenario === "delegate" || scenario === "read-via-wait")
+        return call(
+          fauxToolCall("sub_result", {
+            id: taskId(),
+            wait: true,
+            timeout: 15,
+            finish: scenario === "delegate",
+          }),
+        );
     }
   }
-  return {
-    text:
-      process.env.PI_SUB_CHILD === "1" && process.env.WORKER_TEST_LARGE_CHILD
-        ? "Large report\n" +
-          "Evidence line 漢字\n".repeat(4000) +
-          "END_OF_LARGE_REPORT"
-        : "fake response",
-  };
+  return fauxAssistantMessage("fake response");
+}
+
+async function respond(context, { signal } = {}) {
+  if (child && process.env.WORKER_TEST_SLOW_CHILD) {
+    if (process.env.WORKER_TEST_CHILD_MARKER)
+      writeFileSync(process.env.WORKER_TEST_CHILD_MARKER, "running");
+    try {
+      await delay(10000, undefined, { signal });
+    } catch (error) {
+      if (!signal?.aborted) throw error;
+      return fauxAssistantMessage(""); // Faux emits the native abort event.
+    }
+  }
+  const crashed = process.env.WORKER_TEST_CRASH_ONCE;
+  if (crashed && !existsSync(crashed)) {
+    writeFileSync(crashed, "crashed");
+    process.exit(42);
+  }
+  if (
+    process.env.WORKER_TEST_CRASH_AFTER_RESPONSE &&
+    context.messages.some((m) => m.role === "assistant")
+  )
+    process.exit(42);
+  return reply(context);
 }
 
 export default function (pi) {
-  if (process.env.PI_SUB_CHILD === "1" && process.env.WORKER_TEST_CHILD_PIDS)
+  const faux = createFauxCore({
+    provider: "worker-test",
+    models: (process.env.WORKER_TEST_TWO_MODELS
+      ? ["fake", "other"]
+      : ["fake"]
+    ).map((id) => ({ id, reasoning: true })),
+    // Test large handoffs, not thousands of tiny streaming deltas.
+    tokenSize: { min: 16384, max: 16384 },
+  });
+  pi.registerProvider("worker-test", {
+    baseUrl: faux.models[0].baseUrl,
+    apiKey: "test",
+    api: faux.api,
+    models: faux.models,
+    streamSimple(model, context, options) {
+      faux.appendResponses([respond]);
+      return faux.streamSimple(model, context, options);
+    },
+  });
+  if (child && process.env.WORKER_TEST_CHILD_PIDS)
     pi.on("session_start", (_event, ctx) => {
       const directory = join(ctx.cwd, "child-pids");
       mkdirSync(directory, { recursive: true });
@@ -154,153 +180,8 @@ export default function (pi) {
         String(process.pid),
       );
     });
-  const definition = {
-    baseUrl: "http://localhost",
-    apiKey: "test",
-    api: "worker-test-api",
-    models: [
-      "fake",
-      ...(process.env.WORKER_TEST_TWO_MODELS ? ["other"] : []),
-    ].map((id) => ({
-      id,
-      name: "Fake",
-      reasoning: true,
-      input: ["text"],
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      contextWindow: 100000,
-      maxTokens: 10000,
-    })),
-    streamSimple(model, context, options) {
-      const stream = createAssistantMessageEventStream();
-      const message = {
-        role: "assistant",
-        content: [],
-        api: model.api,
-        provider: model.provider,
-        model: model.id,
-        usage: {
-          input: 10,
-          output: 3,
-          cacheRead: 2,
-          cacheWrite: 1,
-          cacheWrite1h: 1,
-          reasoning: 2,
-          totalTokens: 16,
-          cost: {
-            input: 1,
-            output: 2,
-            cacheRead: 3,
-            cacheWrite: 4,
-            total: 10,
-            totalFromProvider: true,
-          },
-        },
-        stopReason: "stop",
-        timestamp: Date.now(),
-      };
-      stream.push({ type: "start", partial: message });
-      const slow =
-        process.env.WORKER_TEST_SLOW_CHILD && process.env.PI_SUB_CHILD === "1";
-      if (slow && process.env.WORKER_TEST_CHILD_MARKER)
-        writeFileSync(process.env.WORKER_TEST_CHILD_MARKER, "running");
-      let finished = false;
-      const finish = () => {
-        if (finished) return;
-        finished = true;
-        options?.signal?.removeEventListener("abort", aborted);
-        if (
-          process.env.WORKER_TEST_CRASH_AFTER_RESPONSE &&
-          context.messages.some((message) => message.role === "assistant")
-        )
-          process.exit(42);
-        const crashed = process.env.WORKER_TEST_CRASH_ONCE;
-        if (crashed && !existsSync(crashed)) {
-          writeFileSync(crashed, "crashed");
-          process.exit(42);
-        }
-        if (options?.signal?.aborted) {
-          message.stopReason = "aborted";
-          message.errorMessage = "aborted";
-          stream.push({ type: "error", reason: "aborted", error: message });
-        } else {
-          const output = reply(context);
-          if (output.error) {
-            message.stopReason = "error";
-            message.errorMessage = output.error;
-            stream.push({ type: "error", reason: "error", error: message });
-            stream.end();
-            return;
-          }
-          if (output.name || output.calls) {
-            message.stopReason = "toolUse";
-            for (const call of output.calls ?? [output]) {
-              const contentIndex = message.content.length;
-              const toolCall = {
-                type: "toolCall",
-                id: `call-${Date.now()}-${contentIndex}`,
-                name: call.name,
-                arguments: call.args,
-              };
-              message.content.push(toolCall);
-              stream.push({
-                type: "toolcall_start",
-                contentIndex,
-                partial: message,
-              });
-              stream.push({
-                type: "toolcall_delta",
-                contentIndex,
-                delta: JSON.stringify(call.args),
-                partial: message,
-              });
-              stream.push({
-                type: "toolcall_end",
-                contentIndex,
-                toolCall,
-                partial: message,
-              });
-            }
-          } else {
-            message.content.push({ type: "text", text: output.text });
-            stream.push({
-              type: "text_start",
-              contentIndex: 0,
-              partial: message,
-            });
-            stream.push({
-              type: "text_delta",
-              contentIndex: 0,
-              delta: output.text,
-              partial: message,
-            });
-            stream.push({
-              type: "text_end",
-              contentIndex: 0,
-              content: output.text,
-              partial: message,
-            });
-          }
-          stream.push({ type: "done", reason: message.stopReason, message });
-        }
-        stream.end();
-      };
-      const timer = setTimeout(finish, slow ? 10000 : 300);
-      const aborted = () => {
-        clearTimeout(timer);
-        finish();
-      };
-      if (slow) {
-        options?.signal?.addEventListener("abort", aborted, { once: true });
-        if (options?.signal?.aborted) aborted();
-      }
-      return stream;
-    },
-  };
-  pi.registerProvider("worker-test", definition);
   pi.registerCommand("dialog", {
     description: "test",
-    handler: async (_args, ctx) => {
-      await ctx.ui.confirm("test", "test");
-    },
+    handler: (_args, ctx) => ctx.ui.confirm("test", "test"),
   });
 }
