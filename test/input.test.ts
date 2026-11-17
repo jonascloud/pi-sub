@@ -919,13 +919,18 @@ test("a steering message ends waits and keeps the parent from blocking until it 
       .execute("call", { id: "failed", wait: true }, signal, () => {}, ctx);
   const active = { id: "failed", status: "active" };
 
-  const followed = wait();
+  let yielded = false;
+  const followed = wait().then((result) => {
+    yielded = true;
+    return result;
+  });
   await emit("input", {
     source: "interactive",
     text: "afterwards",
     streamingBehavior: "followUp",
   });
   await flushReplies();
+  expect(yielded).toBe(false); // A follow-up asks to be read after the work.
   const first = wait();
   await emit("input", {
     source: "interactive",
@@ -955,11 +960,11 @@ test("a steering message ends waits and keeps the parent from blocking until it 
 
   emit("message_start", { message: { role: "assistant" } });
   expect(JSON.parse((await wait()).content[0].text)).toMatchObject(active);
-  fake.pendingMessages = false;
+  // Delivered. The follow-up still queued behind it holds nothing back.
   emit("message_start", { message: { role: "user" } });
   const aborted = new AbortController();
   const blocking = wait(aborted.signal);
-  await flushReplies();
+  await new Promise((resolve) => setTimeout(resolve, 250));
   expect(fake.wait).toHaveBeenCalledTimes(3);
   aborted.abort(); // Escape remains an interruption, not a yield.
   expect(await blocking).toMatchObject({
@@ -968,27 +973,39 @@ test("a steering message ends waits and keeps the parent from blocking until it 
   });
 });
 
-test("a steering message withdrawn from the queue leaves later waits blocking", async () => {
-  const { emit, tools, ctx } = setup();
-  emit("agent_start");
-  await emit("input", {
-    source: "rpc",
-    text: "never mind",
-    streamingBehavior: "steer",
-  });
-  await flushReplies();
-  const aborted = new AbortController();
-  const blocking = tools
-    .get("sub_result")!
-    .execute(
-      "call",
-      { id: "failed", wait: true },
-      aborted.signal,
-      () => {},
-      ctx,
-    );
-  await flushReplies();
-  expect(fake.wait).toHaveBeenCalledOnce();
-  aborted.abort();
-  await blocking;
-});
+test.each([false, true])(
+  "a steering message another input handler delays ends a later wait once queued, and never if withdrawn (queued=%s)",
+  async (queued) => {
+    const { emit, tools, ctx } = setup();
+    emit("agent_start");
+    await emit("input", {
+      source: "rpc",
+      text: "one more thing",
+      streamingBehavior: "steer",
+    });
+    await flushReplies();
+    const aborted = new AbortController();
+    let settled = false;
+    const waiting = tools
+      .get("sub_result")!
+      .execute(
+        "call",
+        { id: "failed", wait: true },
+        aborted.signal,
+        () => {},
+        ctx,
+      )
+      .then((result: { isError?: boolean }) => {
+        settled = true;
+        return result;
+      });
+    await flushReplies();
+    expect(fake.wait).toHaveBeenCalledOnce();
+    expect(settled).toBe(false);
+    fake.pendingMessages = queued;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    expect(settled).toBe(queued);
+    aborted.abort();
+    expect((await waiting).isError).toBe(queued ? undefined : true);
+  },
+);

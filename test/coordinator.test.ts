@@ -655,9 +655,12 @@ describe("children an interrupted parent never chose to pause", () => {
     await c.prompt();
     await c.continue(ids[0]!);
     await c.stop(ids[1]!);
+    // Pausing a task it had continued is the parent's own decision.
+    const pausing = c.pause(ids[0]!);
+    workers[3]!.close({ interrupted: true });
+    await pausing;
+    expect(c.get(ids[0]!).status).toBe("paused");
     expect(c.takeInterrupted().map((task) => task.id)).toEqual([ids[2]]);
-    workers[3]!.close();
-    await tick();
     await c.dispose();
   });
 

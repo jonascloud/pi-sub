@@ -53,6 +53,19 @@ export default function piSub(pi: ExtensionAPI): void {
   // observing a child must not hold them back.
   let steers = 0;
   const waits = new Set<AbortController>();
+  let steerWatch: ReturnType<typeof setInterval> | undefined;
+  // Pi queues a steering message once every input handler has returned and
+  // announces that to no extension: look while one is expected and a wait is open.
+  const yieldToSteering = () => {
+    if (steers && context?.hasPendingMessages())
+      for (const wait of waits) wait.abort();
+    const expected = steers > 0 && waits.size > 0;
+    if (expected && !steerWatch) steerWatch = setInterval(yieldToSteering, 100);
+    if (!expected && steerWatch) {
+      clearInterval(steerWatch);
+      steerWatch = undefined;
+    }
+  };
 
   const replyBatchFor = (ctx: ExtensionContext, messages?: AgentMessage[]) =>
     lifetime.signal.aborted || !coordinator?.runnable
@@ -160,6 +173,7 @@ export default function piSub(pi: ExtensionAPI): void {
     if (steers && ctx.hasPendingMessages()) return manager().inspect(id);
     const yielded = new AbortController();
     waits.add(yielded);
+    yieldToSteering();
     try {
       return await manager().wait(
         id,
@@ -204,10 +218,7 @@ export default function piSub(pi: ExtensionAPI): void {
     if (!(await preparePrompt())) return { action: "handled" };
     if (event.streamingBehavior !== "steer") return;
     steers++;
-    // Pi queues the message once every input handler has returned.
-    setImmediate(() => {
-      for (const wait of waits) wait.abort();
-    });
+    setImmediate(yieldToSteering);
   });
   pi.on("message_start", (event) => {
     if (event.message.role === "user" && steers) steers--;
@@ -306,6 +317,7 @@ export default function piSub(pi: ExtensionAPI): void {
   pi.on("session_shutdown", async () => {
     lifetime.abort();
     if (idleDelivery) clearImmediate(idleDelivery);
+    clearInterval(steerWatch);
     unmount?.();
     await coordinator?.dispose();
     workspace.dispose();

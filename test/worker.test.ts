@@ -310,6 +310,27 @@ process.exit(0);
   expect(Date.now() - start).toBeLessThan(3000);
 }, 10000);
 
+test("a stop arriving while an exited execution drains does not turn its reply into an interruption", async () => {
+  const { worker } = await setup(`
+append(entry('u',user)); append(entry('a',assistant));
+emit({type:'agent_settled',aborted:false});
+require('node:child_process').spawn(process.execPath,['-e',"setTimeout(()=>{},6000)"],{stdio:['ignore','inherit','inherit'],detached:true}).unref();
+process.exit(0);
+`);
+  const settled = nextEvent(worker, "agent_settled");
+  const running = worker.run("hello");
+  await settled;
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  await worker.stop();
+  const report = await running;
+  expect(report).toMatchObject({
+    text: "new response",
+    interrupted: false,
+    inputPersisted: true,
+  });
+  expect(report).not.toHaveProperty("error");
+}, 10000);
+
 test("stop is bounded by exit, not by a descendant holding the pipes", async () => {
   const { worker } = await setup(`
 require('node:child_process').spawn(process.execPath,['-e',"setTimeout(()=>{},6000)"],{stdio:['ignore','inherit','inherit'],detached:true}).unref();

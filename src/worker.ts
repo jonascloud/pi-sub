@@ -64,6 +64,7 @@ export function createWorker(
   let execution: Promise<WorkerReport> | undefined;
   let child: ChildProcessWithoutNullStreams | undefined;
   let stopRequested = false;
+  let exited = false;
   let processClosed = false;
   let terminate: (() => Promise<void>) | undefined;
   let stopping: Promise<void> | undefined;
@@ -260,6 +261,7 @@ export function createWorker(
         // only, so a descendant holding an inherited pipe gets a bounded wait.
         let drain: ReturnType<typeof setTimeout> | undefined;
         child!.once("exit", () => {
+          exited = true;
           drain = setTimeout(() => {
             undrained = true;
             child!.stdout.destroy();
@@ -394,7 +396,9 @@ export function createWorker(
     },
     async stop() {
       if (!processClosed) {
-        stopRequested = true; // Must precede signal delivery, even during startup.
+        // Must precede signal delivery, even during startup. A process that
+        // already exited on its own finished its execution: only draining remains.
+        if (!exited) stopRequested = true;
         await terminate?.();
       }
       await execution;
