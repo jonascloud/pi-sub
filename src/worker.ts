@@ -1,5 +1,5 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { Usage } from "@earendil-works/pi-ai";
+import { contentText, type Usage } from "@earendil-works/pi-ai";
 import {
   getPackageDir,
   parseSessionEntries,
@@ -92,11 +92,7 @@ export function createWorker(
           );
       }
       return {
-        text:
-          reply?.content
-            .filter((part) => part.type === "text")
-            .map((part) => part.text)
-            .join("\n") ?? "",
+        text: contentText(reply?.content ?? []),
         usage: entries && sessionUsage(entries),
         ...(error ? { error } : {}),
         interrupted: stopRequested,

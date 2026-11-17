@@ -14,7 +14,6 @@ import { Coordinator, isSettled, type TaskView } from "./src/coordinator.ts";
 import {
   availableExecutions,
   availableModels,
-  ladderPath,
   loadLadder,
   selectExecution,
   STRENGTH_GUIDANCE,
@@ -161,7 +160,7 @@ export default function piSub(pi: ExtensionAPI): void {
     let availability: string;
     try {
       const max = availableExecutions(
-        loadLadder(ladderPath()),
+        loadLadder(pi.getSettings()),
         availableModels(ctx),
       ).at(-1)?.power;
       availability = `Available ladder levels (snapshot): ${max ? (max === 1 ? "1" : `1–${max}`) : "none"}.`;
@@ -295,7 +294,7 @@ export default function piSub(pi: ExtensionAPI): void {
           if (!ctx.isProjectTrusted())
             throw new Error("Trust this project before starting subagents.");
           const execution = selectExecution(
-            loadLadder(ladderPath()),
+            loadLadder(pi.getSettings()),
             args.level,
             availableModels(ctx),
           );

@@ -16,21 +16,25 @@ Use `/reload` after installation or source changes.
 
 ## Model ladder
 
-The only configuration is `<agent-dir>/pi-sub-config.json`, normally `~/.pi/agent/pi-sub-config.json` (`PI_CODING_AGENT_DIR` selects another profile). It maps strengths 1–10 to exact `provider/model:thinking` references. This is a format example, not a default:
+Configure `piSub.ladder` in native Pi settings. Profile defaults live in `<agent-dir>/settings.json` (normally `~/.pi/agent/settings.json`; `PI_CODING_AGENT_DIR` selects another profile). A trusted project's `.pi/settings.json` can override or add individual rungs. This is a format example, not a default:
 
 ```json
 {
-  "3": "provider/fast-model:off",
-  "6": "provider/reasoning-model:medium",
-  "8": "provider/reasoning-model:high"
+  "piSub": {
+    "ladder": {
+      "3": "provider/fast-model:off",
+      "6": "provider/reasoning-model:medium",
+      "8": "provider/reasoning-model:high"
+    }
+  }
 }
 ```
 
-Strength is a rough local scale with workload anchors, not a benchmark score: 1–2 narrow mechanical work, 3–4 bounded routine implementation, 5–6 multi-file changes and moderate analysis, 7–8 complex design and debugging, 9–10 the hardest, highly uncertain work. Unused levels stay empty; `{}` disables delegation.
+Strength is a rough local scale with workload anchors, not a benchmark score: 1–2 narrow mechanical work, 3–4 bounded routine implementation, 5–6 multi-file changes and moderate analysis, 7–8 complex design and debugging, 9–10 the hardest, highly uncertain work. Unused levels stay empty. An empty project ladder `{}` inherits profile rungs; it does not disable delegation. There is no per-rung delete or off switch, and `false` and `null` are invalid. If the effective ladder has no rungs, delegation fails with an explicit unconfigured error.
 
-Each task requests a minimum level. On task creation, routing picks the first natively available rung at or above it and fails explicitly if there is none. The model and thinking level stay fixed for the task's lifetime, including queueing and continuations. Ladder edits affect new tasks, not existing ones or their authorization. Native execution capability can still fail. The ladder authorizes delegation independently of the parent's model scope.
+Each task requests a minimum level. On task creation, routing picks the first natively available rung at or above it and fails explicitly if there is none. The model and thinking level stay fixed for the task's lifetime, including queueing and continuations. New tasks use the effective settings snapshot; existing tasks retain their selection and authorization. Manual edits take effect according to Pi's settings reload lifecycle; `/reload` disposes open tasks. Native execution capability can still fail. The ladder authorizes delegation independently of the parent's model scope.
 
-pi-sub reads the file but never writes it. To create or revise it, ask your coding agent to follow [the ladder setup guide](instructions/create-model-ladder.md), for example from this checkout:
+pi-sub reads effective settings but never writes them or falls back to the old `<agent-dir>/pi-sub-config.json`. To migrate once, manually copy its rung mapping into `piSub.ladder` in the desired settings scope, preserving other settings. To create or revise it, ask your coding agent to follow [the ladder setup guide](instructions/create-model-ladder.md), for example from this checkout:
 
 ```sh
 pi @instructions/create-model-ladder.md "Help me create or revise my pi-sub model ladder."

@@ -112,9 +112,6 @@ beforeEach(() => {
   vi.spyOn(models, "availableModels").mockReturnValue([
     { provider: "test", model: "fake", thinking: ["off"] },
   ]);
-  vi.spyOn(models, "loadLadder").mockReturnValue([
-    { power: 6, provider: "test", model: "fake", thinking: "off" },
-  ]);
 });
 afterEach(async () => {
   await turn();
@@ -134,6 +131,9 @@ function setup() {
     { description: string; execute: (...args: any[]) => Promise<any> }
   >();
   const sendMessage = vi.fn();
+  const getSettings = vi.fn<() => object>(() => ({
+    piSub: { ladder: { 6: "test/fake:off" } },
+  }));
   const renderers: string[] = [];
   const notify = vi.fn();
   const abort = vi.fn();
@@ -148,6 +148,7 @@ function setup() {
     ui: { notify },
   } as unknown as ExtensionContext;
   piSub({
+    getSettings,
     on: (name: string, handler: (event: any, ctx: any) => any) =>
       handlers.set(name, handler),
     registerCommand: (name: string, command: any) =>
@@ -179,6 +180,7 @@ function setup() {
     JSON.parse(result.content[0]!.text);
   return {
     ctx,
+    getSettings,
     emit,
     commands,
     tools,
@@ -194,7 +196,7 @@ function setup() {
 }
 
 test("adds four tools, three commands, one message view and one stable prompt section", () => {
-  const { tools, commands, renderers, emit, settle } = setup();
+  const { tools, commands, renderers, emit, settle, getSettings } = setup();
   expect([...tools.keys()]).toEqual([
     "sub_task",
     "sub_message",
@@ -221,12 +223,10 @@ test("adds four tools, three commands, one message view and one stable prompt se
   vi.mocked(models.availableModels).mockReturnValue([]);
   emit("before_agent_start", { systemPromptOptions: options });
   expect(options.sections.pi_sub).toContain("levels (snapshot): none.");
-  vi.mocked(models.loadLadder).mockImplementation(() => {
-    throw new Error("Invalid ladder");
-  });
+  getSettings.mockReturnValue({ piSub: { ladder: false } });
   emit("before_agent_start", { systemPromptOptions: options });
   expect(options.sections.pi_sub).toMatch(
-    /Delegation unavailable: Invalid ladder$/,
+    /Delegation unavailable: Invalid model ladder.*piSub\.ladder/,
   );
 });
 

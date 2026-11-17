@@ -6,7 +6,7 @@ Status: Accepted
 
 Create and revise the ladder in the normal agent conversation using [one setup guide](../../instructions/create-model-ladder.md). The agent discovers available executions, compares useful candidates, discusses the complete proposal with the user, and edits the configuration with ordinary tools.
 
-pi-sub only reads, validates and routes from that file. Every delegated task has a required minimum level. Missing or unusable configuration points to the guide instead of starting a setup workflow.
+pi-sub only reads, validates and routes from native effective settings; it never writes them. Every delegated task has a required minimum level. Missing or unusable configuration points to the guide instead of starting a setup workflow.
 
 ## Rationale and consequences
 
