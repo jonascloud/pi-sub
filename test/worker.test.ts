@@ -54,41 +54,32 @@ const entry = (id,message) => ({type:'message',id,parentId:null,timestamp:new Da
 const user = {role:'user',content:[{type:'text',text:'hello'}],timestamp:Date.now()};
 const assistant = {role:'assistant',content:[{type:'text',text:'new response'}],stopReason:'stop',usage:${JSON.stringify(usage)},timestamp:Date.now()};
 `;
-async function setup(body: string, options: Partial<WorkerOptions> = {}) {
+async function setup(
+  body: string,
+  options: Partial<WorkerOptions> = {},
+  continues = false,
+) {
   const dir = await mkdtemp(join(tmpdir(), "worker-process-"));
   dirs.push(dir);
   const cliPath = join(dir, "child.cjs");
   await writeFile(cliPath, prelude + body);
   const session = join(dir, "session.jsonl");
-  const config: WorkerOptions = {
-    cwd: dir,
-    sessionDir: join(dir, "sessions"),
-    provider: "test",
-    model: "fake",
-    thinking: "off",
-    name: "test",
-    cliPath,
-    ...options,
-  };
-  const worker = createWorker(config, session);
+  const worker = createWorker(
+    {
+      cwd: dir,
+      sessionDir: join(dir, "sessions"),
+      provider: "test",
+      model: "fake",
+      thinking: "off",
+      name: "test",
+      cliPath,
+      ...options,
+    },
+    session,
+    continues,
+  );
   workers.push(worker);
-  return { worker, session, dir, config };
-}
-/** The next spawned process ignores signals until released, like one stuck in the kernel. */
-function unkillable() {
-  let release = () => {};
-  vi.mocked(spawn).mockImplementationOnce(((
-    ...args: Parameters<typeof spawn>
-  ) => {
-    const child = (vi.mocked(spawn).getMockImplementation() ?? spawn)(...args);
-    const kill = child.kill.bind(child);
-    child.kill = () => true;
-    release = () => {
-      child.kill = kill;
-    };
-    return child;
-  }) as typeof spawn);
-  return () => release();
+  return { worker, session, dir };
 }
 function nextEvent(worker: Worker, type = "agent_start") {
   return new Promise<void>((resolve) => {
@@ -100,36 +91,39 @@ function nextEvent(worker: Worker, type = "agent_start") {
     });
   });
 }
+const saved = (entries: object[]) =>
+  [{ type: "session", version: 3, id: "session" }, ...entries]
+    .map((entry) => JSON.stringify(entry))
+    .join("\n") + "\n";
+const holdPipes = `require('node:child_process').spawn(process.execPath,['-e',"setTimeout(()=>{},6000)"],{stdio:['ignore','inherit','inherit'],detached:true}).unref();`;
 
-test("launch uses stdin and fixed native options, LF-only framing and split UTF-8", async () => {
-  const { worker, dir } = await setup(
-    `
+test("launch sends the prompt on stdin with fixed native options and reports the saved reply", async () => {
+  const { worker, dir } = await setup(`
 let input=''; process.stdin.setEncoding('utf8');
 process.stdin.on('data', chunk => input += chunk);
 process.stdin.on('end', () => {
- fs.writeFileSync(file+'.args', JSON.stringify({args:process.argv,input,child:process.env.PI_SUB_CHILD}));
- user.content=input.trim(); append(entry('u',user)); emit({type:'message_end',message:user});
+ fs.writeFileSync(file+'.launch', JSON.stringify({args:process.argv,input,env:process.env}));
+ append(entry('u',user)); emit({type:'message_end',message:user});
  assistant.content[0].text = 'ä\\u2028middle\\u2029end'; append(entry('a',assistant));
  const bytes=Buffer.from(JSON.stringify({type:'message_end',message:assistant})+'\\r\\n');
  const split=bytes.indexOf(Buffer.from('ä'))+1;
  process.stdout.write(bytes.subarray(0,split));
  setTimeout(()=>process.stdout.write(bytes.subarray(split)),10);
 });
-`,
-  );
+`);
   const events: string[] = [];
   worker.onEvent((event) => events.push(event.type));
   const prompt = " \nprivate prompt\nwith lines \t";
-  const report = await worker.run(prompt);
-  expect(report).toMatchObject({
+  expect(await worker.run(prompt)).toEqual({
     text: "ä\u2028middle\u2029end",
     interrupted: false,
     inputPersisted: true,
+    saved: true,
+    sessionLost: false,
     usage,
   });
-  expect(report.error).toBeUndefined();
   const launch = JSON.parse(
-    await readFile(join(dir, "session.jsonl.args"), "utf8"),
+    await readFile(join(dir, "session.jsonl.launch"), "utf8"),
   );
   expect(spawn).toHaveBeenLastCalledWith(
     process.execPath,
@@ -138,74 +132,31 @@ process.stdin.on('end', () => {
   );
   expect(launch.input).toBe(prompt);
   expect(launch.args).not.toContain(prompt);
-  expect(launch.args).toEqual(
-    expect.arrayContaining([
-      "--mode",
-      "json",
-      "--print",
-      "--session",
-      "-e",
-      "--exclude-tools",
-    ]),
-  );
-  expect(launch.args[launch.args.indexOf("--exclude-tools") + 1]).toBe(
-    "sub_task,sub_message,sub_result,sub_control",
-  );
+  for (const [flag, value] of [
+    ["--mode", "json"],
+    ["--provider", "test"],
+    ["--model", "fake"],
+    ["--thinking", "off"],
+    ["--session", join(dir, "session.jsonl")],
+    ["--exclude-tools", "sub_task,sub_message,sub_result,sub_control"],
+  ])
+    expect(launch.args[launch.args.indexOf(flag) + 1]).toBe(value);
+  expect(launch.args).toContain("--print");
   expect(launch.args).not.toContain("--approve");
-  expect(launch.child).toBe("1");
+  expect(launch.env).toMatchObject({
+    PI_SUB_CHILD: "1",
+    PI_SUB_EXPECTED_PROVIDER: "test",
+    PI_SUB_EXPECTED_MODEL: "fake",
+    PI_SUB_EXPECTED_THINKING: "off",
+  });
   expect(events).toEqual(["message_end", "message_end"]);
-  await expect(worker.run("again")).rejects.toThrow("once");
 });
 
-test("child guard rejects a switched assignment journal through public session context", () => {
-  vi.stubEnv("PI_SUB_EXPECTED_SESSION_ID", "");
+test("the child guard aborts a model or thinking level other than the assigned one", () => {
   vi.stubEnv("PI_SUB_CHILD", "1");
   vi.stubEnv("PI_SUB_EXPECTED_PROVIDER", "test");
   vi.stubEnv("PI_SUB_EXPECTED_MODEL", "fake");
   vi.stubEnv("PI_SUB_EXPECTED_THINKING", "off");
-  vi.stubEnv("PI_SUB_EXPECTED_SESSION_FILE", "/expected/task.jsonl");
-  const diagnostic = vi.spyOn(console, "error").mockImplementation(() => {});
-  try {
-    const on =
-      vi.fn<
-        (
-          type: string,
-          handler: (event: unknown, ctx: ExtensionContext) => unknown,
-        ) => void
-      >();
-    childGuard({ on } as unknown as ExtensionAPI);
-    const beforeStart = on.mock.calls.find(
-      ([type]) => type === "before_agent_start",
-    )![1];
-    let sessionFile = "/expected/task.jsonl";
-    const abort = vi.fn();
-    const ctx = {
-      model: { provider: "test", id: "fake" },
-      thinkingLevel: "off",
-      sessionManager: { getSessionFile: () => sessionFile },
-      abort,
-    } as unknown as ExtensionContext;
-    beforeStart({ systemPromptOptions: { sections: {} } }, ctx);
-    expect(abort).not.toHaveBeenCalled();
-    sessionFile = "/unrelated/task.jsonl";
-    beforeStart({}, ctx);
-    expect(abort).toHaveBeenCalledOnce();
-    expect(diagnostic).toHaveBeenCalledWith(
-      expect.stringContaining("Worker session mismatch"),
-    );
-  } finally {
-    diagnostic.mockRestore();
-    vi.unstubAllEnvs();
-  }
-});
-
-test("child guard rejects a substituted journal identity even at the same path", () => {
-  vi.stubEnv("PI_SUB_CHILD", "1");
-  vi.stubEnv("PI_SUB_EXPECTED_PROVIDER", "test");
-  vi.stubEnv("PI_SUB_EXPECTED_MODEL", "fake");
-  vi.stubEnv("PI_SUB_EXPECTED_THINKING", "off");
-  vi.stubEnv("PI_SUB_EXPECTED_SESSION_FILE", "/expected/task.jsonl");
-  vi.stubEnv("PI_SUB_EXPECTED_SESSION_ID", "original");
   const diagnostic = vi.spyOn(console, "error").mockImplementation(() => {});
   try {
     const handlers = new Map<
@@ -218,46 +169,88 @@ test("child guard rejects a substituted journal identity even at the same path",
         handler: (event: unknown, ctx: ExtensionContext) => unknown,
       ) => handlers.set(name, handler),
     } as unknown as ExtensionAPI);
-    let sessionId = "original";
     const abort = vi.fn();
     const ctx = {
       model: { provider: "test", id: "fake" },
       thinkingLevel: "off",
       abort,
-      sessionManager: {
-        getSessionFile: () => "/expected/task.jsonl",
-        getSessionId: () => sessionId,
-      },
     } as unknown as ExtensionContext;
-    handlers.get("session_start")!({}, ctx);
+    const event = {
+      systemPromptOptions: { sections: {} as { pi_sub?: string } },
+    };
+    handlers.get("before_agent_start")!(event, ctx);
     expect(abort).not.toHaveBeenCalled();
-    sessionId = "substituted";
-    handlers.get("before_agent_start")!({}, ctx);
+    expect(event.systemPromptOptions.sections.pi_sub).toContain(
+      "smallest sufficient handoff",
+    );
+    Object.assign(ctx, { thinkingLevel: "minimal" }); // A native clamp.
+    handlers.get("before_provider_request")!({}, ctx);
     expect(abort).toHaveBeenCalledOnce();
-    expect(diagnostic).toHaveBeenCalledWith("Worker session identity mismatch");
+    expect(diagnostic).toHaveBeenCalledWith(
+      "Worker model mismatch: expected test/fake thinking=off, got test/fake thinking=minimal",
+    );
   } finally {
     diagnostic.mockRestore();
     vi.unstubAllEnvs();
   }
 });
 
-test("stop before run prevents spawning; stop is idempotent", async () => {
+test("stop before run prevents spawning", async () => {
   const { worker, session } = await setup(`process.exit(99)`);
+  const spawned = vi.mocked(spawn).mock.calls.length;
   await Promise.all([worker.stop(), worker.stop()]);
   expect(await worker.run("hello")).toMatchObject({
     text: "",
     interrupted: true,
     inputPersisted: false,
+    saved: false,
   });
+  expect(vi.mocked(spawn).mock.calls.length).toBe(spawned);
   await expect(readFile(session)).rejects.toMatchObject({ code: "ENOENT" });
 });
 
+test("stopping a continuation during preflight preserves usage, not old input or replies", async () => {
+  const { worker, session } = await setup("process.exit(99)", {}, true);
+  await writeFile(
+    session,
+    saved([
+      {
+        type: "message",
+        id: "old-u",
+        message: { role: "user", content: "old instruction" },
+      },
+      {
+        type: "message",
+        id: "old-a",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "old reply" }],
+          stopReason: "stop",
+          usage,
+        },
+      },
+    ]),
+  );
+  const spawned = vi.mocked(spawn).mock.calls.length;
+  const run = worker.run("new instruction");
+  await worker.stop(); // readSession has yielded, but no child has started.
+  expect(await run).toEqual({
+    text: "",
+    interrupted: true,
+    inputPersisted: false,
+    saved: true,
+    sessionLost: false,
+    usage,
+  });
+  expect(vi.mocked(spawn).mock.calls.length).toBe(spawned);
+});
+
 test.each([false, true])(
-  "stop waits for drained close; force kill=%s",
+  "stop waits for exit and reports what the session saved; force kill=%s",
   async (force) => {
     const { worker } = await setup(`
-process.on('SIGTERM', () => { ${force ? "" : `setTimeout(()=>{ emit({type:'message_end',message:assistant}); process.exit(0); },100);`} });
-emit({type:'agent_start'}); emit({type:'agent_settled',aborted:false});
+process.on('SIGTERM', () => { ${force ? "" : `setTimeout(()=>{ append(entry('a',assistant)); process.exit(0); },100);`} });
+append(entry('u',user)); emit({type:'agent_start'});
 setInterval(()=>{},1000);
 `);
     const ready = nextEvent(worker);
@@ -271,364 +264,149 @@ setInterval(()=>{},1000);
     const start = Date.now();
     await Promise.all([worker.stop(), worker.stop()]);
     const report = await running;
-    expect(report.interrupted).toBe(true);
-    expect(report.inputPersisted).toBe(false);
-    expect(report.text).toBe(force ? "" : "new response");
+    expect(report).toMatchObject({
+      text: force ? "" : "new response",
+      interrupted: true,
+      inputPersisted: true,
+      sessionLost: false,
+    });
+    expect(report).not.toHaveProperty("error");
     expect(Date.now() - start).toBeGreaterThanOrEqual(force ? 900 : 80);
   },
   10000,
 );
 
-test("output inherited by a descendant still drains within the bound after exit", async () => {
+test("an input the session never saved is reported as unsent", async () => {
   const { worker } = await setup(`
-require('node:child_process').spawn(process.execPath,['-e',"setTimeout(()=>console.log(JSON.stringify({type:'message_end',message:"+JSON.stringify(assistant)+"})),150)"],{stdio:['ignore',process.stdout,'ignore']});
-process.exit(0);
+emit({type:'message_end',message:user}); emit({type:'agent_start'});
+setInterval(()=>{},1000);
 `);
+  const ready = nextEvent(worker);
+  const running = worker.run("hello");
+  await ready;
+  await worker.stop();
+  // Streamed events precede the write: only the saved entry is evidence.
+  expect(await running).toMatchObject({
+    interrupted: true,
+    inputPersisted: false,
+    saved: true,
+  });
+});
+
+test("output is progress only: a streamed reply the session never saved is no reply", async () => {
+  const { worker } = await setup(
+    `append(entry('u',user)); process.stdout.write('{broken}\\nnull\\n'); emit({type:'message_end',message:assistant}); process.stdout.write('{"type":"agent_st');`,
+  );
+  const events: string[] = [];
+  worker.onEvent((event) => events.push(event.type));
   expect(await worker.run("hello")).toMatchObject({
+    text: "",
+    error: "No new assistant response",
+    inputPersisted: true,
+  });
+  expect(events).toEqual(["message_end"]); // Malformed frames are skipped, not fatal.
+});
+
+test.each(["error", "aborted", "length", "toolUse"])(
+  "exit zero does not hide native %s",
+  async (reason) => {
+    const { worker } = await setup(
+      `assistant.stopReason=${JSON.stringify(reason)}; append(entry('a',assistant));`,
+    );
+    expect(await worker.run("hello")).toMatchObject({
+      text: "new response",
+      error: `Native response ended with ${reason}`,
+      interrupted: false,
+    });
+  },
+);
+
+test("a crash after saved work fails the execution but keeps its session", async () => {
+  const { worker } = await setup(
+    `append(entry('u',user)); assistant.stopReason='toolUse'; append(entry('a',assistant)); console.error('AbortError: The operation was aborted'); process.exit(1);`,
+  );
+  expect(await worker.run("hello")).toEqual({
     text: "new response",
+    error: "Native process exited 1: AbortError: The operation was aborted",
     interrupted: false,
+    inputPersisted: true,
+    saved: true,
+    sessionLost: false,
+    usage,
   });
 });
 
 test("a descendant holding the pipes cannot keep an exited execution open", async () => {
-  const { worker } = await setup(`
-append(entry('u',user)); append(entry('a',assistant));
-process.stdout.write('{"type":"agent_st');
-require('node:child_process').spawn(process.execPath,['-e',"setTimeout(()=>{},6000)"],{stdio:['ignore','inherit','inherit'],detached:true}).unref();
-process.exit(0);
-`);
+  const { worker } = await setup(
+    `append(entry('u',user)); append(entry('a',assistant)); ${holdPipes} process.exit(0);`,
+  );
   const start = Date.now();
   const report = await worker.run("hello");
-  // The journal decides; the abandoned progress frame is not a protocol error.
-  expect(report).toMatchObject({
-    text: "new response",
-    interrupted: false,
-    inputPersisted: true,
-    sessionLost: false,
-  });
+  expect(report).toMatchObject({ text: "new response", interrupted: false });
   expect(report).not.toHaveProperty("error");
   expect(Date.now() - start).toBeLessThan(3000);
 }, 10000);
 
 test("a stop arriving while an exited execution drains does not turn its reply into an interruption", async () => {
-  const { worker } = await setup(`
-append(entry('u',user)); append(entry('a',assistant));
-emit({type:'agent_settled',aborted:false});
-require('node:child_process').spawn(process.execPath,['-e',"setTimeout(()=>{},6000)"],{stdio:['ignore','inherit','inherit'],detached:true}).unref();
-process.exit(0);
-`);
+  const { worker } = await setup(
+    `append(entry('u',user)); append(entry('a',assistant)); emit({type:'agent_settled',aborted:false}); ${holdPipes} process.exit(0);`,
+  );
   const settled = nextEvent(worker, "agent_settled");
   const running = worker.run("hello");
   await settled;
   await new Promise((resolve) => setTimeout(resolve, 300));
   await worker.stop();
   const report = await running;
-  expect(report).toMatchObject({
-    text: "new response",
-    interrupted: false,
-    inputPersisted: true,
-  });
+  expect(report).toMatchObject({ text: "new response", interrupted: false });
   expect(report).not.toHaveProperty("error");
 }, 10000);
 
 test("stop is bounded by exit, not by a descendant holding the pipes", async () => {
-  const { worker } = await setup(`
-require('node:child_process').spawn(process.execPath,['-e',"setTimeout(()=>{},6000)"],{stdio:['ignore','inherit','inherit'],detached:true}).unref();
-emit({type:'agent_start'}); setInterval(()=>{},1000);
-`);
+  const { worker } = await setup(
+    `${holdPipes} emit({type:'agent_start'}); setInterval(()=>{},1000);`,
+  );
   const ready = nextEvent(worker);
   const running = worker.run("hello");
   await ready;
+  const start = Date.now();
   await worker.stop();
   expect(await running).toMatchObject({ interrupted: true });
+  expect(Date.now() - start).toBeLessThan(3000);
 }, 10000);
 
-test("failed bounded stop can be retried without settling run before exit", async () => {
-  const release = unkillable();
-  const { worker } = await setup(
-    `emit({type:'agent_start'}); setInterval(()=>{},1000);`,
-  );
-  const ready = nextEvent(worker);
-  let completed = false;
-  const running = worker.run("hello").then((report) => {
-    completed = true;
-    return report;
-  });
-  await ready;
-  await expect(worker.stop()).rejects.toThrow("stop may be retried");
-  expect(completed).toBe(false);
-  release();
-  await worker.stop();
-  expect(await running).toMatchObject({ interrupted: true });
-}, 10000);
-
-test("failed internal termination stays pending and external stop can retry", async () => {
-  const release = unkillable();
-  const { worker } = await setup(
-    `emit({type:'agent_start'}); process.stdout.write('{broken}\\n'); setInterval(()=>{},1000);`,
-  );
-  const ready = nextEvent(worker);
-  let completed = false;
-  const running = worker.run("hello").then((report) => {
-    completed = true;
-    return report;
-  });
-  await ready;
-  // The internal bounded attempt times out while the process ignores signals.
-  // Vitest also fails this test if its rejected stop promise goes unhandled.
-  await new Promise((resolve) => setTimeout(resolve, 3300));
-  expect(completed).toBe(false);
-  release();
-  await worker.stop();
-  expect(await running).toMatchObject({
-    error: "Invalid native JSON output",
-    interrupted: true,
-  });
-}, 10000);
-
-test.each(["error", "aborted", "length", "toolUse"])(
-  "exit zero does not hide native %s",
-  async (reason) => {
-    const { worker } = await setup(
-      `assistant.stopReason=${JSON.stringify(reason)}; append(entry('a',assistant)); emit({type:'message_end',message:assistant});`,
-    );
-    expect(await worker.run("hello")).toMatchObject({
-      text: "new response",
-      error: expect.stringContaining(reason),
-      interrupted: false,
-    });
-  },
-);
-
-test.each(["{broken}\\n", '{"type":"agent_start"}', "null\\n"])(
-  "corrupt or partial JSON output is reported: %s",
-  async (output) => {
-    const { worker } = await setup(
-      `process.stdout.write(${JSON.stringify(output.replaceAll("\\n", "\n"))});`,
-    );
-    expect((await worker.run("hello")).error).toMatch(/JSON/);
-  },
-);
-
-test("fatal malformed output terminates internally and drains the final response", async () => {
-  const { worker } = await setup(`
-process.on('SIGTERM',()=>{
- emit({type:'message_end',message:user});
- emit({type:'message_end',message:assistant});
- setTimeout(()=>process.exit(0),100);
-});
-process.stdout.write('{broken}\\n');
-setInterval(()=>{},1000);
-`);
-  const report = await worker.run("hello");
-  expect(report).toMatchObject({
-    error: "Invalid native JSON output",
-    interrupted: false,
-    inputPersisted: false,
-    text: "new response",
-  });
-}, 10000);
-
-test("oversized live output triggers bounded force kill without reporting interruption", async () => {
-  const { worker } = await setup(`
-process.on('SIGTERM',()=>{});
-process.stdout.write('x'.repeat(16*1024*1024+1));
-setInterval(()=>{},1000);
-`);
-  expect(await worker.run("hello")).toMatchObject({
-    error: "Native JSON record exceeds size limit",
-    interrupted: false,
-  });
-}, 10000);
-
-test("partial output at EOF terminates a still-live child", async () => {
-  const { worker } = await setup(`
-process.stdout.end('{"type":"agent_start"}');
-setInterval(()=>{},1000);
-`);
-  expect(await worker.run("hello")).toMatchObject({
-    error: "Incomplete native JSON output at EOF",
-    interrupted: false,
-  });
-}, 10000);
-
-test("explicit interruption tolerates a truncated final progress frame", async () => {
-  const { worker } = await setup(`
-append(entry('u',user));
-emit({type:'agent_start'});
-process.stdout.write('{"type":');
-setInterval(()=>{},1000);
-`);
-  const started = nextEvent(worker);
-  const running = worker.run("hello");
-  await started;
-  await worker.stop();
-  expect(await running).toMatchObject({
-    interrupted: true,
-    inputPersisted: true,
-  });
-  expect((await running).error).toBeUndefined();
-});
-
-test("explicit interruption does not hide a damaged native journal", async () => {
-  const { worker } = await setup(`
-append(entry('u',user));
-fs.appendFileSync(file,'{broken}\\n');
-emit({type:'agent_start'});
-setInterval(()=>{},1000);
-`);
-  const started = nextEvent(worker);
-  const running = worker.run("hello");
-  await started;
-  await worker.stop();
-  expect(await running).toMatchObject({
-    interrupted: true,
-    error: "Corrupt native session file",
-    sessionLost: true,
-  });
-});
-
-test("continuous draining bounds diagnostics without deadlocking", async () => {
-  const { worker } = await setup(
-    `process.stderr.write('x'.repeat(200000)); process.exitCode=42;`,
-  );
-  const report = await worker.run("hello");
-  expect(report.error).toMatch(/42/);
-  expect(report.error!.length).toBeLessThan(17000);
-});
-
-test.each([false, true])(
-  "a streamed user event without a saved entry never proves persistence (stop=%s)",
-  async (stop) => {
-    const { worker } = await setup(`
-emit({type:'message_end',message:user});
-${stop ? "setInterval(()=>{},1000);" : "process.exitCode=1;"}
-`);
-    const observed = nextEvent(worker, "message_end");
-    const running = worker.run("hello");
-    await observed;
-    if (stop) await worker.stop();
-    expect(await running).toMatchObject({
-      inputPersisted: false,
-      interrupted: stop,
-    });
-  },
-);
-
-test("a journal lost during interruption is an error, not a fresh paused task", async () => {
-  const { worker, session } = await setup(`
-append(entry('u',user)); emit({type:'message_end',message:user});
-emit({type:'agent_start'}); setInterval(()=>{},1000);
-`);
-  await writeFile(
-    session,
-    JSON.stringify({ type: "session", version: 3, id: "session" }) + "\n",
-  );
-  const started = nextEvent(worker);
-  const running = worker.run("hello");
-  await started;
-  await rm(session);
-  await worker.stop();
-  expect(await running).toMatchObject({
-    error: "Native session file is missing",
-    interrupted: true,
-    inputPersisted: false,
-    sessionLost: true,
-    sessionId: "session",
-  });
-});
-
-test.each(["missing", "replaced"])(
-  "an expected %s journal fails preflight without spawning or replacing usage",
-  async (kind) => {
-    const { session, config } = await setup("process.exit(99)");
-    if (kind === "replaced")
-      await writeFile(
-        session,
-        JSON.stringify({ type: "session", version: 3, id: "other" }) + "\n",
-      );
-    const worker = createWorker(config, session, "expected");
-    workers.push(worker);
-    const spawned = vi.mocked(spawn).mock.calls.length;
-    expect(await worker.run("hello")).toMatchObject({
-      error:
-        kind === "missing"
-          ? "Native session file is missing"
-          : "Native session identity changed",
-      inputPersisted: false,
-      sessionLost: true,
-    });
-    expect(await worker.stop()).toBeUndefined();
-    expect(vi.mocked(spawn).mock.calls.length).toBe(spawned);
-    if (kind === "missing")
-      await expect(readFile(session)).rejects.toMatchObject({ code: "ENOENT" });
-    else expect(await readFile(session, "utf8")).toContain('"other"');
-  },
-);
-
-test("a new saved user entry proves persistence even when output is lost", async () => {
-  const { worker } = await setup(
-    `append(entry('u',user)); emit({type:'agent_start'}); setInterval(()=>{},1000);`,
-  );
-  const ready = nextEvent(worker);
-  const running = worker.run("hello");
-  await ready;
-  await worker.stop();
-  expect(await running).toMatchObject({
-    interrupted: true,
-    inputPersisted: true,
-  });
-});
-
-test("unrelated new user messages do not acknowledge interrupted execution input", async () => {
-  const { worker } = await setup(`
-user.content=[{type:'text',text:'unrelated startup or follow-up'}];
-append(entry('unrelated',user)); emit({type:'message_end',message:user});
-emit({type:'agent_start'}); setInterval(()=>{},1000);
-`);
-  const ready = nextEvent(worker);
-  const running = worker.run("original brief");
-  await ready;
-  await worker.stop();
-  expect(await running).toMatchObject({
-    interrupted: true,
-    inputPersisted: false,
-  });
-});
-
-test("no stale restored assistant; cumulative native usage counts every entry once", async () => {
+test("only replies this execution saved count, and usage covers the whole session once", async () => {
   const { worker, session } = await setup(
     `emit({type:'agent_settled',aborted:false});`,
+    {},
+    true,
   );
-  const entries = [
-    { type: "session", id: "session", version: 3 },
-    {
-      type: "message",
-      id: "a",
-      message: {
-        role: "assistant",
-        content: [{ type: "text", text: "stale" }],
-        stopReason: "stop",
-        usage,
-      },
-    },
-    { type: "message", id: "t", message: { role: "toolResult", usage } },
-    ...["compaction", "branch_summary", "usage"].map((type) => ({
-      type,
-      id: type,
-      usage,
-    })),
-  ];
   await writeFile(
     session,
-    entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n",
+    saved([
+      {
+        type: "message",
+        id: "a",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "stale" }],
+          stopReason: "stop",
+          usage,
+        },
+      },
+      { type: "message", id: "t", message: { role: "toolResult", usage } },
+      ...["compaction", "branch_summary", "usage"].map((type) => ({
+        type,
+        id: type,
+        usage,
+      })),
+    ]) + "{cut off by a kill",
   );
-  const report = await worker.run("hello");
-  expect(report).toMatchObject({
+  expect(await worker.run("hello")).toMatchObject({
     text: "",
     error: "No new assistant response",
     inputPersisted: false,
-    sessionLost: false,
+    saved: true,
+    sessionLost: false, // A malformed line is skipped, as the native loader does.
     usage: {
       input: 50,
       reasoning: 10,
@@ -638,153 +416,49 @@ test("no stale restored assistant; cumulative native usage counts every entry on
   });
 });
 
-test("a damaged final journal cannot discard previously confirmed native usage", async () => {
-  const { worker, session } = await setup(`
-fs.writeFileSync(file,JSON.stringify({type:'session',version:3,id:'session'})+'\\n');
-append(entry('new',assistant));
-fs.appendFileSync(file,'{broken}\\n');
-`);
-  await writeFile(
-    session,
-    [
-      { type: "session", version: 3, id: "session" },
-      {
-        type: "message",
-        id: "old",
-        message: {
-          role: "assistant",
-          content: [{ type: "text", text: "old" }],
-          stopReason: "stop",
-          usage,
-        },
-      },
-    ]
-      .map((value) => JSON.stringify(value))
-      .join("\n") + "\n",
-  );
-  expect(await worker.run("hello")).toMatchObject({
-    error: "Corrupt native session file",
-    usage: { totalTokens: 16, cost: { total: 10 } },
+test("a first start that saved nothing may repeat", async () => {
+  const { worker } = await setup(`fs.unlinkSync(file);`);
+  const report = await worker.run("hello");
+  expect(report).toMatchObject({
+    error: "Native session file is missing",
+    saved: false,
+    sessionLost: false,
+  });
+  expect(report.usage).toBeUndefined();
+  const { worker: unstartable } = await setup("", {
+    cwd: "/nonexistent/pi-worker-test",
+  });
+  expect(await unstartable.run("hello")).toMatchObject({
+    error: expect.stringMatching(/ENOENT/),
+    saved: false,
+    sessionLost: false,
   });
 });
 
-test.each([
-  [
-    "foreign identity",
-    `fs.writeFileSync(file,JSON.stringify({type:'session',version:3,id:'foreign'})+'\\n'); append(entry('old',assistant)); append(entry('new',assistant));`,
-    "Native session identity changed",
-  ],
-  [
-    "changed entry",
-    `assistant.usage.totalTokens=999; append(entry('old',assistant));`,
-    "Corrupt native session file",
-  ],
-  [
-    "replaced entry",
-    `fs.writeFileSync(file,JSON.stringify({type:'session',version:3,id:'session'})+'\\n'); assistant.usage.totalTokens=999; append(entry('old',assistant)); append(entry('new',assistant));`,
-    "Native session entry changed",
-  ],
-  [
-    "corrupt collision",
-    `fs.writeFileSync(file,JSON.stringify({type:'session',version:3,id:'session'})+'\\n'); assistant.usage.totalTokens=999; append(entry('old',assistant)); append(entry('new',assistant)); fs.appendFileSync(file,'{broken}\\n');`,
-    "Corrupt native session file",
-  ],
-])(
-  "untrusted final journal (%s) keeps only confirmed usage",
-  async (_name, body, error) => {
-    const { worker, session } = await setup(body);
-    await writeFile(
-      session,
-      [
-        { type: "session", version: 3, id: "session" },
-        {
-          type: "message",
-          id: "old",
-          message: {
-            role: "assistant",
-            content: [],
-            stopReason: "stop",
-            usage,
-          },
-        },
-      ]
-        .map((value) => JSON.stringify(value))
-        .join("\n") + "\n",
-    );
-    const report = await worker.run("hello");
-    expect(report).toMatchObject({
-      error,
-      usage,
-      inputPersisted: false,
-      sessionLost: true,
-    });
-  },
-);
-
-test("a damaged preflight ledger is not offered as a smaller replacement snapshot", async () => {
-  const { worker, session } = await setup("");
-  await writeFile(
-    session,
-    [
-      { type: "session", version: 3, id: "session" },
-      {
-        type: "message",
-        id: "old",
-        message: { role: "assistant", content: [], stopReason: "stop", usage },
-      },
-    ]
-      .map((value) => JSON.stringify(value))
-      .join("\n") + "\n{broken}\n",
-  );
-  const report = await worker.run("hello");
-  expect(report.error).toBe("Corrupt native session file");
-  expect(report.usage).toBeUndefined();
-});
-
-test("missing usage is not invented", async () => {
-  const { worker } = await setup(
-    `delete assistant.usage; append(entry('a',assistant)); emit({type:'message_end',message:assistant});`,
-  );
-  expect((await worker.run("hello")).usage).toBeUndefined();
-});
-
-test("corrupt saved session is not passed to native loader or rewritten", async () => {
-  const { worker, session } = await setup(
-    `fs.writeFileSync(file,'overwritten');`,
-  );
-  await writeFile(session, "{broken}\n");
-  expect(await worker.run("hello")).toMatchObject({
-    error: "Corrupt native session file",
+test("a session that existed and is gone is lost, before or during an execution", async () => {
+  const gone = await setup("process.exit(99)", {}, true);
+  const spawned = vi.mocked(spawn).mock.calls.length;
+  expect(await gone.worker.run("hello")).toMatchObject({
+    error: "Native session file is missing",
     inputPersisted: false,
     sessionLost: true,
   });
-  expect(await readFile(session, "utf8")).toBe("{broken}\n");
-});
+  expect(vi.mocked(spawn).mock.calls.length).toBe(spawned);
 
-test("a first start that leaves no journal fails without losing a session", async () => {
-  const { worker } = await setup(`fs.unlinkSync(file);`);
-  expect(await worker.run("hello")).toMatchObject({
-    error: expect.stringMatching(/missing/),
-    sessionLost: false,
-  });
-  const { worker: failed } = await setup("", {
-    cwd: "/nonexistent/pi-worker-test",
-  });
-  expect(await failed.run("hello")).toMatchObject({
-    error: expect.stringMatching(/ENOENT/),
-    sessionLost: false,
-  });
-});
-
-test("a crash after saved work fails the execution but keeps its session", async () => {
-  const { worker } = await setup(
-    `append(entry('u',user)); assistant.stopReason='toolUse'; append(entry('a',assistant)); console.error('AbortError: The operation was aborted'); process.exit(1);`,
+  const removed = await setup(
+    `emit({type:'agent_start'}); setInterval(()=>{},1000);`,
+    {},
+    true,
   );
-  expect(await worker.run("hello")).toMatchObject({
-    error: expect.stringContaining("Native process exited 1: AbortError"),
-    inputPersisted: true,
-    sessionLost: false,
-    sessionId: "session",
-    usage,
+  await writeFile(removed.session, saved([]));
+  const started = nextEvent(removed.worker);
+  const running = removed.worker.run("hello");
+  await started;
+  await rm(removed.session);
+  await removed.worker.stop();
+  expect(await running).toMatchObject({
+    error: "Native session file is missing",
+    interrupted: true,
+    sessionLost: true,
   });
 });

@@ -31,6 +31,13 @@ function reply(context) {
     const results = messages
       .slice(index + 1)
       .filter((message) => message.role === "toolResult");
+    if (text.startsWith("integration:report:") && !results.length) {
+      const [, , report, offset] = text.split(":");
+      return {
+        name: "sub_result",
+        args: { report, offset: Number(offset), limit: 4096 },
+      };
+    }
     if (text === "integration:batch" && !results.length)
       return {
         calls: [
@@ -80,7 +87,6 @@ function reply(context) {
         "integration:continue",
         "integration:refine-task",
         "integration:accept",
-        "integration:failure-receipt",
       ].includes(text) &&
       !results.length
     ) {
@@ -126,16 +132,6 @@ function reply(context) {
           finish: text === "integration:delegate",
         },
       };
-    }
-    if (text === "integration:repeat" && !results.length) {
-      const previous = messages.findLast(
-        (message) =>
-          message.role === "toolResult" && message.toolName === "sub_result",
-      );
-      const task = JSON.parse(
-        previous.content.find((part) => part.type === "text").text,
-      );
-      return { name: "sub_result", args: { id: task.id, finish: true } };
     }
   }
   return {
@@ -213,9 +209,8 @@ export default function (pi) {
         finished = true;
         options?.signal?.removeEventListener("abort", aborted);
         if (
-          process.env.WORKER_TEST_CRASH ||
-          (process.env.WORKER_TEST_CRASH_AFTER_RESPONSE &&
-            context.messages.some((message) => message.role === "assistant"))
+          process.env.WORKER_TEST_CRASH_AFTER_RESPONSE &&
+          context.messages.some((message) => message.role === "assistant")
         )
           process.exit(42);
         const crashed = process.env.WORKER_TEST_CRASH_ONCE;
@@ -302,55 +297,10 @@ export default function (pi) {
     },
   };
   pi.registerProvider("worker-test", definition);
-  pi.registerCommand("test-reload", {
-    description: "Synthetic runtime reload",
-    handler: async (_args, ctx) => {
-      await ctx.reload();
-    },
-  });
-  pi.registerCommand("test-remove-model", {
-    description: "Synthetic availability change",
-    handler: async () =>
-      pi.registerProvider("worker-test", {
-        ...definition,
-        models: definition.models.filter((model) => model.id !== "fake"),
-      }),
-  });
-  if (process.env.WORKER_TEST_END_DIALOG) {
-    pi.on("agent_end", async (_event, ctx) => {
-      await ctx.ui.confirm("end", "test");
-    });
-  }
-  if (process.env.WORKER_TEST_ABORT_CRASH) {
-    pi.on("agent_end", async (event) => {
-      if (
-        event.messages.some(
-          (message) =>
-            message.role === "assistant" && message.stopReason === "aborted",
-        )
-      )
-        process.exit(42);
-    });
-  }
-  if (process.env.WORKER_TEST_STARTUP_DIALOG) {
-    pi.on("session_start", async (_event, ctx) => {
-      await ctx.ui.confirm("startup", "test");
-    });
-  }
-  pi.registerCommand("crash", {
-    description: "test",
-    handler: async () => {
-      process.exit(42);
-    },
-  });
   pi.registerCommand("dialog", {
     description: "test",
     handler: async (_args, ctx) => {
       await ctx.ui.confirm("test", "test");
     },
-  });
-  pi.registerCommand("handled", {
-    description: "test",
-    handler: async () => {},
   });
 }

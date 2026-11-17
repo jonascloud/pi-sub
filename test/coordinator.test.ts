@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Usage } from "@earendil-works/pi-ai";
-import { Coordinator, type TaskView } from "../src/coordinator.ts";
+import { Coordinator } from "../src/coordinator.ts";
 import type {
   Worker,
   WorkerEvent,
@@ -32,18 +32,18 @@ const usage = (input: number, output = 0, cacheRead = 0): Usage => ({
   },
 });
 
-/** A run report is available only after physical close, including on stop. */
+/** A report exists only once the process has ended, also when it was stopped. */
 class Fake implements Worker {
   private report = Promise.withResolvers<WorkerReport>();
-  private closed = Promise.withResolvers<void>();
   private listener: (event: WorkerEvent) => void = () => {};
-  private finished = false;
   constructor(
     readonly sessionFile: string,
-    private sessions: Map<string, Usage>,
+    readonly continues: boolean,
   ) {}
   run = vi.fn((_input: string) => this.report.promise);
-  stop = vi.fn(() => this.closed.promise);
+  stop = vi.fn(async () => {
+    await this.report.promise;
+  });
   onEvent(listener: (event: WorkerEvent) => void) {
     this.listener = listener;
     return () => {
@@ -54,754 +54,524 @@ class Fake implements Worker {
     this.listener(event);
   }
   close(report: Partial<WorkerReport> = {}) {
-    if (this.finished) throw new Error("Process already closed");
-    this.finished = true;
-    if (report.usage)
-      this.sessions.set(this.sessionFile, structuredClone(report.usage));
-    this.closed.resolve();
     this.report.resolve({
       text: "answer",
-      sessionFile: this.sessionFile,
-      usage: this.sessions.get(this.sessionFile),
       interrupted: false,
       inputPersisted: true,
+      saved: true,
       sessionLost: false,
       ...report,
     });
   }
-  reject(error: Error) {
-    this.report.reject(error);
-  }
-  physicalClose() {
-    this.closed.resolve();
-  }
 }
-function setup(maxWorkers = 1, beforeStart?: (task: TaskView) => void) {
+function setup(maxWorkers = 1) {
   const workers: Fake[] = [];
-  const sessions = new Map<string, Usage>();
-  const onReady = vi.fn();
-  const factory = vi.fn(
-    (_options: WorkerOptions, sessionFile: string, _sessionId?: string) => {
-      const worker = new Fake(sessionFile, sessions);
+  const onSettled = vi.fn();
+  const c = new Coordinator({
+    maxWorkers,
+    createWorker: (_options, sessionFile, continues) => {
+      const worker = new Fake(sessionFile, continues ?? false);
       workers.push(worker);
       return worker;
     },
-  );
-  const c = new Coordinator({
-    maxWorkers,
-    createWorker: factory,
-    onReady,
-    beforeStart,
+    onSettled,
   });
   const start = (prompt = "brief") =>
     c.start({ prompt, description: prompt, level: 3, worker: options });
-  return { c, workers, start, factory, onReady };
+  return { c, workers, start, onSettled };
 }
 
-describe("reply delivery is not task acceptance", () => {
-  it("delivers a reply once, keeps questions resumable, and isolates successor replies", async () => {
-    const { c, workers, start } = setup();
+describe("a task is a conversation on one session", () => {
+  it("replies, continues on the same session with a fresh process, and is removed on acceptance", async () => {
+    const { c, workers, start, onSettled } = setup();
     const id = start();
-    expect(c.markDelivered(id, "unknown")).toBe(false);
-    workers[0]!.close({ text: "Which schema?", usage: usage(25) });
+    expect(c.get(id)).toMatchObject({ status: "active", unsent: 0 });
+    expect(workers[0]!.run).toHaveBeenCalledExactlyOnceWith("brief");
+    expect(workers[0]!.continues).toBe(false);
+    workers[0]!.emit({ type: "agent_settled", aborted: false } as WorkerEvent);
+    expect(c.get(id).status).toBe("active"); // Only process exit ends an execution.
+    workers[0]!.close({ text: "Which schema?" });
     await tick();
-    const first = c.get(id);
-    expect(first.reply).toMatchObject({ delivered: false });
-    const changed = vi.fn();
-    const detach = c.subscribe(changed);
-    expect(c.markDelivered(id, first.reply!.id)).toBe(true);
-    expect(c.markDelivered(id, first.reply!.id)).toBe(false);
-    expect(changed).toHaveBeenCalledOnce();
-    detach();
     expect(c.get(id)).toMatchObject({
       status: "ready",
       response: "Which schema?",
-      reply: { delivered: true },
+      delivered: false,
     });
-    expect(first.reply!.delivered).toBe(false); // Snapshots cannot change underneath a carrier.
-    expect(c.summary().completed).toBe(0);
-    expect(c.drainUsage()).toEqual(usage(25)); // Confirmed work, not acceptance, is charged.
+    expect(onSettled).toHaveBeenCalledOnce();
+    c.markDelivered(id);
+    expect(c.get(id).delivered).toBe(true);
 
-    const blocker = start("occupy the slot");
     await c.message(id, "Production");
-    expect(c.get(id).status).toBe("queued");
-    expect(c.get(id).reply).toBeUndefined();
-    expect(c.markDelivered(id, first.reply!.id)).toBe(false);
-    workers[1]!.close();
-    await tick();
-    expect(c.get(blocker).status).toBe("ready");
-    expect(workers[2]!.sessionFile).toBe(first.sessionFile);
-    expect(workers[2]!.run).toHaveBeenCalledExactlyOnceWith("Production");
-    workers[2]!.close({ text: "Checked production.", usage: usage(75) });
-    await tick();
-    const next = c.get(id);
-    expect(next.reply!.id).not.toBe(first.reply!.id);
-    expect(c.markDelivered(id, first.reply!.id)).toBe(false);
-    expect(c.get(id).reply!.delivered).toBe(false);
-    expect(c.markDelivered(id, next.reply!.id)).toBe(true);
-    await c.collect(id);
-    expect(c.markDelivered(id, next.reply!.id)).toBe(false);
-    expect(c.summary().completed).toBe(1);
-    expect(c.drainUsage()).toEqual(usage(50));
-    await c.dispose();
-  });
-
-  it("delivers a failure once like a reply and leaves the task open", async () => {
-    const { c, workers, start, onReady } = setup();
-    const id = start();
-    workers[0]!.close({ error: "worker failed" });
-    await tick();
-    const failed = c.get(id);
-    expect(failed).toMatchObject({
-      status: "ready",
-      outcome: "error",
-      error: "worker failed",
-      reply: { delivered: false },
-    });
-    expect(onReady).toHaveBeenCalledExactlyOnceWith(failed);
-    expect(c.markDelivered("unknown", "anything")).toBe(false);
-    expect(c.markDelivered(id, "anything")).toBe(false);
-    expect(c.markDelivered(id, failed.reply!.id)).toBe(true);
     expect(c.get(id)).toMatchObject({
-      outcome: "error",
-      reply: { delivered: true },
+      status: "active",
+      response: "",
+      delivered: false,
     });
+    expect(workers[1]!.sessionFile).toBe(workers[0]!.sessionFile);
+    expect(workers[1]!.continues).toBe(true);
+    expect(workers[1]!.run).toHaveBeenCalledExactlyOnceWith("Production");
+    workers[1]!.close({ text: "Checked production." });
+    await tick();
+    expect(c.accept(id)).toMatchObject({
+      status: "accepted",
+      response: "Checked production.",
+    });
+    expect(c.list()).toEqual([]);
+    expect(() => c.get(id)).toThrow("Unknown task");
     await c.dispose();
   });
-});
 
-describe("one session, fresh execution processes", () => {
-  it("does not complete or admit on native settlement; closed ready tasks free capacity", async () => {
-    const { c, workers, start, onReady } = setup();
+  it("runs up to the limit in creation order and combines corrections while queued", async () => {
+    const { c, workers, start } = setup();
     const a = start("a"),
-      b = start("b");
-    workers[0]!.emit({ type: "agent_settled", aborted: false });
-    await tick();
-    expect(c.get(a).status).toBe("active");
-    expect(workers).toHaveLength(1);
-    expect(onReady).not.toHaveBeenCalled();
-    await expect(c.collect(a)).rejects.toThrow("Cannot collect");
+      b = start("b"),
+      d = start("d");
+    await c.message(b, "also this");
+    expect(c.list().map((task) => task.status)).toEqual([
+      "active",
+      "queued",
+      "queued",
+    ]);
+    expect(c.get(b).unsent).toBe(2);
     workers[0]!.close();
     await tick();
-    expect(c.get(a).status).toBe("ready");
-    expect(c.get(b).status).toBe("active");
-    expect(workers).toHaveLength(2);
-    expect(onReady).toHaveBeenCalledOnce();
+    expect(c.get(a).status).toBe("ready"); // A ready task holds no slot.
+    expect(workers[1]!.run).toHaveBeenCalledExactlyOnceWith("b\n\nalso this");
     workers[1]!.close();
     await tick();
-    await c.dispose();
-  });
-
-  it("answers and continues with distinct workers but the same explicit session file", async () => {
-    const { c, workers, start, factory } = setup();
-    const id = start();
-    const sessionFile = c.get(id).sessionFile;
-    workers[0]!.close({ text: "Which schema?" });
-    await tick();
-    await c.message(id, "Production");
-    expect(workers[1]).not.toBe(workers[0]);
-    expect(workers[1]!.run).toHaveBeenCalledExactlyOnceWith("Production");
-    const pausing = c.pause(id);
-    workers[1]!.close({ interrupted: true });
-    await pausing;
-    await c.continue(id);
-    expect(workers[2]!.run).toHaveBeenCalledExactlyOnceWith(
-      "Continue the task.",
-    );
-    expect(factory.mock.calls.map((call) => call[1])).toEqual([
-      sessionFile,
-      sessionFile,
-      sessionFile,
-    ]);
-    for (const worker of workers) expect(worker.run).toHaveBeenCalledOnce();
+    expect(c.get(d).status).toBe("active");
     workers[2]!.close();
     await tick();
     await c.dispose();
   });
 
-  it("pausing every task holds queued work too, without holding back new work", async () => {
+  it("only settled tasks can be accepted", async () => {
     const { c, workers, start } = setup();
-    const a = start(),
-      b = start("queued");
+    const id = start();
+    expect(() => c.accept(id)).toThrow("Cannot accept a active task");
+    workers[0]!.close({ error: "failed" });
+    await tick();
+    expect(c.accept(id)).toMatchObject({ status: "accepted", error: "failed" });
+    await c.dispose();
+  });
+});
+
+describe("pausing and redirecting", () => {
+  it("pausing every task holds queued work too, and each continues on its own", async () => {
+    const { c, workers, start } = setup();
+    const ids = ["first", "second", "third"].map(start);
     const pausing = Promise.all(c.list().map((task) => c.pause(task.id)));
-    expect(c.get(b).status).toBe("paused");
+    expect(c.get(ids[1]!).status).toBe("paused");
     workers[0]!.close({ interrupted: true });
     await pausing;
     expect(workers).toHaveLength(1); // The freed slot admits nothing paused with it.
-    for (const id of [a, b]) expect(c.get(id).status).toBe("paused");
-    const later = start("later");
+    for (const id of ids) expect(c.get(id).status).toBe("paused");
+    const later = start("later"); // New work is not held back.
     expect(c.get(later).status).toBe("active");
-    await c.continue(b);
-    expect(c.get(b).status).toBe("queued");
+    for (const id of ids) c.continue(id);
+    expect(() => c.continue(later)).toThrow("not paused");
     workers[1]!.close();
-    await tick();
-    expect(c.get(b).status).toBe("active");
-    expect(c.get(a).status).toBe("paused");
-    workers[2]!.close();
-    await tick();
-    await c.dispose();
-  });
-
-  it("resumes all paused tasks in creation order across the worker limit", async () => {
-    const { c, workers, start } = setup();
-    const ids = ["first", "second", "third"].map(start);
-    const sessions = ids.map((id) => c.get(id).sessionFile);
-    const pausing = Promise.all(c.list().map((task) => c.pause(task.id)));
-    workers[0]!.close({ interrupted: true });
-    await pausing;
-    for (const task of c.list()) await c.continue(task.id);
     for (let i = 0; i < ids.length; i++) {
-      expect(workers).toHaveLength(i + 2);
-      expect(workers[i + 1]!.sessionFile).toBe(sessions[i]);
-      workers[i + 1]!.close();
       await tick();
+      expect(workers[i + 2]!.sessionFile).toBe(c.get(ids[i]!).sessionFile);
+      // Only the interrupted one had received its brief.
+      expect(workers[i + 2]!.run).toHaveBeenCalledExactlyOnceWith(
+        ["Continue the task.", "second", "third"][i],
+      );
+      workers[i + 2]!.close();
     }
-    await c.dispose();
-  });
-
-  it("a closed paused execution frees capacity without taking the task", async () => {
-    const { c, workers, start } = setup();
-    const a = start("a"),
-      b = start("b");
-    const pausing = c.pause(a);
-    await tick();
-    expect(workers).toHaveLength(1);
-    workers[0]!.close({ interrupted: true });
-    await pausing;
-    expect(c.get(a).status).toBe("paused");
-    expect(c.get(b).status).toBe("active");
-    expect(workers).toHaveLength(2);
-    workers[1]!.close();
     await tick();
     await c.dispose();
   });
 
-  it("admits FIFO and combines corrections while queued", async () => {
-    const { c, workers, start } = setup();
-    start("a");
-    const b = start("b"),
-      d = start("d");
-    await c.message(b, "correction");
-    workers[0]!.close();
-    await tick();
-    expect(workers[1]!.run).toHaveBeenCalledExactlyOnceWith("b\n\ncorrection");
-    expect(c.get(d).status).toBe("queued");
-    workers[1]!.close();
-    await tick();
-    workers[2]!.close();
-    await tick();
-    await c.dispose();
-  });
-});
-
-describe("journal expectations across executions", () => {
-  it("retains the journal identity and the last usage when continuation preflight fails", async () => {
-    const { c, workers, start, factory } = setup();
-    const id = start();
-    expect(factory.mock.calls[0]![2]).toBeUndefined();
-    workers[0]!.close({ sessionId: "native-session", usage: usage(25) });
-    await tick();
-    await c.message(id, "continue with this correction");
-    expect(factory.mock.calls[1]![2]).toBe("native-session");
-    workers[1]!.close({
-      sessionId: undefined,
-      usage: undefined,
-      text: "",
-      error: "Native session file is missing",
-      inputPersisted: false,
-    });
-    await tick();
-    expect(c.get(id)).toMatchObject({
-      outcome: "error",
-      tokens: 25,
-      pendingInput: ["continue with this correction"],
-    });
-    await c.collect(id);
-    expect(c.drainUsage()).toEqual(usage(25));
-    await c.dispose();
-  });
-
-  it("allows a fresh start after interruption before any journal was created", async () => {
-    const { c, workers, start, factory } = setup();
-    const id = start();
-    const pausing = c.pause(id);
-    workers[0]!.close({ interrupted: true, inputPersisted: false });
-    await pausing;
-    await c.continue(id);
-    expect(factory.mock.calls[1]![2]).toBeUndefined();
-    expect(workers[1]!.run).toHaveBeenCalledExactlyOnceWith("brief");
-    workers[1]!.close({ sessionId: "created-on-retry" });
-    await tick();
-    await c.dispose();
-  });
-});
-
-describe("input ownership at close", () => {
   it.each([false, true])(
-    "redirect waits for close and requeues old input only if unpersisted (%s)",
+    "a message to an active task ends its process and sends again what the session never saved (saved=%s)",
     async (inputPersisted) => {
       const { c, workers, start } = setup();
       const id = start("brief");
       const sending = c.message(id, "correction");
       expect(workers[0]!.stop).toHaveBeenCalledOnce();
-      await tick();
-      expect(workers).toHaveLength(1);
-      workers[0]!.physicalClose();
-      await tick();
-      expect(workers).toHaveLength(1);
-      expect(c.get(id).status).toBe("active");
+      expect(workers).toHaveLength(1); // Never two processes on one session.
       workers[0]!.close({ interrupted: true, inputPersisted });
       await sending;
-      expect(workers).toHaveLength(2);
+      expect(c.get(id).status).toBe("active");
       expect(workers[1]!.run).toHaveBeenCalledExactlyOnceWith(
         inputPersisted ? "correction" : "brief\n\ncorrection",
       );
-      expect(workers[1]!.stop).not.toHaveBeenCalled();
       workers[1]!.close();
       await tick();
       await c.dispose();
     },
   );
 
-  it.each([false, true])(
-    "a pause during redirect cancels restart and retains input (%s)",
-    async (inputPersisted) => {
-      const { c, workers, start } = setup();
-      const id = start("brief");
-      const sending = c.message(id, "correction");
-      const pausing = c.pause(id);
-      workers[0]!.close({ interrupted: true, inputPersisted });
-      await Promise.all([sending, pausing]);
-      expect(workers).toHaveLength(1);
-      expect(c.get(id)).toMatchObject({
-        status: "paused",
-        pendingInput: inputPersisted ? ["correction"] : ["brief", "correction"],
-      });
-      await c.continue(id);
-      expect(workers[1]!.run).toHaveBeenCalledExactlyOnceWith(
-        inputPersisted ? "correction" : "brief\n\ncorrection",
-      );
-      workers[1]!.close();
-      await tick();
-      await c.dispose();
-    },
-  );
+  it("a pause during a redirect wins and keeps the correction for the continuation", async () => {
+    const { c, workers, start } = setup();
+    const id = start("brief");
+    const sending = c.message(id, "correction");
+    const pausing = c.pause(id);
+    workers[0]!.close({ interrupted: true });
+    await Promise.all([sending, pausing]);
+    expect(workers).toHaveLength(1);
+    expect(c.get(id)).toMatchObject({ status: "paused", unsent: 1 });
+    c.continue(id);
+    expect(workers[1]!.run).toHaveBeenCalledExactlyOnceWith("correction");
+    workers[1]!.close();
+    await tick();
+    await c.dispose();
+  });
+
+  it("a process that finished before the pause reached it keeps its reply", async () => {
+    const { c, workers, start, onSettled } = setup();
+    const id = start();
+    const pausing = c.pause(id);
+    workers[0]!.close({ text: "done", interrupted: false });
+    await pausing;
+    expect(c.get(id)).toMatchObject({ status: "ready", response: "done" });
+    expect(onSettled).toHaveBeenCalledOnce();
+    await c.dispose();
+  });
 });
 
-describe("final reports and receipts", () => {
-  it.each(["collect", "stop", "failure"] as const)(
-    "preserves cumulative display and charges each execution once before %s",
-    async (take) => {
-      const { c, workers, start } = setup();
-      const id = start();
-      workers[0]!.close({ usage: usage(8, 2) });
-      await tick();
-      expect(c.drainUsage()).toEqual(usage(8, 2));
-      await c.message(id, "next");
-      workers[1]!.close({
-        usage: usage(12, 3, 10),
-        ...(take === "failure" ? { error: "failed" } : {}),
-      });
-      await tick();
-      expect(c.drainUsage()).toEqual(usage(4, 1, 10));
-      if (take === "stop") await c.stop(id);
-      await c.collect(id);
-      await c.stop(id);
-      expect(c.drainUsage()).toBeUndefined();
-      expect(c.summary()).toEqual({
-        completed: take === "collect" ? 1 : 0,
-        inputTokens: 12,
-        outputTokens: 3,
-      });
-      const receipt = c.inspect(id);
-      expect(receipt).not.toHaveProperty("worker");
-      expect(receipt).not.toHaveProperty("run");
-      expect(receipt).not.toHaveProperty("status");
-      structuredClone(receipt);
-      await c.dispose();
-    },
-  );
-
+describe("failures", () => {
   it("a failed execution keeps its task, session and unsent input for a retry", async () => {
-    const { c, workers, start } = setup();
+    const { c, workers, start, onSettled } = setup();
     const id = start("valuable brief");
     workers[0]!.close({
       text: "partial",
       error: "Native process exited 1",
       inputPersisted: false,
-      usage: usage(7),
     });
     await tick();
     expect(c.get(id)).toMatchObject({
-      status: "ready",
-      outcome: "error",
+      status: "failed",
       error: "Native process exited 1",
       response: "partial",
-      pendingInput: ["valuable brief"],
+      unsent: 1,
+      delivered: false,
     });
-    expect(c.get(id).outcome).toBe("error");
-    expect(c.drainUsage()).toEqual(usage(7));
+    expect(onSettled).toHaveBeenCalledOnce();
+    c.markDelivered(id);
 
     await c.message(id, "Retry.");
-    expect(c.get(id)).toMatchObject({ status: "active", response: "" });
-    expect(c.get(id)).not.toHaveProperty("error");
+    const retried = c.get(id);
+    expect(retried).toMatchObject({ status: "active", delivered: false });
+    expect(retried).not.toHaveProperty("error");
     expect(workers[1]!.sessionFile).toBe(workers[0]!.sessionFile);
     expect(workers[1]!.run).toHaveBeenCalledExactlyOnceWith(
       "valuable brief\n\nRetry.",
     );
-    workers[1]!.close({ text: "done", usage: usage(9) });
+    workers[1]!.close({ text: "done" });
     await tick();
-    expect(c.get(id)).toMatchObject({ outcome: "reply", response: "done" });
-    expect(c.drainUsage()).toEqual(usage(2));
+    expect(c.get(id)).toMatchObject({ status: "ready", response: "done" });
     await c.dispose();
   });
 
-  it("reconciles streamed counts with saved session usage across continuations", async () => {
+  it("a first start that saved nothing starts again; a lost session is final", async () => {
     const { c, workers, start } = setup();
     const id = start();
-    const stream = (worker: Fake, value: Usage) =>
-      worker.emit({
-        type: "message_end",
-        message: {
-          role: "assistant",
-          api: "openai-completions",
-          provider: "p",
-          model: "m",
-          content: [],
-          stopReason: "stop",
-          usage: value,
-          timestamp: 0,
-        },
-      });
-    stream(workers[0]!, usage(10, 2, 88));
-    expect(c.summary()).toMatchObject({ inputTokens: 10, outputTokens: 2 });
-    workers[0]!.close({ usage: usage(12, 3, 185) });
-    await tick();
-    expect(c.get(id).tokens).toBe(200);
-
-    await c.message(id, "next");
-    stream(workers[1]!, usage(5, 4, 41));
-    expect(c.summary()).toMatchObject({ inputTokens: 17, outputTokens: 7 });
-    workers[1]!.close({ usage: usage(20, 10, 270) });
-    await tick();
-    expect(c.summary()).toMatchObject({ inputTokens: 20, outputTokens: 10 });
-    expect((await c.collect(id)).tokens).toBe(300);
-    expect(c.drainUsage()).toEqual(usage(20, 10, 270));
-
-    const next = start("another task");
-    workers[2]!.close({ usage: usage(7, 8, 5) });
-    await tick();
-    await c.collect(next);
-    expect(c.summary()).toMatchObject({ inputTokens: 27, outputTokens: 18 });
-    await c.dispose();
-  });
-
-  it("a session lost during a pause is a terminal failure, not a pause", async () => {
-    const { c, workers, start, factory } = setup();
-    const id = start();
-    const pausing = c.pause(id);
     workers[0]!.close({
-      interrupted: true,
-      error: "Corrupt native session file",
+      error: "Spawn failed",
+      saved: false,
       inputPersisted: false,
+    });
+    await tick();
+    await c.message(id, "Again.");
+    expect(workers[1]!.continues).toBe(false);
+    workers[1]!.close();
+    await tick();
+    await c.message(id, "More.");
+    expect(workers[2]!.continues).toBe(true);
+    workers[2]!.close({
+      error: "Native session file is missing",
+      inputPersisted: false,
+      saved: false,
       sessionLost: true,
     });
-    await pausing;
+    await tick();
     expect(c.get(id)).toMatchObject({
-      status: "ready",
-      outcome: "error",
-      error: "Corrupt native session file; the session cannot continue",
-      pendingInput: ["brief"],
+      status: "failed",
+      error: "Native session file is missing; the session cannot continue",
+      unsent: 1,
     });
     await expect(c.message(id, "Retry.")).rejects.toThrow("session is lost");
-    await expect(c.continue(id)).rejects.toThrow("not paused");
-    expect(c.get(id).pendingInput).toEqual(["brief"]);
-    expect(factory).toHaveBeenCalledOnce();
-    expect(await c.stop(id)).toMatchObject({
-      outcome: "error",
-      pendingInput: ["brief"],
-    });
+    expect(workers).toHaveLength(3);
+    expect(await c.stop(id)).toMatchObject({ status: "stopped", unsent: 1 });
     await c.dispose();
   });
+});
 
-  it("accepts a normal transformed reply without replaying an unproven literal input", async () => {
-    const { c, workers, start } = setup();
+describe("stopping", () => {
+  it("waits for the process, removes the task and frees its slot", async () => {
+    const { c, workers, start, onSettled } = setup();
     const id = start();
-    workers[0]!.close({ inputPersisted: false, text: "transformed reply" });
+    const queued = start("queued");
+    let stopped = false;
+    const stopping = c.stop(id).then((view) => {
+      stopped = true;
+      return view;
+    });
+    await expect(c.message(id, "too late")).rejects.toThrow("stopping");
     await tick();
-    expect(c.get(id)).toMatchObject({
-      status: "ready",
-      outcome: "reply",
-      response: "transformed reply",
-    });
-    expect(c.get(id).pendingInput).toBeUndefined();
+    expect(stopped).toBe(false);
+    expect(workers).toHaveLength(1);
+    workers[0]!.close({ interrupted: true, inputPersisted: false });
+    expect(await stopping).toMatchObject({ id, status: "stopped", unsent: 1 });
+    expect(c.list().map((task) => task.id)).toEqual([queued]);
+    expect(c.get(queued).status).toBe("active");
+    expect(onSettled).not.toHaveBeenCalled();
+    // Work that never started stops at once.
+    const waiting = start("waiting");
+    expect(await c.stop(waiting)).toMatchObject({ status: "stopped" });
+    workers[1]!.close();
+    await tick();
     await c.dispose();
   });
 
-  it("a failed stop keeps the process and slot, and its retry stops the task", async () => {
+  it("dispose ends every process before it resolves", async () => {
+    const { c, workers, start } = setup(2);
+    start();
+    start();
+    let done = false;
+    const disposing = c.dispose().then(() => {
+      done = true;
+    });
+    await tick();
+    expect(done).toBe(false);
+    for (const worker of workers) {
+      expect(worker.stop).toHaveBeenCalledOnce();
+      worker.close({ interrupted: true });
+    }
+    await disposing;
+    expect(c.list()).toEqual([]);
+    expect(() => start()).toThrow("disposed");
+  });
+});
+
+describe("retained reports", () => {
+  it("keeps immutable full reports across continuations and removal until disposal", async () => {
     const { c, workers, start } = setup();
     const id = start();
-    start("queued");
-    workers[0]!.stop.mockRejectedValueOnce(Error("termination failed"));
-    await expect(c.stop(id)).rejects.toThrow(
-      "Could not terminate execution: termination failed",
+    const response = "é".repeat(4000);
+    const error = "failure ".repeat(500);
+    workers[0]!.close({ text: response, error });
+    await tick();
+    const first = c.get(id);
+    expect(Buffer.byteLength(first.response)).toBeLessThanOrEqual(512);
+    expect(Buffer.byteLength(first.error!)).toBeLessThanOrEqual(240);
+    const ref = first.report!;
+    expect(ref).toBeDefined();
+    const original = ref.id;
+    first.report!.id = "modified";
+    expect(c.get(id).report!.id).toBe(original);
+    let text = "",
+      offset: number | undefined = 0;
+    do {
+      const part = c.reports.read(original, offset);
+      text += part.text;
+      offset = part.next;
+    } while (offset !== undefined);
+    expect(JSON.parse(text)).toMatchObject({ response, error });
+    await c.message(id, "continue");
+    expect(c.get(id).report).toBeUndefined();
+    workers[1]!.close({ text: "next" });
+    await tick();
+    const next = c.accept(id).report!;
+    expect(next.id).not.toBe(original);
+    expect(c.reports.read(original).text).toBe(
+      text.slice(0, c.reports.read(original).text.length),
     );
-    expect(c.get(id)).toMatchObject({ status: "active", operation: "closing" });
-    expect(c.get(id).outcome).toBeUndefined();
-    expect(workers).toHaveLength(1);
-    const retry = c.stop(id);
-    workers[0]!.close({ interrupted: true, usage: usage(7) });
-    expect(await retry).toMatchObject({ id, outcome: "stopped" });
-    expect(workers).toHaveLength(2);
-    expect(c.drainUsage()).toEqual(usage(7));
-    workers[1]!.close();
-    await tick();
+    expect(JSON.parse(c.reports.read(next.id).text).response).toBe("next");
     await c.dispose();
+    expect(() => c.reports.read(original)).toThrow();
   });
 
-  it("a pause that cannot confirm termination does not fail the task, which pauses once the process exits", async () => {
-    const { c, workers, start, onReady } = setup();
+  it("captures stopped executions and does not treat streamed previews as journal output", async () => {
+    const { c, workers, start } = setup();
     const id = start();
-    workers[0]!.stop.mockRejectedValueOnce(Error("did not exit"));
-    await expect(c.pause(id)).rejects.toThrow("Could not terminate");
-    expect(c.get(id)).toMatchObject({ status: "active", operation: "pausing" });
-    workers[0]!.close({ interrupted: true }); // The process exits after all.
+    workers[0]!.emit({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "x".repeat(4000) }],
+        stopReason: "stop",
+        usage: usage(0),
+      },
+    } as unknown as WorkerEvent);
+    expect(Buffer.byteLength(c.get(id).response)).toBeLessThanOrEqual(512);
+    const stopping = c.stop(id);
+    workers[0]!.close({ text: "", interrupted: true });
+    const view = await stopping;
+    expect(view.response).toBe("");
+    expect(JSON.parse(c.reports.read(view.report!.id).text)).toMatchObject({
+      status: "stopped",
+      response: "",
+    });
+    await c.dispose();
+  });
+
+  it("removes a queued task synchronously before a message can start it", async () => {
+    const { c, workers, start } = setup();
+    const active = start();
+    const queued = start("queued");
+    const stopping = c.stop(queued);
+    await expect(c.message(queued, "late")).rejects.toThrow("Unknown task");
+    await stopping;
+    workers[0]!.close();
     await tick();
-    expect(c.get(id).status).toBe("paused");
-    expect(c.get(id)).not.toHaveProperty("error");
-    expect(onReady).not.toHaveBeenCalled();
-    await c.continue(id);
+    expect(workers).toHaveLength(1);
+    await c.stop(active);
+    await c.dispose();
+  });
+
+  it("preserves the worker limit when observers synchronously queue work", async () => {
+    const { c, workers, start } = setup(2);
+    const first = start("first");
+    let added = false;
+    c.subscribe(() => {
+      if (
+        !added &&
+        c
+          .list()
+          .some(
+            (task) => task.description === "second" && task.status === "active",
+          )
+      ) {
+        added = true;
+        start("third");
+      }
+    });
+    start("second");
+    expect(workers).toHaveLength(2);
+    expect(c.list().find((task) => task.description === "third")?.status).toBe(
+      "queued",
+    );
+    workers[0]!.close();
+    await tick();
+    expect(workers).toHaveLength(3);
+    workers[1]!.close();
+    workers[2]!.close();
+    await tick();
+    await c.stop(first);
+    await c.dispose();
+  });
+
+  it("admits queued work even if onSettled throws", async () => {
+    const workers: Fake[] = [];
+    const c = new Coordinator({
+      maxWorkers: 1,
+      createWorker: (_options, file, continues) => {
+        const worker = new Fake(file, continues ?? false);
+        workers.push(worker);
+        return worker;
+      },
+      onSettled: () => {
+        throw new Error("observer");
+      },
+    });
+    const start = () =>
+      c.start({
+        prompt: "work",
+        description: "work",
+        level: 1,
+        worker: options,
+      });
+    start();
+    start();
+    workers[0]!.close();
+    await tick();
     expect(workers).toHaveLength(2);
     workers[1]!.close();
     await tick();
     await c.dispose();
   });
 
-  it("recovers after both an unexpected run rejection and a failed first stop", async () => {
+  it("survives capture failure and admits queued work", async () => {
     const { c, workers, start } = setup();
     const id = start();
     start("queued");
-    workers[0]!.stop.mockRejectedValueOnce(Error("termination failed"));
-    workers[0]!.reject(Error("report transport failed"));
-    await tick();
-    expect(c.get(id).status).toBe("active");
-    expect(workers).toHaveLength(1);
-    const retry = c.stop(id);
-    workers[0]!.physicalClose();
-    expect(await retry).toMatchObject({
-      outcome: "error",
-      pendingInput: ["brief"],
-      error: expect.stringContaining("report transport failed"),
+    vi.spyOn(c.reports, "put").mockImplementationOnce(() => {
+      throw new Error("disk full");
     });
-    expect(workers).toHaveLength(2);
-    workers[1]!.close();
-    await tick();
-    await c.dispose();
-  });
-
-  it("unexpected run rejection is not success and retains ownership until stop closes", async () => {
-    const { c, workers, start, onReady } = setup();
-    const id = start();
-    start("queued");
-    workers[0]!.reject(Error("report transport failed"));
-    await tick();
-    expect(workers[0]!.stop).toHaveBeenCalledOnce();
-    expect(workers).toHaveLength(1);
-    expect(c.get(id).status).toBe("active");
-    expect(onReady).not.toHaveBeenCalled();
-    workers[0]!.physicalClose();
+    workers[0]!.close({ text: "x".repeat(5000) });
     await tick();
     expect(c.get(id)).toMatchObject({
-      status: "ready",
-      outcome: "error",
-      error: "report transport failed",
-      pendingInput: ["brief"],
+      status: "failed",
+      error: expect.stringContaining("Report capture failed"),
     });
+    expect(c.get(id).report).toBeUndefined();
+    expect(Buffer.byteLength(c.get(id).response)).toBeLessThanOrEqual(512);
+    expect(workers).toHaveLength(2);
     workers[1]!.close();
     await tick();
     await c.dispose();
   });
 });
 
-describe("admission and shutdown", () => {
-  it("keeps input and releases admission when event subscription throws", async () => {
-    const { c, workers, start, factory } = setup();
-    const original = factory.getMockImplementation()!;
-    factory.mockImplementationOnce((...args) => {
-      const worker = original(...args);
-      worker.onEvent = () => {
-        throw new Error("subscription failed");
-      };
-      return worker;
-    });
-    const id = start("keep this input");
-    expect(c.get(id)).toMatchObject({
-      status: "ready",
-      outcome: "error",
-      pendingInput: ["keep this input"],
-    });
-    expect(workers[0]!.run).not.toHaveBeenCalled();
-    const next = start("next");
-    expect(c.get(next).status).toBe("active");
-    expect(await c.collect(id)).toMatchObject({
-      outcome: "error",
-      error: "subscription failed",
-    });
-    workers[1]!.close();
-    await tick();
-    await c.dispose();
-  });
-
-  it("aggregates confirmed usage once and drains independently", async () => {
+describe("usage", () => {
+  it("charges the growth of each session snapshot once and keeps totals of removed tasks", async () => {
     const { c, workers, start } = setup();
-    const a = start("a");
-    workers[0]!.close({
-      usage: {
-        ...usage(2),
-        reasoning: 3,
-        cost: { ...usage(2).cost, totalFromProvider: true },
+    const id = start();
+    workers[0]!.emit({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "streamed" }],
+        stopReason: "stop",
+        usage: usage(10, 2, 88),
       },
-    });
+    } as unknown as WorkerEvent);
+    expect(c.get(id)).toMatchObject({ response: "streamed", tokens: 100 });
+    expect(c.summary()).toEqual({ inputTokens: 10, outputTokens: 2 });
+    expect(c.drainUsage()).toBeUndefined(); // Streamed counts are not confirmed.
+    workers[0]!.close({ usage: usage(12, 3, 185) });
     await tick();
-    await c.collect(a);
-    await c.collect(a);
-    const b = start("b");
-    workers[1]!.close({
-      usage: {
-        ...usage(4),
-        cacheWrite1h: 5,
-        cost: { ...usage(4).cost, totalFromProvider: false },
-      },
-    });
-    await tick();
-    await c.collect(b);
-    expect(c.drainUsage()).toMatchObject({
-      totalTokens: 6,
-      reasoning: 3,
-      cacheWrite1h: 5,
-      cost: { total: 6, totalFromProvider: false },
-    });
+    expect(c.get(id).tokens).toBe(200);
+    expect(c.drainUsage()).toEqual(usage(12, 3, 185));
     expect(c.drainUsage()).toBeUndefined();
-    await c.dispose();
-  });
 
-  it("charges only the growth of optional counters across continuations", async () => {
-    const { c, workers, start } = setup();
-    const id = start();
-    workers[0]!.close({ usage: { ...usage(2), reasoning: 3 } });
-    await tick();
-    c.drainUsage();
     await c.message(id, "next");
-    workers[1]!.close({
-      usage: { ...usage(5), reasoning: 7, cacheWrite1h: 1 },
-    });
+    workers[1]!.close({ usage: usage(20, 10, 270), error: "failed" });
     await tick();
-    expect(c.drainUsage()).toEqual({
-      ...usage(3),
-      reasoning: 4,
-      cacheWrite1h: 1,
-    });
+    expect(c.drainUsage()).toEqual(usage(8, 7, 85)); // Failed work is charged too.
+    await c.message(id, "again");
+    workers[2]!.close({ usage: undefined, error: "unreadable" });
+    await tick();
+    expect(c.get(id).tokens).toBe(300); // The last confirmed snapshot stands.
+    expect(c.drainUsage()).toBeUndefined();
+    await c.stop(id);
+    expect(c.summary()).toEqual({ inputTokens: 20, outputTokens: 10 });
     await c.dispose();
   });
+});
 
-  it("rechecks authorization on queued admission, answers and resume", async () => {
-    let approved = true;
-    const beforeStart = vi.fn(() => {
-      if (!approved) throw Error("revoked");
-    });
-    const { c, workers, start, factory } = setup(1, beforeStart);
-    const a = start(),
-      b = start("queued");
-    approved = false;
-    workers[0]!.close();
-    await tick();
-    expect(c.get(b)).toMatchObject({ outcome: "error", error: "revoked" });
-    await c.message(a, "answer");
-    expect(c.get(a)).toMatchObject({
-      outcome: "error",
-      error: "revoked",
-      pendingInput: ["answer"],
-    });
-    approved = true;
-    const d = start("pause me");
-    const pausing = c.pause(d);
-    workers[1]!.close({ interrupted: true });
-    await pausing;
-    approved = false;
-    await c.continue(d);
-    expect(c.get(d)).toMatchObject({ outcome: "error", error: "revoked" });
-    expect(factory).toHaveBeenCalledTimes(2);
-    expect(beforeStart).toHaveBeenCalledTimes(5);
-    await c.dispose();
-  });
-
-  it("stops queued work before it starts and returns independent idempotent receipts", async () => {
-    const { c, workers, start } = setup();
-    start("active");
-    const id = start("never started");
-    const result = await c.stop(id);
-    expect(result).toMatchObject({
-      outcome: "stopped",
-      pendingInput: ["never started"],
-    });
-    expect(workers).toHaveLength(1);
-    result.execution.model = "mutated";
-    expect(c.inspect(id).execution.model).toBe("m");
-    expect(await c.stop(id)).toEqual(await c.collect(id));
-    workers[0]!.close();
-    await tick();
-    await c.dispose();
-  });
-
-  it.each(["stop", "dispose"] as const)(
-    "%s waits for physical close even before any native start event",
-    async (action) => {
-      const { c, workers, start } = setup();
-      const id = start();
-      let done = false;
-      const closing = (action === "stop" ? c.stop(id) : c.dispose()).then(
-        () => {
-          done = true;
-        },
-      );
-      await tick();
-      expect(done).toBe(false);
-      expect(workers[0]!.stop).toHaveBeenCalledOnce();
-      workers[0]!.close({ interrupted: true, inputPersisted: false });
-      await closing;
-      expect(c.list()).toEqual([]);
-      if (action === "stop")
-        expect(c.inspect(id)).toMatchObject({
-          outcome: "stopped",
-          pendingInput: ["brief"],
-        });
-      await c.dispose();
-    },
-  );
-
-  it("wait supports abort, timeout, and final report completion", async () => {
+describe("waiting observes", () => {
+  it("until the task settles, pauses or the timeout passes, and never changes it", async () => {
     const { c, workers, start } = setup();
     const id = start();
+    expect(await c.wait(id, undefined, 1)).toMatchObject({ status: "active" });
     const abort = new AbortController();
-    const waiting = c.wait(id, abort.signal);
+    const aborted = c.wait(id, abort.signal);
     abort.abort();
-    await expect(waiting).rejects.toMatchObject({ name: "AbortError" });
-    await expect(c.wait(id, undefined, 1)).rejects.toThrow("timed out");
-    const final = c.wait(id);
-    workers[0]!.close();
-    await expect(final).resolves.toMatchObject({ status: "ready" });
-    await c.dispose();
-  });
+    await expect(aborted).rejects.toMatchObject({ name: "AbortError" });
+    expect(() => c.wait("unknown")).toThrow("Unknown task");
 
-  it("wait ends when its task is paused: nothing more can arrive", async () => {
-    const { c, workers, start } = setup();
-    const id = start();
-    const waiting = c.wait(id);
+    const paused = c.wait(id);
     const pausing = c.pause(id);
     workers[0]!.close({ interrupted: true });
     await pausing;
-    await expect(waiting).resolves.toMatchObject({ status: "paused" });
-    await expect(c.wait(id)).resolves.toMatchObject({ status: "paused" });
+    expect(await paused).toMatchObject({ status: "paused" });
+    c.continue(id);
+    const settled = c.wait(id);
+    workers[1]!.close({ error: "failed" });
+    expect(await settled).toMatchObject({ status: "failed" });
+    expect(await c.wait(id)).toMatchObject({ status: "failed" });
+
+    const other = start("other");
+    const removed = c.wait(other);
+    const stopping = c.stop(other);
+    workers[2]!.close({ interrupted: true });
+    await stopping;
+    await expect(removed).rejects.toThrow("Task was stopped");
     await c.dispose();
   });
 });

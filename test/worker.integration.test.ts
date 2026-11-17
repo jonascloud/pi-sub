@@ -1,9 +1,8 @@
-import { afterEach, expect, test } from "vitest";
+import { afterEach, expect, test, vi } from "vitest";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
-import { getPackageDir } from "@earendil-works/pi-coding-agent";
+import { fileURLToPath } from "node:url";
 import { Coordinator } from "../src/coordinator.ts";
 import {
   createWorker,
@@ -33,11 +32,11 @@ async function setup(env: Record<string, string> = {}) {
     env: { PI_CODING_AGENT_DIR: join(dir, "agent"), ...env },
     args: ["--no-extensions", "-e", resolve("test/fixtures/provider.js")],
   };
-  const make = (overrides: Partial<WorkerOptions> = {}, sessionId?: string) => {
+  const make = (overrides: Partial<WorkerOptions> = {}, continues = false) => {
     const worker = createWorker(
       { ...options, ...overrides },
       session,
-      sessionId,
+      continues,
     );
     workers.push(worker);
     return worker;
@@ -56,7 +55,7 @@ function nextEvent(worker: Worker, type: string) {
 }
 
 test("native CLI: continuation retains conversation and loads global/project instructions once", async () => {
-  const { make, session, dir, options } = await setup();
+  const { make, dir, options } = await setup();
   // Public context hook observes what the native CLI actually restores, rather
   // than inferring continuity just from the presence of a session file.
   const observer = join(dir, "observe.ts");
@@ -83,9 +82,10 @@ test("native CLI: continuation retains conversation and loads global/project ins
   const report = await first.run("What is your response?");
   expect(report).toMatchObject({
     text: "fake response",
-    sessionFile: session,
     inputPersisted: true,
     interrupted: false,
+    saved: true,
+    sessionLost: false,
     usage: {
       input: 10,
       reasoning: 2,
@@ -102,11 +102,10 @@ test("native CLI: continuation retains conversation and loads global/project ins
   expect(initialPrompt).toContain("smallest sufficient handoff");
   expect(initialPrompt).not.toContain("Delegate bounded work");
   await writeFile(global, "UPDATED_GLOBAL_INSTRUCTION");
-  const second = make({ args });
+  const second = make({ args }, true);
   const continued = await second.run("Explain your previous answer.");
   expect(continued).toMatchObject({
     text: "fake response",
-    sessionFile: session,
     inputPersisted: true,
     usage: {
       input: 20,
@@ -149,10 +148,10 @@ test("native continuation refuses a deleted journal and keeps prior task usage",
       "Continue without losing the original instruction.",
     );
     expect(await coordinator.wait(id, undefined, 15000)).toMatchObject({
-      outcome: "error",
+      status: "failed",
       error: "Native session file is missing; the session cannot continue",
       tokens: 16,
-      pendingInput: ["Continue without losing the original instruction."],
+      unsent: 1,
     });
     await expect(coordinator.message(id, "Again.")).rejects.toThrow(
       "session is lost",
@@ -160,7 +159,7 @@ test("native continuation refuses a deleted journal and keeps prior task usage",
     await expect(readFile(first.sessionFile)).rejects.toMatchObject({
       code: "ENOENT",
     });
-    await coordinator.collect(id);
+    expect(coordinator.accept(id).status).toBe("accepted");
     expect(coordinator.drainUsage()?.totalTokens).toBe(16);
   } finally {
     await coordinator.dispose();
@@ -169,10 +168,8 @@ test("native continuation refuses a deleted journal and keeps prior task usage",
 
 test("a crashed native child continues on its session once its failure is answered", async () => {
   const { options, dir } = await setup();
-  const readies: string[] = [];
-  const coordinator = new Coordinator({
-    onReady: (task) => readies.push(task.outcome!),
-  });
+  const onSettled = vi.fn();
+  const coordinator = new Coordinator({ onSettled });
   try {
     const id = coordinator.start({
       prompt: "Keep this original instruction.",
@@ -186,17 +183,16 @@ test("a crashed native child continues on its session once its failure is answer
     });
     const failed = await coordinator.wait(id, undefined, 15000);
     expect(failed).toMatchObject({
-      status: "ready",
-      outcome: "error",
+      status: "failed",
       error: expect.stringMatching(/^Native process exited 42/),
-      reply: { delivered: false },
+      unsent: 0, // The session holds the instruction.
+      delivered: false,
     });
     expect(failed.error).not.toContain("cannot continue");
-    expect(failed.pendingInput).toBeUndefined(); // The journal holds it.
 
     await coordinator.message(id, "Continue.");
     expect(await coordinator.wait(id, undefined, 15000)).toMatchObject({
-      outcome: "reply",
+      status: "ready",
       response: "fake response",
       sessionFile: failed.sessionFile,
       tokens: 16,
@@ -204,67 +200,11 @@ test("a crashed native child continues on its session once its failure is answer
     const journal = await readFile(failed.sessionFile, "utf8");
     for (const input of ["Keep this original instruction.", "Continue."])
       expect(journal.split(JSON.stringify(input))).toHaveLength(2);
-    expect(readies).toEqual(["error", "reply"]);
+    expect(onSettled).toHaveBeenCalledTimes(2);
   } finally {
     await coordinator.dispose();
   }
 }, 30000);
-
-test("the native child refuses history lost between parent preflight and CLI startup", async () => {
-  const { make, dir } = await setup();
-  const first = await make().run("Original persisted instruction.");
-  expect(first.error).toBeUndefined();
-  const wrapper = join(dir, "delete-before-load.mjs");
-  const marker = join(dir, "provider-called");
-  await writeFile(
-    wrapper,
-    `import {unlinkSync} from 'node:fs';
-unlinkSync(process.env.PI_SUB_EXPECTED_SESSION_FILE);
-await import(${JSON.stringify(pathToFileURL(join(getPackageDir(), "dist/cli.js")).href)});`,
-  );
-  const report = await make(
-    {
-      cliPath: wrapper,
-      env: {
-        PI_CODING_AGENT_DIR: join(dir, "agent"),
-        WORKER_TEST_SLOW_CHILD: "1",
-        WORKER_TEST_CHILD_MARKER: marker,
-      },
-    },
-    first.sessionId,
-  ).run("Must not execute against empty history.");
-  expect(report.error).toMatch(/session identity|session file/);
-  await expect(readFile(marker)).rejects.toMatchObject({ code: "ENOENT" });
-}, 15000);
-
-test("native user message events do not acknowledge an input whose journal append fails", async () => {
-  const { make, session, dir, options } = await setup();
-  const first = await make().run("Original persisted instruction.");
-  expect(first.error).toBeUndefined();
-  const extension = join(dir, "fail-append.ts");
-  await writeFile(
-    extension,
-    `import {renameSync, mkdirSync} from 'node:fs';
-export default pi => pi.on('message_end', (event, ctx) => {
-  if (event.message.role !== 'user') return;
-  const file = ctx.sessionManager.getSessionFile();
-  renameSync(file, file + '.saved');
-  mkdirSync(file); // The subsequent native append must fail, including when tests run as root.
-});`,
-  );
-  const report = await make(
-    { args: [...options.args!, "-e", extension] },
-    first.sessionId,
-  ).run("Unwritten correction.");
-  expect(report).toMatchObject({
-    inputPersisted: false,
-    error: expect.stringContaining("EISDIR"),
-    usage: { totalTokens: 16 },
-  });
-  expect(await readFile(session + ".saved", "utf8")).not.toContain(
-    "Unwritten correction.",
-  );
-}, 20000);
 
 test("native JSON can exit zero on provider error; report still fails", async () => {
   const { make } = await setup({ WORKER_TEST_INTEGRATION: "1" });
@@ -305,9 +245,10 @@ test("native stop drains close and a different process can continue", async () =
     interrupted: true,
     inputPersisted: true,
   });
-  const report = await make({
-    env: { PI_CODING_AGENT_DIR: options.env!.PI_CODING_AGENT_DIR! },
-  }).run("continue after interruption");
+  const report = await make(
+    { env: { PI_CODING_AGENT_DIR: options.env!.PI_CODING_AGENT_DIR! } },
+    true,
+  ).run("continue after interruption");
   expect(report).toMatchObject({
     text: "fake response",
     interrupted: false,

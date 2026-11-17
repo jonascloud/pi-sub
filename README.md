@@ -28,7 +28,7 @@ The only configuration is `<agent-dir>/pi-sub-config.json`, normally `~/.pi/agen
 
 Strength is a rough local scale with workload anchors, not a benchmark score: 1–2 narrow mechanical work, 3–4 bounded routine implementation, 5–6 multi-file changes and moderate analysis, 7–8 complex design and debugging, 9–10 the hardest, highly uncertain work. Unused levels stay empty; `{}` disables delegation.
 
-Each task requests a minimum level. Dispatch picks the first natively available rung at or above it and fails explicitly if there is none. The ladder authorizes delegation independently of the parent's model scope; availability, credentials, supported thinking, project trust and ladder membership are rechecked before every execution, including continuations. Edits apply to the next execution without a reload.
+Each task requests a minimum level. On task creation, routing picks the first natively available rung at or above it and fails explicitly if there is none. The model and thinking level stay fixed for the task's lifetime, including queueing and continuations. Ladder edits affect new tasks, not existing ones or their authorization. Native execution capability can still fail. The ladder authorizes delegation independently of the parent's model scope.
 
 pi-sub reads the file but never writes it. To create or revise it, ask your coding agent to follow [the ladder setup guide](instructions/create-model-ladder.md), for example from this checkout:
 
@@ -42,7 +42,7 @@ pi @instructions/create-model-ladder.md "Help me create or revise my pi-sub mode
 | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `sub_task`    | Start bounded work with required `level` (integer 1–10) and `prompt`, plus optional `description`. Returns an ID immediately.                                                               |
 | `sub_message` | Send `{ id, message }`. Updates queued input or stops active execution, waits for closure, then continues the same session with the correction. Also answers ready, failed or paused tasks. |
-| `sub_result`  | Inspect `{ id }`. Optional `wait` and timeout in seconds only observe. `finish: true` explicitly accepts/removes a ready task.                                                              |
+| `sub_result`  | Inspect `{ id, wait?, timeout?, finish? }`, or page `{ report, offset?, limit? }`. `finish: true` explicitly accepts/removes a ready task.                                                              |
 | `sub_control` | `pause`, `continue` or `stop`, with optional `id`; omit it to control all applicable tasks. Stopping never rolls back side effects.                                                         |
 
 ```text
@@ -52,9 +52,11 @@ sub_message({ id: "<task-id>", message: "Use the production schema, then continu
 sub_result({ id: "<task-id>", finish: true })
 ```
 
-A wait only observes. It ends with a reply or failure, when its task pauses, at its timeout, or as soon as the user sends a message, so a waiting parent never holds the user back. None of these stops work. Reading a reply does not accept it, and a delivered reply needs no acknowledgement: the task stays open for follow-up until accepted or stopped. Accepted and stopped tasks cannot resume, but their results remain retrievable in the active parent session.
+A wait only observes. It ends with a reply or failure, when its task pauses, at its timeout, or as soon as the user sends a message, so a waiting parent never holds the user back. None of these stops work. Reading a reply does not accept it, and a delivered reply needs no acknowledgement: the task stays open for follow-up until accepted or stopped. Accepted and stopped tasks cannot resume; cached reports survive task removal until eviction or runtime teardown. If acceptance is the first delivery, it includes the result. Otherwise it confirms only the task ID, accepted status and available report ID. `/sub:stop` also names any final report IDs without repeating replies. There are no idempotent task receipts.
 
-Replies and failures arrive on their own. At the next safe turn boundary, or once when the parent is idle, pi-sub batches unannounced ones into one message; a complete tool return already counts as delivery. Large reports and batches are handed off as a reference to a private temporary file instead of being clipped. These files expire on session switch, fork, reload or shutdown, so preserve relevant findings before leaving the session.
+Replies and failures arrive on their own. At the next safe turn boundary, or once when the parent is idle, pi-sub batches unannounced ones into one message; a complete tool return already counts as delivery. Each completed execution has an immutable report ID. Serialized reports up to 2 KiB are inline; larger ones include a reference, a response preview of at most 512 bytes and an error preview of at most 240 bytes. A result or batch is at most 8 KiB; an oversized batch is cached as a report with a summary and reference.
+
+Page a report with `sub_result({ report: "<report-id>", offset: 0, limit: 4096 })`. This returns plain text and the next offset without executing a child. Offsets are zero-based UTF-8 byte boundaries; limits are bytes, default 4096, minimum 4 and maximum 4096. The parent runtime has one 16 MiB FIFO cache of UTF-8 report payloads; reads do not refresh it. Eviction returns “Report no longer available”, without recreating the report. A single report over 16 MiB spills to a private temporary file until runtime teardown. A batch also spills if caching it would evict a report it references; later FIFO eviction is unchanged. The budget excludes JS heap, native history, pending input and journals. Session switch, fork, reload or shutdown tears down the runtime; preserve relevant findings before leaving.
 
 ## Pause and continue
 
@@ -70,7 +72,7 @@ No ID means all applicable tasks. `/sub:pause` without an ID stops everything: i
 
 Pausing terminates the process (SIGTERM, then SIGKILL) and continuation restarts it on the same session. It does not undo writes or external effects.
 
-A failed execution leaves its task open. The parent receives the failure like a reply, and a message continues the session, resending instructions that never reached it. Nothing retries on its own. Only a lost session is final: a journal that is corrupt, replaced or gone.
+A failed execution leaves its task open. The parent receives the failure like a reply, and a message continues the session, resending instructions that never reached it. Nothing retries on its own. A lost or corrupt journal can prevent continuation.
 
 Up to four executions run concurrently. Queued, paused and ready tasks hold no process. Shutdown, reload and session replacement close all executions and delete the temporary workspace; reopening a saved conversation starts without tasks.
 
@@ -85,7 +87,7 @@ Usage is read from each child's saved journal after every execution and charged 
 - Children load normal Pi resources from the same profile and working directory, including `AGENTS.md` and project context, but not the parent's conversation, runtime-only registrations or tool filters. The delegation tools are excluded to prevent recursion.
 - `--approve` conveys project trust, **not** approval of individual tools. Children have no interactive UI: `confirm` returns `false` and other dialogs return `undefined`. The parent model cannot grant human authorization.
 - Separate processes are not a filesystem sandbox. Interruption and replay do not guarantee exactly-once external effects.
-- Process exit is not success: a reply requires a new saved assistant response. Continuations check the journal's identity and structure, not that its history is unchanged.
+- Process exit is not success: a reply requires a new saved assistant response.
 
 ## Development
 
