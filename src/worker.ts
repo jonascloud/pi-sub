@@ -1,15 +1,14 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage, Usage } from "@earendil-works/pi-ai";
+import type { Usage } from "@earendil-works/pi-ai";
 import {
   getPackageDir,
   parseSessionEntries,
   type JsonAgentSessionEvent,
   type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
-import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 import { addUsage } from "./usage.ts";
 
@@ -26,98 +25,98 @@ export interface WorkerOptions {
 }
 export type WorkerEvent = JsonAgentSessionEvent;
 export interface WorkerReport {
+  /** The last assistant text this execution saved. */
   text: string;
-  sessionFile: string;
-  /** Cumulative native session usage, never a per-process increment. */
+  /** Cumulative usage of the whole session, never a per-process increment. */
   usage?: Usage;
   error?: string;
   interrupted: boolean;
-  // Exact prompt evidence only. Native input transformations may make this
-  // unprovable; interrupted/failed executions then conservatively replay input.
+  /** The session gained a user message, so the input need not be sent again. */
   inputPersisted: boolean;
-  /** The journal is corrupt, substituted, rewritten or gone: nothing can continue it. */
+  /** A session file exists: the next execution continues it. */
+  saved: boolean;
+  /** A session that existed is gone: nothing can continue it. */
   sessionLost: boolean;
-  /** Native journal identity retained across fresh execution processes. */
-  sessionId?: string;
 }
 export interface Worker {
-  /** Resolves after process exit and bounded draining, or without spawning on preflight failure. */
+  /** Resolves once the process has exited, or without spawning if stopped first. Never rejects. */
   run(prompt: string): Promise<WorkerReport>;
+  /** Resolves once the execution has ended. */
   stop(): Promise<void>;
   onEvent(listener: (event: WorkerEvent) => void): () => void;
 }
 
 const excludedTools = "sub_task,sub_message,sub_result,sub_control";
 const stderrLimit = 16 * 1024;
-const recordLimit = 16 * 1024 * 1024;
-const terminateGrace = 1000;
-const killGrace = 2000;
+const killGrace = 1000;
 const drainGrace = 1000;
 
-/** One execution owns one child; only the native session survives continuations. */
+/**
+ * One execution is one `pi --mode json --print` process on the task's session.
+ * Its output is progress; the saved session is the result.
+ */
 export function createWorker(
   options: WorkerOptions,
   sessionFile: string,
-  expectedSessionId?: string,
+  continues = false,
 ): Worker {
   const listeners = new Set<(event: WorkerEvent) => void>();
   let execution: Promise<WorkerReport> | undefined;
-  let child: ChildProcessWithoutNullStreams | undefined;
   let stopRequested = false;
   let exited = false;
-  let processClosed = false;
-  let terminate: (() => Promise<void>) | undefined;
-  let stopping: Promise<void> | undefined;
+  let terminate = () => {};
 
   async function execute(prompt: string): Promise<WorkerReport> {
-    let lastAssistant: AssistantMessage | undefined;
-    let inputPersisted = false;
-    let failure: string | undefined;
-    let sessionLost = false;
+    let error: string | undefined;
     let stderr = "";
     const fail = (message: string) => {
-      failure ??= message;
+      error ??= message;
     };
-    const before = await readSession(sessionFile);
-    let sessionId = before.id;
-    const entries = new Map(before.entries.map((entry) => [entry.id, entry]));
-    const report = (usage?: Usage): WorkerReport => ({
-      text:
-        lastAssistant?.content
-          .filter((part) => part.type === "text")
-          .map((part) => part.text)
-          .join("\n") ?? "",
-      sessionFile,
-      usage,
-      ...(failure ? { error: failure } : {}),
-      interrupted: stopRequested,
-      inputPersisted,
-      sessionLost,
-      ...(sessionId ? { sessionId } : {}),
-    });
-    // Only a genuinely new task may start without a journal. Never let the
-    // native loader silently replace lost, substituted or damaged history.
-    if (
-      before.error ||
-      (expectedSessionId && before.id !== expectedSessionId)
-    ) {
-      // A read error may pass; damage and substitution of known history do not.
-      sessionLost = before.corrupt === true || !before.error;
-      fail(
-        before.error ??
-          (before.missing
-            ? "Native session file is missing"
-            : "Native session identity changed"),
+    const report = (
+      entries: SessionEntry[] | undefined,
+      known: ReadonlySet<string> = new Set(),
+      sessionLost = false,
+    ): WorkerReport => {
+      const fresh = (entries ?? []).flatMap((entry) =>
+        entry.type === "message" && !known.has(entry.id) ? [entry.message] : [],
       );
-      // A damaged preflight ledger is not a replacement cumulative snapshot.
-      // The coordinator keeps its last confirmed snapshot; no new work ran.
-      return report();
-    }
-    if (stopRequested) return report(aggregateUsage(before.entries));
+      const reply = fresh.findLast((message) => message.role === "assistant");
+      // Exit is not success: only a new saved reply that ended normally is.
+      if (!stopRequested && !error) {
+        const diagnostics = stderr.trim() ? `: ${stderr.trim()}` : "";
+        if (!reply) fail(`No new assistant response${diagnostics}`);
+        else if (reply.stopReason !== "stop")
+          fail(
+            (reply.errorMessage ||
+              `Native response ended with ${reply.stopReason}`) + diagnostics,
+          );
+      }
+      return {
+        text:
+          reply?.content
+            .filter((part) => part.type === "text")
+            .map((part) => part.text)
+            .join("\n") ?? "",
+        usage: entries && sessionUsage(entries),
+        ...(error ? { error } : {}),
+        interrupted: stopRequested,
+        inputPersisted: fresh.some((message) => message.role === "user"),
+        saved: entries !== undefined,
+        sessionLost,
+      };
+    };
 
     try {
+      const before = await readSession(sessionFile);
+      if (continues && !before) {
+        fail("Native session file is missing");
+        return report(before, undefined, true);
+      }
+      const known = new Set(before?.map((entry) => entry.id));
+      if (stopRequested) return report(before, known);
+
       // The parent's runtime, not whichever node happens to be first on PATH.
-      child = spawn(
+      const child = spawn(
         process.execPath,
         [
           options.cliPath
@@ -153,254 +152,92 @@ export function createWorker(
             PI_SUB_EXPECTED_PROVIDER: options.provider,
             PI_SUB_EXPECTED_MODEL: options.model,
             PI_SUB_EXPECTED_THINKING: options.thinking,
-            PI_SUB_EXPECTED_SESSION_FILE: resolve(options.cwd, sessionFile),
-            PI_SUB_EXPECTED_SESSION_ID: sessionId ?? "",
           },
           stdio: ["pipe", "pipe", "pipe"],
         },
       );
-      const stdout = new StringDecoder("utf8");
-      const diagnostics = new StringDecoder("utf8");
-      let pending = "";
-      let discarding = false;
-      let undrained = false;
-      let protocolFailed = false;
-      const protocolFailure = (message: string) => {
-        fail(message);
-        if (protocolFailed || processClosed) return;
-        protocolFailed = true;
-        // This is failure cleanup, not a caller-requested interruption. Keep
-        // draining and leave run pending if this bounded attempt fails.
-        void terminate?.().catch((error: unknown) => fail(String(error)));
-      };
-      const line = (value: string) => {
-        if (!value.trim()) return;
-        try {
-          const event = JSON.parse(value) as WorkerEvent | { type: "session" };
-          if (
-            !event ||
-            typeof event !== "object" ||
-            typeof event.type !== "string"
-          )
-            throw new Error("Expected JSON event object");
-          if (event.type === "session") return;
-          if (event.type === "message_end") {
-            // Native message events precede journal writes: progress is not
-            // persistence evidence, even for an exact copy of the input.
-            if (event.message.role === "assistant") {
-              if (!validAssistant(event.message))
-                throw new Error("Invalid assistant message");
-              lastAssistant = event.message;
-            }
-          }
-          for (const listener of listeners) {
-            try {
-              listener(event);
-            } catch {
-              /* Consumers cannot interrupt draining. */
-            }
-          }
-        } catch {
-          protocolFailure("Invalid native JSON output");
-        }
-      };
-      const consume = (value: string) => {
-        pending += value;
-        let index: number;
-        while ((index = pending.indexOf("\n")) !== -1) {
-          const record = pending.slice(0, index);
-          if (!discarding && record.length <= recordLimit)
-            line(record.replace(/\r$/, ""));
-          else protocolFailure("Native JSON record exceeds size limit");
-          pending = pending.slice(index + 1);
-          discarding = false;
-        }
-        if (pending.length > recordLimit) {
-          protocolFailure("Native JSON record exceeds size limit");
-          pending = "";
-          discarding = true;
-        }
-      };
-      let stdoutEnded = false;
-      const finishStdout = () => {
-        if (stdoutEnded) return;
-        stdoutEnded = true;
-        consume(stdout.end());
-        // Killing a writer or abandoning a held pipe can truncate the last
-        // progress frame. The saved journal still must validate; genuine
-        // protocol failures remain errors.
-        if (!stopRequested && !undrained && (pending || discarding))
-          protocolFailure("Incomplete native JSON output at EOF");
-      };
       const outcome = await new Promise<{
         code: number | null;
         signal: NodeJS.Signals | null;
-      }>((resolveClose) => {
-        let notifyClosed!: () => void;
-        const closed = new Promise<void>((resolve) => {
-          notifyClosed = resolve;
-        });
-        child!.stdout.on("data", (data: Buffer) => consume(stdout.write(data)));
-        child!.stdout.once("end", finishStdout);
-        child!.stdout.on("error", (error: Error) =>
-          protocolFailure(`Native stdout: ${error.message}`),
-        );
-        child!.stderr.on("error", (error: Error) =>
-          fail(`Native stderr: ${error.message}`),
-        );
-        child!.stderr.on("data", (data: Buffer) => {
-          stderr = (stderr + diagnostics.write(data)).slice(-stderrLimit);
-        });
-        child!.stdin.on("error", (error: Error) => {
-          if (!stopRequested) fail(`Native stdin: ${error.message}`);
-        });
-        child!.on("error", (error: Error) =>
-          fail(`Native process: ${error.message}`),
-        );
-        // The journal is final once the process is gone. Output is progress
-        // only, so a descendant holding an inherited pipe gets a bounded wait.
+      }>((closed) => {
+        let kill: ReturnType<typeof setTimeout> | undefined;
         let drain: ReturnType<typeof setTimeout> | undefined;
-        child!.once("exit", () => {
+        terminate = () => {
+          child.kill("SIGTERM");
+          kill ??= setTimeout(() => child.kill("SIGKILL"), killGrace);
+        };
+        // Frames end at LF only: model text may contain other line separators.
+        let pending = "";
+        child.stdout.setEncoding("utf8").on("data", (text: string) => {
+          const lines = (pending + text).split("\n");
+          pending = lines.pop()!;
+          for (const line of lines) {
+            let event: WorkerEvent | { type: "session" };
+            try {
+              event = JSON.parse(line);
+            } catch {
+              continue; // Progress only: a damaged frame is no failure.
+            }
+            if (typeof event?.type !== "string" || event.type === "session")
+              continue;
+            for (const listener of listeners) {
+              try {
+                listener(event);
+              } catch {
+                /* Observers cannot end an execution. */
+              }
+            }
+          }
+        });
+        child.stderr.setEncoding("utf8").on("data", (text: string) => {
+          stderr = (stderr + text).slice(-stderrLimit);
+        });
+        for (const stream of [child.stdin, child.stdout, child.stderr])
+          stream.on("error", () => {});
+        child.on("error", (cause) => fail(`Native process: ${cause.message}`));
+        // The session is final once the process is gone. A descendant holding
+        // an inherited pipe gets a bounded wait, not the execution.
+        child.once("exit", () => {
           exited = true;
           drain = setTimeout(() => {
-            undrained = true;
-            child!.stdout.destroy();
-            child!.stderr.destroy();
+            child.stdout.destroy();
+            child.stderr.destroy();
           }, drainGrace);
         });
-        child!.once("close", (code, signal) => {
+        child.once("close", (code, signal) => {
+          clearTimeout(kill);
           clearTimeout(drain);
-          processClosed = true;
-          notifyClosed();
-          finishStdout();
-          stderr = (stderr + diagnostics.end()).slice(-stderrLimit);
-          resolveClose({ code, signal });
+          exited = true;
+          terminate = () => {};
+          closed({ code, signal });
         });
-        terminate = () => {
-          if (processClosed) return Promise.resolve();
-          if (stopping) return stopping;
-          let killTimer: ReturnType<typeof setTimeout> | undefined;
-          let deadline: ReturnType<typeof setTimeout> | undefined;
-          stopping = new Promise<void>((resolveStop, rejectStop) => {
-            void closed.then(resolveStop);
-            deadline = setTimeout(() => {
-              rejectStop(
-                new Error(
-                  "Native process did not exit after SIGKILL; stop may be retried",
-                ),
-              );
-            }, terminateGrace + killGrace);
-            child!.kill("SIGTERM");
-            killTimer = setTimeout(() => {
-              if (processClosed) return;
-              try {
-                child!.kill("SIGKILL");
-              } catch (error) {
-                rejectStop(error);
-              }
-            }, terminateGrace);
-          }).finally(() => {
-            clearTimeout(killTimer);
-            clearTimeout(deadline);
-            stopping = undefined;
-          });
-          // A failed bounded stop attempt never settles the execution promise.
-          // Only the ChildProcess close callback above owns that boundary.
-          return stopping;
-        };
-        try {
-          child!.stdin.end(prompt);
-        } catch (error) {
-          fail(`Native stdin: ${String(error)}`);
-          child!.stdin.destroy();
-        }
+        child.stdin.end(prompt);
       });
-      // close, not agent_settled, is the boundary: the process has exited and
-      // its pipes are drained or abandoned.
-      if (!stopRequested && (outcome.code !== 0 || outcome.signal)) {
+      if (!stopRequested && (outcome.code !== 0 || outcome.signal))
         fail(
           `Native process exited ${outcome.signal ?? outcome.code}${stderr.trim() ? `: ${stderr.trim()}` : ""}`,
         );
-      }
-    } catch (error) {
-      fail(error instanceof Error ? error.message : String(error));
-      if (child && !processClosed) {
-        child.stdin.destroy();
-        child.stdout.resume();
-        child.stderr.resume();
-        await new Promise<void>((resolve) => {
-          child!.once("close", () => {
-            processClosed = true;
-            resolve();
-          });
-        });
-      }
-    }
 
-    const saved = await readSession(sessionFile);
-    if (saved.error) fail(saved.error);
-    if (saved.missing && (sessionId || !stopRequested))
-      fail("Native session file is missing");
-    if (sessionId && saved.id && saved.id !== sessionId)
-      fail("Native session identity changed");
-    // A journal that never existed loses nothing: a first start may repeat.
-    if (
-      saved.corrupt ||
-      (sessionId && (saved.missing || (saved.id && saved.id !== sessionId)))
-    )
-      sessionLost = true;
-    sessionId ??= saved.id;
-    // A damaged or foreign snapshot is not evidence for any of its records.
-    // Even a valid snapshot must not replace an already confirmed entry.
-    const changed = saved.entries.some((entry) => {
-      const previous = entries.get(entry.id);
-      return previous && JSON.stringify(previous) !== JSON.stringify(entry);
-    });
-    if (changed && !saved.error && saved.id === sessionId) {
-      fail("Native session entry changed");
-      sessionLost = true;
+      const after = await readSession(sessionFile);
+      // An interrupted first start may not have saved anything yet.
+      if (!after && (before || !stopRequested))
+        fail("Native session file is missing");
+      return report(after, known, !!before && !after);
+    } catch (cause) {
+      fail(cause instanceof Error ? cause.message : String(cause));
+      return report(undefined);
     }
-    const trusted =
-      !saved.error && !saved.missing && saved.id === sessionId && !changed;
-    for (const entry of trusted ? saved.entries : []) {
-      if (entries.has(entry.id) || entry.type !== "message") continue;
-      if (matchesInput(entry.message, prompt)) inputPersisted = true;
-      if (entry.message.role === "assistant") lastAssistant = entry.message;
-    }
-    if (!stopRequested) {
-      if (!lastAssistant)
-        fail(
-          `No new assistant response${stderr.trim() ? `: ${stderr.trim()}` : ""}`,
-        );
-      else if (lastAssistant.stopReason !== "stop")
-        fail(
-          `${lastAssistant.errorMessage || `Native response ended with ${lastAssistant.stopReason}`}${stderr.trim() ? `: ${stderr.trim()}` : ""}`,
-        );
-    }
-    // Retain confirmed records even if the final read is unusable. No partial
-    // records from a corrupt snapshot can establish their own provenance.
-    if (trusted)
-      for (const entry of saved.entries)
-        if (!entries.has(entry.id)) entries.set(entry.id, entry);
-    return report(aggregateUsage(entries.values()));
   }
 
   return {
     run(prompt) {
-      if (execution)
-        return Promise.reject(new Error("Worker can only run once"));
-      if (typeof prompt !== "string" || !prompt.trim())
-        return Promise.reject(new Error("Worker prompt must not be empty"));
-      execution = execute(prompt);
+      execution ??= execute(prompt);
       return execution;
     },
     async stop() {
-      if (!processClosed) {
-        // Must precede signal delivery, even during startup. A process that
-        // already exited on its own finished its execution: only draining remains.
-        if (!exited) stopRequested = true;
-        await terminate?.();
-      }
+      // A process that already exited on its own finished its execution.
+      if (!exited) stopRequested = true;
+      terminate();
       await execution;
     },
     onEvent(listener) {
@@ -412,147 +249,35 @@ export function createWorker(
   };
 }
 
-/** Read-only inspection; unlike SessionManager.open this cannot repair/rewrite files. */
-async function readSession(file: string): Promise<{
-  entries: SessionEntry[];
-  id?: string;
-  missing?: boolean;
-  corrupt?: boolean;
-  error?: string;
-}> {
+/** Read-only, and as tolerant as the native loader: malformed lines are skipped. */
+async function readSession(file: string): Promise<SessionEntry[] | undefined> {
   let contents: string;
   try {
     contents = await readFile(file, "utf8");
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT")
-      return { entries: [], missing: true };
-    return {
-      entries: [],
-      error: `Cannot read native session: ${String(error)}`,
-    };
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
   }
-  const entries: SessionEntry[] = [];
-  const ids = new Set<string>();
-  let header: string | undefined;
-  const parsed = parseSessionEntries(contents);
-  // The native parser deliberately skips malformed JSON. Detect that loss
-  // separately, without repairing the file or reconstructing native entries.
-  let corrupt =
-    parsed.length !== contents.split("\n").filter((line) => line.trim()).length;
-  for (const value of parsed) {
-    try {
-      if (!header) {
-        if (value?.type !== "session" || typeof value.id !== "string")
-          throw new Error("Missing session header");
-        header = value.id;
-      } else {
-        if (
-          !value ||
-          typeof value.id !== "string" ||
-          typeof value.type !== "string" ||
-          (value.type === "message" &&
-            (!value.message || typeof value.message.role !== "string"))
-        )
-          throw new Error("Invalid session entry");
-        if (
-          value.type === "message" &&
-          value.message.role === "assistant" &&
-          !validAssistant(value.message)
-        )
-          throw new Error("Invalid assistant message");
-        const entry = value as SessionEntry;
-        if (ids.has(entry.id)) throw new Error("Duplicate session entry");
-        ids.add(entry.id);
-        const usage = entryUsage(entry);
-        if (usage !== undefined && !validUsage(usage))
-          throw new Error("Invalid usage");
-        entries.push(entry);
-      }
-    } catch {
-      corrupt = true;
-    }
-  }
-  return {
-    entries,
-    id: header,
-    ...(!header || corrupt
-      ? { corrupt: true, error: "Corrupt native session file" }
-      : {}),
-  };
-}
-
-function matchesInput(
-  message: { role: string; content?: unknown },
-  prompt: string,
-): boolean {
-  if (message.role !== "user") return false;
-  const content = message.content;
-  const text =
-    typeof content === "string"
-      ? content
-      : Array.isArray(content)
-        ? content
-            .filter(
-              (part) => part?.type === "text" && typeof part.text === "string",
-            )
-            .map((part) => part.text)
-            .join("")
-        : undefined;
-  // CLI stdin trims boundary whitespace. Do not acknowledge unrelated extension
-  // startup/follow-up messages, or guess how native input transforms rewrote ours.
-  return text !== undefined && text.trim() === prompt.trim();
-}
-
-function validAssistant(value: AssistantMessage): boolean {
-  return (
-    Array.isArray(value.content) &&
-    value.content.every(
-      (part) =>
-        part &&
-        typeof part.type === "string" &&
-        (part.type !== "text" || typeof part.text === "string"),
-    ) &&
-    typeof value.stopReason === "string" &&
-    (value.errorMessage === undefined || typeof value.errorMessage === "string")
+  return parseSessionEntries(contents).filter(
+    (entry): entry is SessionEntry =>
+      entry.type !== "session" && typeof entry.id === "string",
   );
 }
 
-function entryUsage(entry: SessionEntry): Usage | undefined {
-  return entry.type === "usage" ||
-    entry.type === "compaction" ||
-    entry.type === "branch_summary"
-    ? entry.usage
-    : entry.type === "message" &&
-        (entry.message.role === "assistant" ||
-          entry.message.role === "toolResult")
-      ? entry.message.usage
-      : undefined;
-}
-
-function validUsage(value: Usage): boolean {
-  if (!value || !value.cost) return false;
-  const finite = (number: unknown) =>
-    typeof number === "number" && Number.isFinite(number);
-  return (
-    ["input", "output", "cacheRead", "cacheWrite", "totalTokens"].every((key) =>
-      finite(value[key as keyof Usage]),
-    ) &&
-    ["input", "output", "cacheRead", "cacheWrite", "total"].every((key) =>
-      finite(value.cost[key as keyof Usage["cost"]]),
-    ) &&
-    (value.reasoning === undefined || finite(value.reasoning)) &&
-    (value.cacheWrite1h === undefined || finite(value.cacheWrite1h)) &&
-    (value.cost.totalFromProvider === undefined ||
-      typeof value.cost.totalFromProvider === "boolean")
-  );
-}
-
-function aggregateUsage(entries: Iterable<SessionEntry>): Usage | undefined {
-  let usage: Usage | undefined;
+function sessionUsage(entries: readonly SessionEntry[]): Usage | undefined {
+  let total: Usage | undefined;
   for (const entry of entries) {
-    const value = entryUsage(entry);
-    if (!value) continue;
-    usage = addUsage(usage, value);
+    const usage =
+      entry.type === "usage" ||
+      entry.type === "compaction" ||
+      entry.type === "branch_summary"
+        ? entry.usage
+        : entry.type === "message" &&
+            (entry.message.role === "assistant" ||
+              entry.message.role === "toolResult")
+          ? entry.message.usage
+          : undefined;
+    if (usage) total = addUsage(total, usage);
   }
-  return usage;
+  return total;
 }

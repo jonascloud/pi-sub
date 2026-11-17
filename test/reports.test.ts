@@ -1,205 +1,226 @@
-import { afterEach, beforeEach, expect, test, vi } from "vitest";
-import * as fs from "node:fs";
-import { dirname } from "node:path";
+import { afterEach, expect, test } from "vitest";
 import type { TaskView } from "../src/coordinator.ts";
+import { REPORT_CACHE_BYTES, ReportStore } from "../src/report-store.ts";
 import {
-  deliveredFile,
-  handoff,
-  reportDetails,
-  reportResult,
-  taskMetadata,
-  taskReport,
+  captureReport,
+  ENVELOPE_BYTES,
+  excerpt,
+  INLINE_BYTES,
+  oneLine,
+  PREVIEW_BYTES,
+  readReport,
+  replyBatch,
+  sanitize,
+  errorResult,
+  toolResult,
 } from "../src/reports.ts";
-import { Workspace } from "../src/workspace.ts";
 
-vi.mock("node:fs", async (original) => ({
-  ...(await original<typeof import("node:fs")>()),
-}));
-let workspace: Workspace;
-beforeEach(() => {
-  workspace = new Workspace();
-});
+let store = new ReportStore();
 afterEach(() => {
-  vi.restoreAllMocks();
-  workspace.dispose();
+  store.dispose();
+  store = new ReportStore();
 });
 const task: TaskView = {
   id: "task-1",
-  description: "Review",
   level: 3,
-  execution: { provider: "test", model: "fake", thinking: "off" },
+  description: "Review changes",
+  execution: { provider: "p", model: "m", thinking: "off" },
   sessionFile: "native.jsonl",
+  status: "ready",
+  activity: "",
   turns: 1,
   toolUses: 0,
   tokens: 1,
   elapsedMs: 1,
-  response: "Small response",
-  status: "ready",
-  outcome: "reply",
-  activity: "",
-  reply: { id: "reply-1", delivered: false },
+  response: "Question?\nImportant detail.",
+  unsent: 0,
+  delivered: false,
 };
-const envelope = (value: ReturnType<typeof reportResult>) =>
-  JSON.parse(value.content[0]!.text);
+const capture = (fields: Partial<TaskView> = {}) => {
+  const value = { ...task, ...fields };
+  return { ...value, ...captureReport(value, store) };
+};
+function complete(id: string) {
+  let text = "",
+    offset = 0;
+  while (true) {
+    const page = store.read(id, offset);
+    text += page.text;
+    if (page.next === undefined) return text;
+    offset = page.next;
+  }
+}
 
-test("inline content is the only full body; diagnostics do not require a workspace directory", () => {
-  vi.spyOn(fs, "mkdtempSync").mockImplementation(() => {
-    throw new Error("No disk");
+test("short reports stay inline, with one immutable reference and compact diagnostics", () => {
+  const saved = capture();
+  const result = toolResult(saved, store);
+  expect(JSON.parse(result.content[0]!.text)).toEqual({
+    id: task.id,
+    description: task.description,
+    status: "ready",
+    response: task.response,
+    report: saved.report,
   });
-  const value = { ...task, pendingInput: ["Unsent correction"] };
-  const result = reportResult(value, workspace);
-  expect(envelope(result)).toEqual(taskReport(value));
-  expect(reportDetails(result.details)).toEqual(taskMetadata(value));
-  expect(result.details.report).not.toHaveProperty("response");
-  expect(result.details.report).not.toHaveProperty("pendingInput");
-  expect(reportDetails(result.details, result.content[0]!.text)).toMatchObject({
-    response: value.response,
-    pendingInput: value.pendingInput,
+  expect(saved.report.bytes).toBeLessThan(INLINE_BYTES);
+  expect(JSON.parse(complete(saved.report.id))).toMatchObject({
+    response: task.response,
   });
-  expect(reportResult("Failure", workspace).details).not.toBe("Failure");
-});
-
-test.each(["x".repeat(60000), "漢字🙂\n".repeat(5000)])(
-  "oversized reports are complete temporary files, not duplicated in history (%#)",
-  (response) => {
-    const value = {
-      ...task,
-      response: response + "END_OF_REPORT",
-      error: "error\n".repeat(3000) + "END_OF_ERROR",
-      pendingInput: ["UNSENT_INSTRUCTION"],
-    };
-    const result = reportResult(value, workspace);
-    const ref = envelope(result);
-    expect(ref).toMatchObject({
+  expect(result.details.tasks).toMatchObject([
+    {
       id: task.id,
       status: "ready",
-      outcome: "reply",
-      errors: 1,
-    });
-    expect(ref.note).toContain("Temporary");
-    expect(Buffer.byteLength(result.content[0]!.text)).toBeLessThanOrEqual(
-      50 * 1024,
-    );
-    const text = fs.readFileSync(ref.file, "utf8");
-    for (const body of [value.response, value.error, ...value.pendingInput])
-      expect(text).toContain(body);
-    const stored = JSON.stringify(result.details);
-    for (const marker of [
-      "END_OF_REPORT",
-      "END_OF_ERROR",
-      "UNSENT_INSTRUCTION",
-    ])
-      expect(stored).not.toContain(marker);
-    expect(stored.length).toBeLessThan(2000);
-    expect(fs.statSync(ref.file).mode & 0o777).toBe(0o600);
-    expect(fs.statSync(dirname(ref.file)).mode & 0o777).toBe(0o700);
-    expect(deliveredFile(result.details, result.content[0]!.text)).toBe(true);
-    expect(deliveredFile(result.details, "Partial reference")).toBe(false);
-  },
-);
-
-test("large batches use one bounded reference", () => {
-  const tasks = Array.from({ length: 600 }, (_, i) => ({
-    ...task,
-    id: `task-${i}`,
-    description: "d".repeat(200),
-  }));
-  const result = reportResult(tasks, workspace);
-  const ref = envelope(result);
-  expect(ref).toMatchObject({ count: 600, errors: 0 });
-  expect(Buffer.byteLength(result.content[0]!.text)).toBeLessThanOrEqual(
-    50 * 1024,
-  );
-  const text = fs.readFileSync(ref.file, "utf8");
-  for (const task of tasks) expect(text).toContain(`"id": "${task.id}"`);
+      preview: oneLine(task.response),
+      report: saved.report,
+    },
+  ]);
+  expect(result.details.tasks[0]).not.toHaveProperty("response");
+  expect(JSON.parse(toolResult([], store).content[0]!.text)).toEqual([]);
+  const later = capture({ response: "Different answer" });
+  expect(later.report.id).not.toBe(saved.report.id);
+  expect(JSON.parse(complete(saved.report.id)).response).toBe(task.response);
 });
 
-test("reports survive follow-up within the runtime and are removed with journals at disposal", () => {
-  const value = { ...task, response: "Saved answer\n".repeat(6000) };
-  const first = envelope(reportResult(value, workspace));
-  const again = envelope(
-    reportResult(
-      { ...value, reply: { ...value.reply!, delivered: true } },
-      workspace,
+test("only acceptance after delivery omits the reply; inspecting or first accepting still delivers it", () => {
+  const saved = capture({
+    response: "important evidence ".repeat(70),
+    status: "failed",
+    error: "failure",
+  });
+  const body = (view: TaskView) =>
+    JSON.parse(toolResult(view, store).content[0]!.text);
+  const accepted = { ...saved, status: "accepted" as const };
+  expect(body(accepted)).toMatchObject({
+    response: saved.response,
+    error: saved.error,
+    report: saved.report,
+  });
+  expect(body({ ...saved, delivered: true })).toEqual(body(saved));
+  expect(body({ ...accepted, delivered: true })).toEqual({
+    id: saved.id,
+    status: "accepted",
+    report: { id: saved.report.id },
+  });
+  expect(JSON.parse(complete(saved.report.id)).response).toBe(saved.response);
+});
+
+test("large answers and errors leave previews, but all evidence is readable without another model call", () => {
+  const response = "Evidence 漢字\n".repeat(3000) + "END_OF_ANSWER";
+  const error = "Failure 😀\n".repeat(3000) + "END_OF_ERROR";
+  const saved = capture({ status: "failed", response, error, unsent: 2 });
+  expect(Buffer.byteLength(saved.response)).toBeLessThanOrEqual(PREVIEW_BYTES);
+  expect(Buffer.byteLength(saved.error!)).toBeLessThanOrEqual(240);
+  expect(saved.response).toContain("…");
+  expect(JSON.parse(complete(saved.report.id))).toMatchObject({
+    response,
+    error,
+    unsent: 2,
+  });
+  for (const text of [
+    toolResult(saved, store).content[0]!.text,
+    replyBatch([saved], store).content,
+  ]) {
+    expect(Buffer.byteLength(text)).toBeLessThanOrEqual(ENVELOPE_BYTES);
+    expect(text).toContain(saved.report.id);
+    expect(text).not.toContain("END_OF_ANSWER");
+    expect(text).not.toContain("END_OF_ERROR");
+    expect(text).not.toContain("Ask the subagent");
+  }
+  const batch = replyBatch([saved], store);
+  expect(batch.content.indexOf("Failure")).toBeLessThan(
+    batch.content.indexOf("Evidence"),
+  );
+  expect(JSON.stringify(batch.details)).not.toContain("END_OF_ANSWER");
+  const page = readReport(store, saved.report.id, 0, 16);
+  expect(page.content[0]!.text).toContain("Next: sub_result");
+  expect(page.details.report).not.toHaveProperty("text");
+});
+
+test("one envelope budget bounds batches and metadata, including JSON escape expansion", () => {
+  const tasks = Array.from({ length: 60 }, (_, i) =>
+    capture({
+      id: `task-${i}`,
+      description: "label".repeat(500),
+      response: "\x00".repeat(2000),
+      error: '"\\\n'.repeat(2000),
+      status: "failed",
+    }),
+  );
+  const result = toolResult(tasks, store);
+  const batch = replyBatch(tasks, store);
+  for (const text of [result.content[0]!.text, batch.content]) {
+    expect(Buffer.byteLength(text)).toBeLessThanOrEqual(ENVELOPE_BYTES);
+    const ref = JSON.parse(text);
+    expect(ref.summary).toContain("60");
+    const full = complete(ref.report.id);
+    expect(full).toContain("task-59");
+    expect(full).toContain(tasks[59]!.report.id);
+  }
+  expect(result.details.tasks).toHaveLength(8);
+  expect(batch.details.tasks).toHaveLength(8);
+  const all = JSON.parse(
+    complete(JSON.parse(result.content[0]!.text).report.id),
+  );
+  expect(all).toHaveLength(60);
+  const error = errorResult("e".repeat(100000), store);
+  expect(Buffer.byteLength(error.content[0]!.text)).toBeLessThanOrEqual(
+    ENVELOPE_BYTES,
+  );
+  expect(complete(JSON.parse(error.content[0]!.text).report.id)).toBe(
+    "e".repeat(100000),
+  );
+});
+
+test("packaging an oversized handoff cannot evict the reports needed to read it", () => {
+  const tasks = Array.from({ length: 20 }, (_, i) =>
+    capture({ id: `t-${i}`, response: "x".repeat(2500) + i }),
+  );
+  store.put(
+    "f".repeat(
+      REPORT_CACHE_BYTES - tasks.reduce((n, task) => n + task.report.bytes, 0),
     ),
   );
-  expect(again.file).toBe(first.file);
-  const next = envelope(
-    reportResult({ ...value, response: value.response + "More" }, workspace),
-  );
-  expect(next.file).not.toBe(first.file);
-  expect(fs.readFileSync(first.file, "utf8")).toContain(value.response);
-  const sessions = workspace.sessions;
-  fs.writeFileSync(sessions + "/journal.jsonl", "history");
-  const root = dirname(sessions);
-  workspace.dispose();
-  expect(fs.existsSync(root)).toBe(false);
-  expect(fs.existsSync(first.file)).toBe(false);
-  expect(() => workspace.saveReport("later")).toThrow("closed");
-  expect(() => workspace.sessions).toThrow("closed");
-});
-
-test("workspaces do not share report ownership", () => {
-  const other = new Workspace();
-  try {
-    const first = workspace.saveReport("same report");
-    const second = other.saveReport("same report");
-    expect(second).not.toBe(first);
-    workspace.dispose();
-    expect(fs.readFileSync(second, "utf8")).toBe("same report");
-  } finally {
-    other.dispose();
+  for (const text of [
+    toolResult(tasks, store).content[0]!.text,
+    replyBatch(tasks, store).content,
+  ]) {
+    const ref = JSON.parse(text).report;
+    expect(ref.file).toBeDefined();
+    expect(complete(ref.id)).toContain(tasks[0]!.report.id);
+    for (const [i, task] of tasks.entries())
+      expect(JSON.parse(complete(task.report.id)).response).toBe(
+        "x".repeat(2500) + i,
+      );
   }
-});
-
-test("cached reports need no further writes", () => {
-  const value = { ...task, response: "x".repeat(60000) };
-  const first = reportResult(value, workspace);
-  const writes = ["mkdirSync", "openSync", "writeFileSync"] as const;
-  for (const method of writes)
-    vi.spyOn(fs, method).mockImplementation(() => {
-      throw new Error("ENOSPC");
-    });
-  expect(reportResult(value, workspace)).toEqual(first);
-  for (const method of writes) expect(fs[method]).not.toHaveBeenCalled();
-});
-
-test("failed writes do not yield references or cache partial data; receipts remain the source for retry", () => {
-  const value = { ...task, response: "Complete evidence\n".repeat(6000) };
-  const write = fs.writeFileSync;
-  let partial = "";
-  const open = fs.openSync;
-  vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => {
-    partial = String(file);
-    return open(file, flags, mode);
-  });
-  vi.spyOn(fs, "writeFileSync").mockImplementation((file) => {
-    write(file, "Partial");
-    throw new Error("ENOSPC: no space left on device");
-  });
-  const failed = reportResult(value, workspace);
-  expect(failed.isError).toBe(true);
-  expect(envelope(failed)).toMatchObject({
-    id: value.id,
-    status: "ready",
-    reportError: expect.stringContaining("ENOSPC"),
-  });
-  expect(envelope(failed)).not.toHaveProperty("file");
-  expect(failed.details.report).not.toHaveProperty("response");
-  expect(deliveredFile(failed.details, failed.content[0]!.text)).toBe(false);
-  expect(fs.existsSync(partial)).toBe(false);
-  vi.restoreAllMocks();
-  const retry = reportResult(value, workspace);
-  expect(fs.readFileSync(envelope(retry).file, "utf8")).toContain(
-    value.response,
+  store.put("z"); // The handoff did not pin or refresh its members.
+  expect(() => store.read(tasks[0]!.report.id)).toThrow(
+    "Report no longer available",
   );
 });
 
-test("handoff limits cover bytes, lines and the complete reference", () => {
-  expect(handoff("x".repeat(51200), "full", workspace).file).toBeUndefined();
-  expect(handoff("x".repeat(51201), "full", workspace).file).toBeDefined();
-  expect(handoff("a\n".repeat(2000), "full", workspace).file).toBeDefined();
-  expect(() =>
-    handoff("x".repeat(1000), "full", workspace, { maxBytes: 10, maxLines: 1 }),
-  ).toThrow("reference exceeds");
+test("pages stay small even for escaped controls and preserve character boundaries", () => {
+  const text = '\0\\"\n😀漢'.repeat(3000);
+  const ref = store.put(text);
+  let offset = 0;
+  do {
+    const result = readReport(store, ref.id, offset);
+    expect(Buffer.byteLength(result.content[0]!.text)).toBeLessThanOrEqual(
+      ENVELOPE_BYTES,
+    );
+    expect(result.content[0]!.text).not.toContain("�");
+    const next = result.details.report.next;
+    if (next === undefined) break;
+    offset = next;
+  } while (true);
+  expect(complete(ref.id)).toBe(text);
+  expect(excerpt("a😀z", 5)).toBe("a…");
+  expect(excerpt("exact", 5)).toBe("exact");
+  expect(excerpt("a�".repeat(20), 7)).toBe("a�…");
+});
+
+test("text for the screen carries no terminal commands or control characters", () => {
+  const unsafe =
+    "\x1b[31mVisible\x1b[0m\x1b]8;;https://evil.test\x07link\x1b]8;;\x07\x1b_Gpayload\x1b\\\x07\b\r\nnext";
+  expect(sanitize(unsafe)).toBe("Visiblelink\nnext");
+  expect(oneLine(unsafe)).toBe("Visiblelink next");
+  expect(oneLine("x".repeat(500))).toBe("x".repeat(159) + "…");
 });

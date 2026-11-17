@@ -15,21 +15,24 @@ import {
   type Ladder,
   availableExecutions,
   availableModels,
-  checkRetained,
   ladderPath,
   loadLadder,
-  parseReference,
   selectExecution,
-  validateLadder,
 } from "../src/models.ts";
 
 let dir: string;
-const ladder: Ladder = {
+const config = {
   "2": "p/cheap:off",
   "6": "p/main:low",
   "8": "p/main:high",
   "10": "p/top:max",
 };
+const ladder: Ladder = [
+  { provider: "p", model: "cheap", thinking: "off", power: 2 },
+  { provider: "p", model: "main", thinking: "low", power: 6 },
+  { provider: "p", model: "main", thinking: "high", power: 8 },
+  { provider: "p", model: "top", thinking: "max", power: 10 },
+];
 const available: AvailableModel[] = [
   { provider: "p", model: "cheap", thinking: ["off"] },
   { provider: "p", model: "main", thinking: ["low", "high"] },
@@ -46,12 +49,25 @@ afterEach(async () => {
 });
 
 describe("model ladder", () => {
-  it("parses first slash and last colon, requiring explicit native thinking", () => {
-    expect(parseReference("openrouter/vendor/model:free:high")).toEqual({
-      provider: "openrouter",
-      model: "vendor/model:free",
-      thinking: "high",
-    });
+  it("validates every rung and parses references at the file boundary", async () => {
+    const path = ladderPath();
+    await mkdir(dirname(path));
+    await writeFile(
+      path,
+      JSON.stringify({
+        "10": "openrouter/vendor/model:free:high",
+        "1": "p/m:off",
+      }),
+    );
+    expect(loadLadder(path)).toEqual([
+      { provider: "p", model: "m", thinking: "off", power: 1 },
+      {
+        provider: "openrouter",
+        model: "vendor/model:free",
+        thinking: "high",
+        power: 10,
+      },
+    ]);
     for (const thinking of [
       "off",
       "minimal",
@@ -60,28 +76,10 @@ describe("model ladder", () => {
       "high",
       "xhigh",
       "max",
-    ])
-      expect(parseReference(`p/m:${thinking}`).thinking).toBe(thinking);
-    for (const text of [
-      "",
-      "p/m",
-      "/m:low",
-      "p/:low",
-      "p/m:",
-      "p/m:auto",
-      "p/m:LOW",
-      " p/m:low",
-      "p/m:low\n",
-      "p/a b:low",
-      "p\t/m:low",
-      "p/m:\u00a0low",
-    ])
-      expect(() => parseReference(text), text).toThrow();
-  });
-
-  it("accepts only canonical integer rungs and exact model references", () => {
-    expect(validateLadder({})).toEqual({});
-    expect(validateLadder(ladder)).toEqual(ladder);
+    ]) {
+      await writeFile(path, JSON.stringify({ "1": `p/m:${thinking}` }));
+      expect(loadLadder(path)[0].thinking).toBe(thinking);
+    }
     for (const key of [
       "0",
       "11",
@@ -94,24 +92,35 @@ describe("model ladder", () => {
       "-1",
       "1.5",
       "version",
-      "approved",
-      "available",
-      "candidates",
-    ])
-      expect(() => validateLadder({ [key]: ladder["6"] }), key).toThrow();
+    ]) {
+      await writeFile(path, JSON.stringify({ [key]: "p/m:low" }));
+      expect(() => loadLadder(path), key).toThrow(/Invalid ladder rung/);
+    }
     for (const entry of [
       null,
       [],
       {},
       1,
-      undefined,
+      "",
       "p/m",
+      "/m:low",
+      "p/:low",
+      "p/m:",
       "p/m:auto",
-      { model: "p/m:low" },
-    ])
-      expect(() => validateLadder({ "6": entry })).toThrow();
-    for (const value of [null, [], "{}", 1])
-      expect(() => validateLadder(value)).toThrow();
+      "p/m:LOW",
+      " p/m:low",
+      "p/m:low\n",
+      "p/a b:low",
+      "p\t/m:low",
+      "p/m:\u00a0low",
+    ]) {
+      await writeFile(path, JSON.stringify({ "1": "p/m:off", "10": entry }));
+      expect(() => loadLadder(path), String(entry)).toThrow(/Invalid model/);
+    }
+    for (const value of [null, [], "{}", 1]) {
+      await writeFile(path, JSON.stringify(value));
+      expect(() => loadLadder(path)).toThrow(/Expected ladder object/);
+    }
   });
 
   it("uses the first currently available configured rung at or above the minimum", () => {
@@ -129,7 +138,7 @@ describe("model ladder", () => {
     expect(selectExecution(ladder, 9, available).power).toBe(10);
     expect(() => selectExecution(ladder, 1, [])).toThrow(/No available/);
     expect(() => selectExecution(ladder, 7, available.slice(0, 1))).toThrow();
-    expect(() => selectExecution({}, 1, available)).toThrow();
+    expect(() => selectExecution([], 1, available)).toThrow();
     expect(() =>
       selectExecution(ladder, 1, [
         { provider: "other", model: "main", thinking: ["low"] },
@@ -149,8 +158,12 @@ describe("model ladder", () => {
       [ladder, [{ provider: "p", model: "main", thinking: ["off"] }], []],
       [ladder, [{ provider: "other", model: "main", thinking: ["high"] }], []],
       [ladder, [], []],
-      [{}, available, []],
-      [{ "1": "p/cheap:off" }, available, [1]],
+      [[], available, []],
+      [
+        [{ provider: "p", model: "cheap", thinking: "off", power: 1 }],
+        available,
+        [1],
+      ],
     ];
     for (const [configured, native, powers] of cases) {
       expect(
@@ -170,23 +183,6 @@ describe("model ladder", () => {
     }
   });
 
-  it("retains an execution only while available and configured at or above its level", () => {
-    const main = { provider: "p", model: "main", thinking: "low" } as const;
-    expect(() => checkRetained(ladder, 6, main, available)).not.toThrow();
-    expect(() => checkRetained(ladder, 3, main, available)).not.toThrow();
-    expect(() => checkRetained(ladder, 7, main, available)).toThrow(
-      /minimum level/,
-    );
-    expect(() =>
-      checkRetained(ladder, 6, { ...main, thinking: "high" }, [
-        { provider: "p", model: "main", thinking: ["low"] },
-      ]),
-    ).toThrow(/no longer available/);
-    expect(() => checkRetained({}, 1, main, available)).toThrow(
-      /minimum level/,
-    );
-  });
-
   it("uses the configured profile and reports a missing ladder without creating files", async () => {
     const path = ladderPath();
     expect(path).toBe(join(dir, "profile", "pi-sub-config.json"));
@@ -202,10 +198,17 @@ describe("model ladder", () => {
     await mkdir(dirname(path));
     const ignore = join(dirname(path), ".gitignore");
     await writeFile(ignore, "# operator rules\nsettings.json\n");
-    for (const value of [ladder, { "7": "p/main:high" }, {}]) {
+    for (const [value, expected] of [
+      [config, ladder],
+      [
+        { "7": "p/main:high" },
+        [{ provider: "p", model: "main", thinking: "high", power: 7 }],
+      ],
+      [{}, []],
+    ] as const) {
       const source = JSON.stringify(value);
       await writeFile(path, source);
-      expect(loadLadder(path)).toEqual(value);
+      expect(loadLadder(path)).toEqual(expected);
       expect(await readFile(path, "utf8")).toBe(source);
     }
     expect(await readFile(ignore, "utf8")).toBe(

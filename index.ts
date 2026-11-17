@@ -1,50 +1,59 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import {
   defineTool,
+  type AgentBeforeSettleEvent,
   type ExtensionAPI,
   type ExtensionContext,
-  type AgentBeforeSettleEvent,
   type TurnEndEvent,
 } from "@earendil-works/pi-coding-agent";
-import { stripTerminalSequences } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { Coordinator, type TaskView } from "./src/coordinator.ts";
+import { Coordinator, isSettled, type TaskView } from "./src/coordinator.ts";
 import {
   availableExecutions,
   availableModels,
-  checkRetained,
   ladderPath,
   loadLadder,
   selectExecution,
+  STRENGTH_GUIDANCE,
 } from "./src/models.ts";
-import { Workspace } from "./src/workspace.ts";
-import { taskToolRenderers } from "./src/tool-view.ts";
-import { mountWidget } from "./src/widget.ts";
 import {
-  SUBAGENT_GUIDANCE,
-  renderReply,
-  renderStopped,
-} from "./src/messages.ts";
-import { pendingReplyBatch, deliveredReplies } from "./src/replies.ts";
-import { reportResult, type Reports } from "./src/reports.ts";
+  errorResult,
+  readReport,
+  replyBatch,
+  sanitize,
+  stoppedNotice,
+  toolResult,
+} from "./src/reports.ts";
+import { REPORT_READ_BYTES } from "./src/report-store.ts";
+import { renderReplies, taskToolRenderers } from "./src/views.ts";
+import { mountWidget } from "./src/widget.ts";
+
+/** One stable instruction section; replies carry observations, not a manual. */
+const guidance = `Delegate bounded work when it justifies briefing and integration. Give the goal, scope, constraints, success criteria and decisive context. Prefer paths to copied content. Children share files and native instructions, not your conversation or UI.
+Choose the minimum sufficient level, not the nearest available one. The ladder selects the execution.
+${STRENGTH_GUIDANCE}
+Replies may be questions. Read only needed report pages; preserve material findings before eviction or session change. A message continues a failed task with unsent input unless its session is lost. Do not repeat a retry that failed the same way.
+Interrupting you leaves children running. Do not resume children the user paused without their direction. Use reports internally; surface only material results, blockers or user decisions. No acknowledgement is needed.`;
 
 const reason = (error: unknown) =>
   error instanceof Error ? error.message : String(error);
 
 export default function piSub(pi: ExtensionAPI): void {
-  // Children load normal Pi resources, but must not recursively install their coordinator.
+  // Children load normal Pi resources, but must not delegate further.
   if (process.env.PI_SUB_CHILD === "1") return;
-  pi.registerMessageRenderer("pi-sub:response", renderReply);
-  pi.registerMessageRenderer("pi-sub:stopped", renderStopped);
-  const workspace = new Workspace();
+  pi.registerMessageRenderer("pi-sub:response", renderReplies);
   let context: ExtensionContext | undefined;
   let unmount: (() => void) | undefined;
+  let closed = false;
+  /** Child sessions are working data of this parent runtime, not an archive. */
+  let sessions: string | undefined;
   // Aborting the parent stops the parent, not its children. Their replies
   // then wait for the user instead of waking what was just stopped.
   let held = false;
   let dialogOpen = false;
-  const lifetime = new AbortController();
   let idleDelivery: ReturnType<typeof setImmediate> | undefined;
   // Steering messages reach the parent only after its current tool calls, so
   // observing a child must not hold them back.
@@ -64,76 +73,57 @@ export default function piSub(pi: ExtensionAPI): void {
     }
   };
 
-  const replyBatchFor = (ctx: ExtensionContext, messages?: AgentMessage[]) =>
-    lifetime.signal.aborted
-      ? undefined
-      : pendingReplyBatch(
-          coordinator.list(),
-          ctx.sessionManager,
-          messages,
-          workspace,
-        );
+  const notify = (text: string, type: "info" | "error" = "info") => {
+    if (closed) return;
+    if (context?.hasUI) context.ui.notify(sanitize(text), type);
+    else if (type === "error") console.error(sanitize(text));
+  };
+  /**
+   * Every reply and failure not yet handed to the parent, as one message.
+   * Handing it to Pi is delivery: nothing is announced twice.
+   */
+  const deliver = (hand: (batch: ReturnType<typeof replyBatch>) => void) => {
+    const tasks = coordinator
+      .list()
+      .filter((task) => isSettled(task.status) && !task.delivered);
+    if (!tasks.length) return;
+    hand(replyBatch(tasks, coordinator.reports));
+    for (const task of tasks) coordinator.markDelivered(task.id);
+  };
+  /** An idle parent is woken once per event-loop turn, however many replies arrived in it. */
   const scheduleReplies = () => {
-    if (idleDelivery || held || lifetime.signal.aborted) return;
-    // Coalesce this event-loop turn; never debounce, poll or queue a follow-up
-    // behind an active parent that may read or supersede these replies itself.
+    if (idleDelivery || held || closed) return;
     idleDelivery = setImmediate(() => {
       idleDelivery = undefined;
-      const ctx = context;
-      if (!ctx?.isIdle() || dialogOpen || held || lifetime.signal.aborted)
-        return;
+      if (!context?.isIdle() || dialogOpen || held || closed) return;
       try {
-        const batch = replyBatchFor(ctx);
-        if (batch) pi.sendMessage(batch, { triggerTurn: true });
+        deliver((batch) => pi.sendMessage(batch, { triggerTurn: true }));
       } catch (error) {
-        notify(
-          `Could not deliver subagent responses: ${reason(error)}`,
-          "error",
-        );
+        notify(`Could not deliver subagent replies: ${reason(error)}`, "error");
       }
     });
   };
+  const coordinator = new Coordinator({ onSettled: scheduleReplies });
 
-  const notify = (text: string, type: "info" | "error" = "info") => {
-    text = stripTerminalSequences(text).replace(
-      /[\x00-\x08\x0b-\x1f\x7f-\x9f]/g,
-      "",
-    );
-    if (lifetime.signal.aborted) return;
-    if (context?.hasUI) context.ui.notify(text, type);
-    else if (type === "error") console.error(text);
+  /** Tool results carry confirmed child usage into the parent session's totals. */
+  const charged = <T extends object>(result: T) => {
+    const usage = coordinator.drainUsage();
+    return usage ? { ...result, usage } : result;
   };
-  const coordinator = new Coordinator({
-    beforeStart(task) {
-      if (!context) throw new Error("No active parent context");
-      checkContext(context);
-      authorizeTask(task, context);
-    },
-    onReady: scheduleReplies,
-  });
-  const checkContext = (ctx: ExtensionContext) => {
-    if (lifetime.signal.aborted)
-      throw new Error("This Pi session is shutting down.");
-    if (!ctx.isProjectTrusted())
-      throw new Error("Trust this project before starting native subagents.");
-    context = ctx;
+  const respond = (value: TaskView | TaskView[]) => {
+    const result = toolResult(value, coordinator.reports);
+    for (const task of [value].flat()) coordinator.markDelivered(task.id);
+    return charged(result);
   };
-  const authorizeTask = (task: TaskView, ctx: ExtensionContext) =>
-    checkRetained(
-      loadLadder(ladderPath()),
-      task.level,
-      task.execution,
-      availableModels(ctx),
-    );
-  const authorized = (id: string, ctx: ExtensionContext) =>
-    authorizeTask(coordinator.get(id), ctx);
-  const observeTask = async (
+  const failed = (error: unknown) =>
+    charged(errorResult(reason(error), coordinator.reports));
+  /** Waits for the task, the timeout or the user, whichever comes first. */
+  const observe = async (
     id: string,
     signal: AbortSignal | undefined,
     timeoutMs: number,
-    ctx: ExtensionContext,
   ) => {
-    if (steers && ctx.hasPendingMessages()) return coordinator.inspect(id);
+    if (steers && context?.hasPendingMessages()) return coordinator.get(id);
     const yielded = new AbortController();
     waits.add(yielded);
     yieldToSteering();
@@ -145,20 +135,11 @@ export default function piSub(pi: ExtensionAPI): void {
       );
     } catch (error) {
       if (yielded.signal.aborted && !signal?.aborted)
-        return coordinator.inspect(id);
+        return coordinator.get(id);
       throw error;
     } finally {
       waits.delete(yielded);
     }
-  };
-  const response = (value: Reports, error = false) => {
-    const result = reportResult(value, workspace);
-    const usage = coordinator.drainUsage();
-    return {
-      ...result,
-      ...(error ? { isError: true } : {}),
-      ...(usage ? { usage } : {}),
-    };
   };
 
   pi.on("session_start", (_event, ctx) => {
@@ -168,67 +149,15 @@ export default function piSub(pi: ExtensionAPI): void {
       unmount = mountWidget(ctx.ui, coordinator);
     }
   });
-  pi.on("ui_prompt_start", () => {
-    dialogOpen = true;
-  });
-  pi.on("ui_prompt_end", () => {
-    dialogOpen = false;
-    scheduleReplies();
-  });
-  pi.on("input", (event, ctx) => {
-    if (event.source !== "interactive" && event.source !== "rpc") return;
-    context = ctx;
-    held = false;
-    if (event.streamingBehavior !== "steer") return;
-    steers++;
-    setImmediate(yieldToSteering);
-  });
-  pi.on("message_start", (event) => {
-    if (event.message.role === "user" && steers) steers--;
-  });
-  // Only complete model-visible context acknowledges a reply. Announcements
-  // and boundary proposals alone must not collapse its outstanding widget row.
-  pi.on("context", (event) => {
-    if (lifetime.signal.aborted) return;
-    for (const message of event.messages)
-      for (const reply of deliveredReplies(message))
-        coordinator.markDelivered(reply.id, reply.replyId);
-  });
-  const deliverAtBoundary = (
-    event: TurnEndEvent | AgentBeforeSettleEvent,
-    ctx: ExtensionContext,
-  ) => {
-    context = ctx;
-    if (event.outcome !== "completed" || ctx.signal?.aborted || dialogOpen)
-      return;
-    const batch = replyBatchFor(ctx, [
-      ...event.context.contextMessages,
-      ...event.context.pendingMessages,
-    ]);
-    if (!batch) return;
-    return {
-      entries: [
-        ...event.entries,
-        { type: "custom_message" as const, ...batch },
-      ],
-      // Natural tool/queue continuation satisfies this request; Pi does not add
-      // another turn on top of it.
-      continue: true,
-    };
-  };
-  pi.on("turn_end", deliverAtBoundary);
-  pi.on("agent_before_settle", deliverAtBoundary);
-  pi.on("turn_start", (_event, ctx) => {
-    context = ctx;
-  });
-  pi.on("agent_settled", (event, ctx) => {
-    context = ctx;
-    steers = 0;
-    if (event.aborted) held = true;
-    else scheduleReplies(); // Includes replies arriving after the final boundary.
+  pi.on("session_shutdown", async () => {
+    closed = true;
+    if (idleDelivery) clearImmediate(idleDelivery);
+    clearInterval(steerWatch);
+    unmount?.();
+    await coordinator.dispose();
+    if (sessions) rmSync(sessions, { recursive: true, force: true });
   });
   pi.on("before_agent_start", (event, ctx) => {
-    context = ctx;
     let availability: string;
     try {
       const max = availableExecutions(
@@ -241,71 +170,105 @@ export default function piSub(pi: ExtensionAPI): void {
     }
     // Providers cache the prompt as a prefix and some resend the whole
     // conversation when it changes: task state never belongs here.
-    event.systemPromptOptions.sections.pi_sub = `${SUBAGENT_GUIDANCE}\n\n${availability}`;
+    event.systemPromptOptions.sections.pi_sub = `${guidance}\n\n${availability}`;
   });
-  pi.on("session_shutdown", async () => {
-    lifetime.abort();
-    if (idleDelivery) clearImmediate(idleDelivery);
-    clearInterval(steerWatch);
-    unmount?.();
-    await coordinator.dispose();
-    workspace.dispose();
+  pi.on("input", (event) => {
+    if (event.source !== "interactive" && event.source !== "rpc") return;
+    held = false;
+    if (event.streamingBehavior !== "steer") return;
+    steers++;
+    setImmediate(yieldToSteering);
   });
-
-  for (const action of ["pause", "continue", "stop"] as const) {
-    pi.registerCommand(`sub:${action}`, {
-      description: `${action} one subagent by ID, or all when no ID is supplied.`,
-      handler: async (args, ctx) => {
-        try {
-          checkContext(ctx);
-          const id = args.trim();
-          if (action === "pause") {
-            if (id) await coordinator.pause(id);
-            else {
-              // The one command that stops everything: children, then the parent.
-              held = true;
-              const pausing = Promise.all(
-                coordinator.list().map((task) => coordinator.pause(task.id)),
-              );
-              ctx.abort();
-              await pausing;
-            }
-          }
-          if (action === "continue") {
-            held = false;
-            const tasks = id
-              ? [coordinator.get(id)]
-              : coordinator.list().filter((task) => task.status === "paused");
-            for (const task of tasks) authorized(task.id, ctx);
-            for (const task of tasks) await coordinator.continue(task.id);
-            if (!tasks.length) notify("No paused tasks.");
-            scheduleReplies();
-          }
-          if (action === "stop") {
-            const results = await Promise.all(
-              (id ? [id] : coordinator.list().map((task) => task.id)).map(
-                (taskId) => coordinator.stop(taskId),
-              ),
-            );
-            if (results.length) {
-              const result = reportResult(results, workspace);
-              pi.sendMessage(
-                {
-                  customType: "pi-sub:stopped",
-                  display: true,
-                  content: result.content[0]!.text,
-                  details: result.details,
-                },
-                { triggerTurn: false },
-              );
-            } else notify("No tasks to stop.");
-          }
-        } catch (error) {
-          notify(reason(error), "error");
-        }
-      },
+  pi.on("message_start", (event) => {
+    if (event.message.role === "user" && steers) steers--;
+  });
+  pi.on("agent_settled", (event) => {
+    steers = 0;
+    if (event.aborted) held = true;
+    else scheduleReplies(); // Replies that arrived after the last boundary.
+  });
+  pi.on("ui_prompt_start", () => {
+    dialogOpen = true;
+  });
+  pi.on("ui_prompt_end", () => {
+    dialogOpen = false;
+    scheduleReplies();
+  });
+  /** A running parent receives replies with the request it makes anyway. */
+  const deliverAtBoundary = (
+    event: TurnEndEvent | AgentBeforeSettleEvent,
+    ctx: ExtensionContext,
+  ) => {
+    if (event.outcome !== "completed" || ctx.signal?.aborted || dialogOpen)
+      return;
+    let entries: TurnEndEvent["entries"] | undefined;
+    deliver((batch) => {
+      entries = [
+        ...event.entries,
+        { type: "custom_message" as const, ...batch },
+      ];
     });
-  }
+    // Natural tool/queue continuation satisfies this request; Pi does not add
+    // another turn on top of it.
+    return entries ? { entries, continue: true } : undefined;
+  };
+  pi.on("turn_end", deliverAtBoundary);
+  pi.on("agent_before_settle", deliverAtBoundary);
+
+  const all = (status?: TaskView["status"]) =>
+    coordinator
+      .list()
+      .filter((task) => !status || task.status === status)
+      .map((task) => task.id);
+  pi.registerCommand("sub:pause", {
+    description: "Pause one subagent by ID, or all of them and the parent.",
+    handler: async (args, ctx) => {
+      const id = args.trim();
+      try {
+        if (id) return await coordinator.pause(id);
+        // The one command that stops everything: children, then the parent.
+        held = true;
+        const pausing = Promise.all(all().map((id) => coordinator.pause(id)));
+        ctx.abort();
+        await pausing;
+      } catch (error) {
+        notify(reason(error), "error");
+      }
+    },
+  });
+  pi.registerCommand("sub:continue", {
+    description: "Continue one paused subagent by ID, or all of them.",
+    handler: async (args) => {
+      const id = args.trim();
+      held = false;
+      try {
+        const ids = id ? [id] : all("paused");
+        for (const paused of ids) coordinator.continue(paused);
+        if (!ids.length) notify("No paused tasks.");
+      } catch (error) {
+        notify(reason(error), "error");
+      }
+      scheduleReplies();
+    },
+  });
+  pi.registerCommand("sub:stop", {
+    description: "Stop one subagent by ID, or all of them.",
+    handler: async (args) => {
+      const id = args.trim();
+      try {
+        const stopped = await Promise.all(
+          (id ? [id] : all()).map((task) => coordinator.stop(task)),
+        );
+        if (!stopped.length) return notify("No tasks to stop.");
+        // The parent learns it without a turn of its own.
+        pi.sendMessage(stoppedNotice(stopped, coordinator.reports), {
+          triggerTurn: false,
+        });
+      } catch (error) {
+        notify(reason(error), "error");
+      }
+    },
+  });
 
   pi.registerTool(
     defineTool({
@@ -328,8 +291,9 @@ export default function piSub(pi: ExtensionAPI): void {
       ),
       async execute(_call, args, signal, _update, ctx) {
         try {
-          checkContext(ctx);
           signal?.throwIfAborted();
+          if (!ctx.isProjectTrusted())
+            throw new Error("Trust this project before starting subagents.");
           const execution = selectExecution(
             loadLadder(ladderPath()),
             args.level,
@@ -343,13 +307,13 @@ export default function piSub(pi: ExtensionAPI): void {
               ...execution,
               cwd: ctx.cwd,
               name: args.description || "Pi subagent",
-              sessionDir: workspace.sessions,
+              sessionDir: (sessions ??= mkdtempSync(join(tmpdir(), "pi-sub-"))),
               args: ["--approve"],
             },
           });
-          return response(coordinator.get(id));
+          return respond(coordinator.get(id));
         } catch (error) {
-          return response(reason(error), true);
+          return failed(error);
         }
       },
     }),
@@ -362,20 +326,18 @@ export default function piSub(pi: ExtensionAPI): void {
       exposure: "model-only",
       executionMode: "sequential",
       description:
-        "Send an answer or correction. Interrupts active work; explicitly resumes paused tasks.",
+        "Send an answer or correction. Interrupts active work; continues paused and failed tasks.",
       parameters: Type.Object(
         { id: Type.String(), message: Type.String({ minLength: 1 }) },
         { additionalProperties: false },
       ),
-      async execute(_call, args, signal, _update, ctx) {
+      async execute(_call, args, signal) {
         try {
-          checkContext(ctx);
           signal?.throwIfAborted();
-          authorized(args.id, ctx);
           await coordinator.message(args.id, args.message);
-          return response(coordinator.get(args.id));
+          return respond(coordinator.get(args.id));
         } catch (error) {
-          return response(reason(error), true);
+          return failed(error);
         }
       },
     }),
@@ -388,10 +350,15 @@ export default function piSub(pi: ExtensionAPI): void {
       exposure: "model-only",
       executionMode: "sequential",
       description:
-        "Read or wait for a response; the task stays available for follow-up. finish:true accepts/removes it, not merely acknowledges it. A timeout, pause or user message only ends the wait.",
+        "Inspect a task by id; wait only observes, finish accepts/removes. Or read a cached report by report ID, without running a model: offset is a UTF-8 byte offset, limit defaults to 4096 bytes. Reports may expire. Results are at most 8 KiB.",
       parameters: Type.Object(
         {
-          id: Type.String(),
+          id: Type.Optional(Type.String()),
+          report: Type.Optional(Type.String()),
+          offset: Type.Optional(Type.Integer({ minimum: 0 })),
+          limit: Type.Optional(
+            Type.Integer({ minimum: 4, maximum: REPORT_READ_BYTES }),
+          ),
           wait: Type.Optional(Type.Boolean()),
           timeout: Type.Optional(
             Type.Number({
@@ -404,26 +371,47 @@ export default function piSub(pi: ExtensionAPI): void {
         },
         { additionalProperties: false },
       ),
-      async execute(_call, args, signal, _update, ctx) {
+      async execute(_call, args, signal) {
         try {
-          checkContext(ctx);
+          signal?.throwIfAborted();
+          if (args.report !== undefined) {
+            if (
+              args.id !== undefined ||
+              args.wait !== undefined ||
+              args.finish !== undefined ||
+              args.timeout !== undefined
+            )
+              throw new Error(
+                "Report reads take report, offset and limit only.",
+              );
+            return charged(
+              readReport(
+                coordinator.reports,
+                args.report,
+                args.offset,
+                args.limit,
+              ),
+            );
+          }
+          if (
+            args.id === undefined ||
+            args.offset !== undefined ||
+            args.limit !== undefined
+          )
+            throw new Error(
+              "Provide a task id, or a report ID with optional offset and limit.",
+            );
           const task = args.wait
-            ? await observeTask(
-                args.id,
-                signal,
-                (args.timeout ?? 30) * 1000,
-                ctx,
-              )
-            : coordinator.inspect(args.id);
+            ? await observe(args.id, signal, (args.timeout ?? 30) * 1000)
+            : coordinator.get(args.id);
           // A wait that ended early has nothing to accept yet.
-          const open = "status" in task && task.status !== "ready";
-          return response(
-            args.finish && !(args.wait && open)
-              ? await coordinator.collect(task.id)
+          return respond(
+            args.finish && (isSettled(task.status) || !args.wait)
+              ? coordinator.accept(args.id)
               : task,
           );
         } catch (error) {
-          return response(reason(error), true);
+          return failed(error);
         }
       },
     }),
@@ -444,35 +432,26 @@ export default function piSub(pi: ExtensionAPI): void {
         },
         { additionalProperties: false },
       ),
-      async execute(_call, args, signal, _update, ctx) {
+      async execute(_call, args, signal) {
         try {
-          checkContext(ctx);
           signal?.throwIfAborted();
-          if (args.action === "stop" && args.id)
-            return response(await coordinator.stop(args.id));
-          const tasks = args.id
-            ? [coordinator.get(args.id)]
-            : coordinator
-                .list()
-                .filter(
-                  (task) =>
-                    args.action !== "continue" || task.status === "paused",
-                );
-          if (args.action === "continue")
-            for (const task of tasks) authorized(task.id, ctx);
-          const results = await Promise.all(
-            tasks.map(async (task) =>
-              args.action === "stop"
-                ? coordinator.stop(task.id)
-                : (await (args.action === "pause"
-                    ? coordinator.pause(task.id)
-                    : coordinator.continue(task.id)),
-                  coordinator.get(task.id)),
-            ),
+          const act = async (id: string) => {
+            if (args.action === "stop") return coordinator.stop(id);
+            if (args.action === "pause") await coordinator.pause(id);
+            else coordinator.continue(id);
+            return coordinator.get(id);
+          };
+          return respond(
+            args.id
+              ? await act(args.id)
+              : await Promise.all(
+                  all(args.action === "continue" ? "paused" : undefined).map(
+                    act,
+                  ),
+                ),
           );
-          return response(results);
         } catch (error) {
-          return response(reason(error), true);
+          return failed(error);
         }
       },
     }),

@@ -17,7 +17,7 @@ export interface AvailableModel {
   model: string;
   thinking: ThinkingLevel[];
 }
-export type Ladder = Record<string, string>;
+export type Ladder = readonly Execution[];
 export interface Execution {
   provider: string;
   model: string;
@@ -54,7 +54,7 @@ export function availableModels(
   }));
 }
 
-export function parseReference(
+function parseReference(
   text: string,
 ): Pick<Execution, "provider" | "model" | "thinking"> {
   if (typeof text !== "string" || /\s/u.test(text))
@@ -84,20 +84,19 @@ function object(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
-export function validateLadder(value: unknown): Ladder {
-  const result: Ladder = {};
+function validateLadder(value: unknown): Ladder {
+  const result: Execution[] = [];
   for (const [rung, raw] of Object.entries(object(value))) {
     if (!/^(?:[1-9]|10)$/.test(rung))
       throw new Error(`Invalid ladder rung: ${rung}`);
     if (typeof raw !== "string")
       throw new Error(`Invalid model at rung ${rung}`);
-    parseReference(raw);
-    result[rung] = raw;
+    result.push({ ...parseReference(raw), power: Number(rung) });
   }
-  return result;
+  return result.sort((a, b) => a.power - b.power);
 }
 
-/** Runtime configuration is read-only; changes take effect on the next admission. */
+/** Runtime configuration is read-only; changes apply to the next new task. */
 export function loadLadder(path: string): Ladder {
   let source: string;
   try {
@@ -119,22 +118,19 @@ export function loadLadder(path: string): Ladder {
   }
 }
 
-/** Validated integer rungs enumerate in ascending strength order. */
+/** Filter the validated ladder without changing its strength order. */
 export function availableExecutions(
   ladder: Ladder,
   available: readonly AvailableModel[],
 ): Execution[] {
-  return Object.entries(validateLadder(ladder)).flatMap(([power, entry]) => {
-    const reference = parseReference(entry);
-    return available.some(
+  return ladder.filter((entry) =>
+    available.some(
       (a) =>
-        a.provider === reference.provider &&
-        a.model === reference.model &&
-        a.thinking.includes(reference.thinking),
-    )
-      ? [{ ...reference, power: Number(power) }]
-      : [];
-  });
+        a.provider === entry.provider &&
+        a.model === entry.model &&
+        a.thinking.includes(entry.thinking),
+    ),
+  );
 }
 
 export function selectExecution(
@@ -151,32 +147,4 @@ export function selectExecution(
   throw new Error(
     `No available ladder execution for level ${level}; check ${ladderPath()} and native model availability. ${setupHelp}`,
   );
-}
-
-/** A retained execution stays usable while available and configured at or above its level. */
-export function checkRetained(
-  ladder: Ladder,
-  level: number,
-  execution: Pick<Execution, "provider" | "model" | "thinking">,
-  available: readonly AvailableModel[],
-): void {
-  const same = (entry: Pick<Execution, "provider" | "model">) =>
-    entry.provider === execution.provider && entry.model === execution.model;
-  if (
-    !available.some((a) => same(a) && a.thinking.includes(execution.thinking))
-  )
-    throw new Error(
-      "The retained execution is no longer available. Stop this subagent instead.",
-    );
-  if (
-    !availableExecutions(ladder, available).some(
-      (entry) =>
-        entry.power >= level &&
-        same(entry) &&
-        entry.thinking === execution.thinking,
-    )
-  )
-    throw new Error(
-      "The retained execution no longer meets the task's minimum level. Stop this subagent instead.",
-    );
 }

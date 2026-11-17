@@ -1,13 +1,10 @@
 import { expect, test } from "vitest";
-import type { TaskResult, TaskView } from "../src/coordinator.ts";
-import { reportDetails } from "../src/reports.ts";
 import {
   access,
   mkdtemp,
   mkdir,
   readFile,
   readdir,
-  rename,
   rm,
   writeFile,
 } from "node:fs/promises";
@@ -120,134 +117,185 @@ async function latestResult(client: RpcClient) {
   if (!result || result.role !== "toolResult")
     throw new Error("Missing sub_result");
   expect(result.isError).toBe(false);
-  const visible = JSON.parse(
+  return JSON.parse(
     result.content.find((part) => part.type === "text")!.text,
-  );
-  const details = reportDetails(
-    result.details,
-    result.content.find((part) => part.type === "text")!.text,
-  ) as TaskView | TaskResult;
-  expect(visible.id).toBe(details.id);
-  if (visible.file)
-    expect((await readFile(visible.file, "utf8")).length).toBeGreaterThan(0);
-  else expect(visible.response).toBe(details.response);
-  expect(visible).not.toHaveProperty("execution");
-  expect(visible).not.toHaveProperty("sessionFile");
-  return details;
+  ) as {
+    id: string;
+    status: string;
+    response: string;
+    error?: string;
+    report?: { id: string; bytes: number; file?: string };
+  };
 }
-
-test("native file handoffs survive acceptance but expire with the active parent runtime", async () => {
+function details(message: { details?: unknown }) {
+  return (
+    message.details as {
+      tasks: { id: string; sessionFile: string; execution: string }[];
+    }
+  ).tasks[0]!;
+}
+test("cached reports survive continuation and acceptance, but not runtime replacement", async () => {
   const { client, cwd, dispose } = await host({ WORKER_TEST_LARGE_CHILD: "1" });
   try {
     await client.promptAndWait("integration:read-via-wait", undefined, 20000);
-    const messages = await client.getMessages();
-    const result = messages.findLast(
-      (message) =>
-        message.role === "toolResult" && message.toolName === "sub_result",
-    )!;
-    if (result.role !== "toolResult") throw new Error("Missing result");
-    const ref = JSON.parse(
-      result.content.find((part) => part.type === "text")!.text,
-    );
-    expect(ref.file).not.toContain(cwd);
-    expect(ref.file).toContain("/reports/");
-    expect(JSON.stringify(result.details)).not.toContain("END_OF_LARGE_REPORT");
-    await expect(access(join(cwd, ".pi/pi-sub"))).rejects.toThrow();
-    const original = await readFile(ref.file, "utf8");
-    expect(original).toContain("Evidence line 漢字\n");
-    expect(original).toContain("END_OF_LARGE_REPORT");
-    expect(
-      Buffer.byteLength(
-        result.content.find((part) => part.type === "text")!.text,
-      ),
-    ).toBeLessThanOrEqual(50 * 1024);
-    await client.promptAndWait("integration:inspect", undefined, 20000);
     const first = await latestResult(client);
     expect(first).toMatchObject({
       status: "ready",
-      reply: { delivered: true },
+      report: { id: expect.any(String), bytes: expect.any(Number) },
     });
+    expect(first.report!.file).toBeUndefined();
+    expect(Buffer.byteLength(first.response)).toBeLessThanOrEqual(512);
+    const taskMessage = (await client.getMessages()).findLast(
+      (m) => m.role === "toolResult" && m.toolName === "sub_task",
+    );
+    if (!taskMessage || taskMessage.role !== "toolResult")
+      throw Error("Missing task");
+    // The waiting tool already delivered this report: no extra notification turn.
+    const messages = await client.getMessages();
+    expect(messages.filter((m) => m.role === "assistant")).toHaveLength(3);
+    expect(
+      messages.some(
+        (m) => m.role === "custom" && m.customType === "pi-sub:response",
+      ),
+    ).toBe(false);
+    const journal = details(taskMessage).sessionFile;
+    expect(basename(journal)).toBe(`${first.id}.jsonl`);
+    expect(dirname(journal)).not.toBe(cwd);
+
     await client.promptAndWait("integration:refine-task", undefined, 20000);
     await client.promptAndWait("integration:accept", undefined, 20000);
-    expect(await latestResult(client)).toMatchObject({
-      id: first.id,
-      outcome: "reply",
-    });
-    expect(
-      (await client.getMessages())
-        .filter((message) => message.role === "toolResult")
-        .map((message) => message.toolName),
-    ).not.toContain("read");
-    expect(await readFile(ref.file, "utf8")).toBe(original);
-    const metadata = reportDetails(result.details) as TaskResult;
-    await client.stop();
-    await expect(access(ref.file)).rejects.toThrow();
-    await expect(access(metadata.sessionFile)).rejects.toThrow();
-    await expect(
-      access(dirname(dirname(metadata.sessionFile))),
-    ).rejects.toThrow();
+    const accepted = await latestResult(client);
+    expect(accepted.status).toBe("accepted");
+    expect(accepted.report!.id).not.toBe(first.report!.id);
+
+    let offset = 0;
+    let pages = "";
+    do {
+      await client.promptAndWait(
+        `integration:report:${first.report!.id}:${offset}`,
+        undefined,
+        20000,
+      );
+      const result = (await client.getMessages()).findLast(
+        (m) => m.role === "toolResult" && m.toolName === "sub_result",
+      );
+      if (!result || result.role !== "toolResult")
+        throw Error("Missing report page");
+      expect(result.isError).toBe(false);
+      const page = (
+        result.details as {
+          report: {
+            id: string;
+            bytes: number;
+            offset: number;
+            next?: number;
+            text?: string;
+          };
+        }
+      ).report;
+      expect(page).toMatchObject({
+        id: first.report!.id,
+        bytes: first.report!.bytes,
+        offset,
+      });
+      expect(page).not.toHaveProperty("text");
+      const text = result.content.find((part) => part.type === "text")!.text;
+      expect(Buffer.byteLength(text)).toBeLessThanOrEqual(8192);
+      pages += text;
+      if (page.next === undefined) break;
+      expect(page.next).toBeGreaterThan(offset);
+      offset = page.next;
+    } while (true);
+    expect(pages).toContain("Evidence line 漢字");
+    expect(pages).toContain("END_OF_LARGE_REPORT");
+    await client.newSession();
+    await expect(access(dirname(journal))).rejects.toThrow();
+    await client.promptAndWait(
+      `integration:report:${first.report!.id}:0`,
+      undefined,
+      20000,
+    );
+    const stale = (await client.getMessages()).findLast(
+      (m) => m.role === "toolResult" && m.toolName === "sub_result",
+    );
+    expect(stale).toMatchObject({ isError: true });
   } finally {
+    await dispose();
+  }
+}, 90000);
+
+test("concurrent replies share the parent's naturally required next turn", async () => {
+  const { client, cwd, dispose } = await host({ WORKER_TEST_CHILD_PIDS: "1" });
+  const settled = nextEvent(client, (e) => e.type === "agent_settled");
+  try {
+    await client.prompt("integration:batch");
+    // The parent tool remains busy until both children have exited.
+    await eventually(async () => {
+      const files = await readdir(join(cwd, "child-pids"));
+      expect(files).toHaveLength(2);
+      for (const file of files) {
+        const pid = Number(
+          await readFile(join(cwd, "child-pids", file), "utf8"),
+        );
+        expect(() => process.kill(pid, 0)).toThrow();
+      }
+    });
+    await writeFile(join(cwd, "parent-release"), "continue");
+    await settled.promise;
+    const messages = await client.getMessages();
+    const batches = messages.filter(
+      (m) => m.role === "custom" && m.customType === "pi-sub:response",
+    );
+    expect(batches).toHaveLength(1);
+    expect(batches[0]).toMatchObject({
+      details: {
+        tasks: [
+          { description: "First review" },
+          { description: "Second review" },
+        ],
+      },
+    });
+    expect(messages.filter((m) => m.role === "assistant")).toHaveLength(2);
+  } finally {
+    settled.dispose();
     await dispose();
   }
 }, 30000);
 
-test.each(["new", "resume", "clone", "reload"] as const)(
-  "native %s discards working data without deleting parent history or project edits",
-  async (transition) => {
-    const { client, cwd, dispose } = await host({
-      WORKER_TEST_LARGE_CHILD: "1",
+test("a large child failure is bounded and remains readable by report reference", async () => {
+  const { client, dispose } = await host({ WORKER_TEST_LARGE_CHILD: "1" });
+  try {
+    await client.promptAndWait("integration:failure", undefined, 20000);
+    await eventually(async () => {
+      const message = (await client.getMessages()).findLast(
+        (m) => m.role === "custom" && m.customType === "pi-sub:response",
+      );
+      expect(message).toBeDefined();
     });
-    try {
-      await client.promptAndWait("integration:read-via-wait", undefined, 20000);
-      const first = await latestResult(client);
-      const root = dirname(dirname(first.sessionFile));
-      const parentFile = (await client.getState()).sessionFile!;
-      await writeFile(join(cwd, "project-edit.txt"), "Keep this work");
-      if (transition === "reload") await client.prompt("/test-reload");
-      else if (transition === "clone")
-        expect(await client.clone()).toMatchObject({ cancelled: false });
-      else {
-        expect(await client.newSession()).toMatchObject({ cancelled: false });
-        if (transition === "resume") {
-          await client.promptAndWait("integration:delegate", undefined, 20000);
-          const secondRoot = dirname(
-            dirname((await latestResult(client)).sessionFile),
-          );
-          expect(secondRoot).not.toBe(root);
-          expect(await client.switchSession(parentFile)).toMatchObject({
-            cancelled: false,
-          });
-          await expect(access(secondRoot)).rejects.toThrow();
-        }
-      }
-      await expect(access(root)).rejects.toThrow();
-      expect(await readFile(join(cwd, "project-edit.txt"), "utf8")).toBe(
-        "Keep this work",
-      );
-      expect(await readFile(parentFile, "utf8")).toContain(
-        "integration:read-via-wait",
-      );
-      if (transition !== "new") {
-        const history = await client.getMessages();
-        expect(JSON.stringify(history)).toContain(first.id);
-        expect(JSON.stringify(history)).not.toContain("END_OF_LARGE_REPORT");
-        await client.promptAndWait("integration:inspect", undefined, 20000);
-        const stale = (await client.getMessages()).findLast(
-          (message) => message.role === "toolResult",
-        );
-        expect(stale).toMatchObject({ isError: true });
-        expect(JSON.stringify(stale)).toContain("Unknown live task");
-      }
-      await client.promptAndWait("integration:delegate", undefined, 20000);
-      const fresh = await latestResult(client);
-      expect(fresh.id).not.toBe(first.id);
-      expect(dirname(dirname(fresh.sessionFile))).not.toBe(root);
-    } finally {
-      await dispose();
-    }
-  },
-  30000,
-);
+    await client.waitForIdle(15000);
+    await client.promptAndWait("integration:inspect", undefined, 20000);
+    const failed = await latestResult(client);
+    expect(failed).toMatchObject({
+      status: "failed",
+      error: expect.stringContaining("fatal synthetic failure"),
+      report: { id: expect.any(String) },
+    });
+    expect(Buffer.byteLength(failed.error!)).toBeLessThanOrEqual(240);
+    await client.promptAndWait(
+      `integration:report:${failed.report!.id}:0`,
+      undefined,
+      20000,
+    );
+    const page = (await client.getMessages()).findLast(
+      (m) => m.role === "toolResult" && m.toolName === "sub_result",
+    );
+    expect(page).toMatchObject({ isError: false });
+    expect(JSON.stringify(page)).toContain("fatal synthetic failure");
+    expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThan(8192);
+  } finally {
+    await dispose();
+  }
+}, 40000);
 
 test("native session replacement closes active children before removing their journals", async () => {
   const { client, cwd, marker, dispose } = await host({
@@ -263,7 +311,7 @@ test("native session replacement closes active children before removing their jo
     );
     if (!message || message.role !== "toolResult")
       throw new Error("Missing task");
-    const task = reportDetails(message.details) as TaskResult;
+    const task = details(message);
     const pid = Number(
       await eventually(() =>
         readFile(join(cwd, "child-pids", basename(task.sessionFile)), "utf8"),
@@ -272,244 +320,11 @@ test("native session replacement closes active children before removing their jo
     expect(() => process.kill(pid, 0)).not.toThrow();
     expect(await client.newSession()).toMatchObject({ cancelled: false });
     expect(() => process.kill(pid, 0)).toThrow();
-    await expect(access(dirname(dirname(task.sessionFile)))).rejects.toThrow();
+    await expect(access(dirname(task.sessionFile))).rejects.toThrow();
   } finally {
     await dispose();
   }
 }, 30000);
-
-test("native acceptance reports its committed state on publication failure and retains a retrievable receipt", async () => {
-  const { client, dispose } = await host({ WORKER_TEST_LARGE_CHILD: "1" });
-  try {
-    await client.promptAndWait("integration:read-via-wait", undefined, 20000);
-    const first = await latestResult(client);
-    const directory = join(dirname(dirname(first.sessionFile)), "reports");
-    const backup = directory + "-backup";
-    // A deterministic storage failure, also when tests run as root.
-    await rename(directory, backup);
-    await writeFile(directory, "not a directory");
-    await client.promptAndWait("integration:accept", undefined, 20000);
-    const failed = (await client.getMessages()).findLast(
-      (message) =>
-        message.role === "toolResult" && message.toolName === "sub_result",
-    );
-    if (!failed || failed.role !== "toolResult")
-      throw new Error("Missing result");
-    expect(failed.isError).toBe(true);
-    const visible = JSON.parse(
-      failed.content.find((part) => part.type === "text")!.text,
-    );
-    expect(visible).toMatchObject({
-      id: first.id,
-      archived: true,
-      outcome: "reply",
-      reportError: expect.any(String),
-    });
-    expect(visible).not.toHaveProperty("file");
-    expect(reportDetails(failed.details)).toMatchObject({
-      id: first.id,
-      outcome: "reply",
-    });
-    expect(reportDetails(failed.details)).not.toHaveProperty("response");
-    expect(reportDetails(failed.details)).not.toHaveProperty("status");
-    await client.promptAndWait("integration:refine-task", undefined, 20000);
-    const followUp = (await client.getMessages()).findLast(
-      (message) =>
-        message.role === "toolResult" && message.toolName === "sub_message",
-    );
-    expect(followUp).toMatchObject({ isError: true });
-    expect(JSON.stringify(followUp)).toContain("Unknown live task");
-    await rm(directory);
-    await rename(backup, directory);
-    await client.promptAndWait("integration:failure-receipt", undefined, 20000);
-    const receipt = await latestResult(client);
-    expect(receipt).toMatchObject({ id: first.id, outcome: "reply" });
-    expect(receipt).not.toHaveProperty("status");
-  } finally {
-    await dispose();
-  }
-}, 30000);
-
-test("native reply delivery keeps the task and its session available for follow-up", async () => {
-  const { client, dispose } = await host();
-  try {
-    const delivered = (previous?: string) =>
-      eventually(async () => {
-        const messages = await client.getMessages();
-        const index = messages.findLastIndex(
-          (message) =>
-            message.role === "custom" &&
-            message.customType === "pi-sub:response" &&
-            (message.details as { replies: { reply: { id: string } }[] })
-              .replies[0]?.reply.id !== previous,
-        );
-        expect(index).toBeGreaterThanOrEqual(0);
-        // The native parent has made a request containing the notification.
-        expect(
-          messages
-            .slice(index + 1)
-            .some((message) => message.role === "assistant"),
-        ).toBe(true);
-        const message = messages[index]!;
-        if (message.role !== "custom") throw new Error("No reply notification");
-        return (
-          message.details as {
-            replies: {
-              id: string;
-              sessionFile: string;
-              reply: { id: string; delivered: boolean };
-            }[];
-          }
-        ).replies[0]!;
-      });
-    await client.promptAndWait("integration:notify", undefined, 20000);
-    const first = await delivered();
-    expect(first.reply.delivered).toBe(false); // The queued snapshot is not a receipt.
-    await client.promptAndWait("integration:inspect", undefined, 20000);
-    expect(await latestResult(client)).toMatchObject({
-      id: first.id,
-      status: "ready",
-      outcome: "reply",
-      reply: { id: first.reply.id, delivered: true },
-    });
-    await client.promptAndWait("integration:refine-task", undefined, 20000);
-    const next = await delivered(first.reply.id);
-    expect(next.id).toBe(first.id);
-    expect(next.sessionFile).toBe(first.sessionFile);
-    expect(next.reply.id).not.toBe(first.reply.id);
-    await client.promptAndWait("integration:inspect", undefined, 20000);
-    expect(await latestResult(client)).toMatchObject({
-      id: first.id,
-      status: "ready",
-      reply: { id: next.reply.id, delivered: true },
-    });
-  } finally {
-    await dispose();
-  }
-}, 40000);
-
-test("a complete tool delivery needs no acceptance call and causes no delayed notification", async () => {
-  const { client, dispose } = await host();
-  try {
-    await client.promptAndWait("integration:read-via-wait", undefined, 20000);
-    const messages = await client.getMessages();
-    expect(
-      messages.filter((message) => message.role === "assistant"),
-    ).toHaveLength(3);
-    expect(
-      messages.filter(
-        (message) =>
-          message.role === "custom" && message.customType === "pi-sub:response",
-      ),
-    ).toHaveLength(0);
-    expect(await latestResult(client)).toMatchObject({
-      status: "ready",
-      outcome: "reply",
-    });
-    await client.promptAndWait("integration:inspect", undefined, 20000);
-    expect(await latestResult(client)).toMatchObject({
-      status: "ready",
-      outcome: "reply",
-      reply: { delivered: true },
-    });
-    expect(
-      (await client.getMessages()).filter(
-        (message) =>
-          message.role === "custom" && message.customType === "pi-sub:response",
-      ),
-    ).toHaveLength(0);
-  } finally {
-    await dispose();
-  }
-}, 30000);
-
-test("native turn boundaries batch concurrent replies into the already required next request", async () => {
-  const { client, cwd, dispose } = await host({ WORKER_TEST_CHILD_PIDS: "1" });
-  const gate = nextEvent(
-    client,
-    (event) =>
-      event.type === "tool_execution_start" && event.toolName === "bash",
-  );
-  try {
-    const settled = nextEvent(
-      client,
-      (event) => event.type === "agent_settled",
-    );
-    try {
-      await client.prompt("integration:batch");
-      await gate.promise;
-      // Keep a real parent tool open until both child processes have exited.
-      // Replies must not be sent as follow-ups while this turn is still active.
-      await eventually(async () => {
-        const files = await readdir(join(cwd, "child-pids"));
-        expect(files).toHaveLength(2);
-        for (const file of files) {
-          const pid = Number(
-            await readFile(join(cwd, "child-pids", file), "utf8"),
-          );
-          expect(() => process.kill(pid, 0)).toThrow();
-          const taskMessage = (await client.getMessages()).find(
-            (message) =>
-              message.role === "toolResult" &&
-              message.toolName === "sub_task" &&
-              basename(
-                (reportDetails(message.details) as TaskResult).sessionFile,
-              ) === file,
-          );
-          if (!taskMessage || taskMessage.role !== "toolResult")
-            throw new Error("Missing task");
-          expect(
-            await readFile(
-              (reportDetails(taskMessage.details) as TaskResult).sessionFile,
-              "utf8",
-            ),
-          ).toContain("fake response");
-        }
-      });
-      expect(
-        (await client.getMessages()).filter(
-          (message) =>
-            message.role === "custom" &&
-            message.customType === "pi-sub:response",
-        ),
-      ).toHaveLength(0);
-      await writeFile(join(cwd, "parent-release"), "continue");
-      await settled.promise;
-    } finally {
-      settled.dispose();
-    }
-    const messages = await client.getMessages();
-    const batches = messages.filter(
-      (message) =>
-        message.role === "custom" && message.customType === "pi-sub:response",
-    );
-    expect(batches).toHaveLength(1);
-    if (batches[0]!.role !== "custom") throw Error("Missing native batch");
-    expect(
-      (
-        batches[0]!.details as { replies: { description: string }[] }
-      ).replies.map((reply) => reply.description),
-    ).toEqual(["First review", "Second review"]);
-    // The tool-calling request and its natural continuation, not a third acknowledgement turn.
-    expect(
-      messages.filter((message) => message.role === "assistant"),
-    ).toHaveLength(2);
-    await client.promptAndWait("integration:inspect", undefined, 20000);
-    expect(await latestResult(client)).toMatchObject({
-      status: "ready",
-      reply: { delivered: true },
-    });
-    expect(
-      (await client.getMessages()).filter(
-        (message) =>
-          message.role === "custom" && message.customType === "pi-sub:response",
-      ),
-    ).toHaveLength(1);
-  } finally {
-    gate.dispose();
-    await dispose();
-  }
-}, 40000);
 
 /** Real parent Pi + real child Pi; only the model provider is synthetic. */
 test("delegates from a file-authored ladder and reports original child usage once", async () => {
@@ -525,7 +340,7 @@ test("delegates from a file-authored ladder and reports original child usage onc
           !message.isError,
       ),
     ).toBe(true);
-    expect(await latestResult(client)).toMatchObject({ outcome: "reply" });
+    expect(await latestResult(client)).toMatchObject({ status: "accepted" });
     const stats = await client.getSessionStats();
     expect(stats.cost).toBe(stats.assistantMessages * 10 + 10); // delegated task
     expect(stats.tokens.input).toBe(stats.assistantMessages * 10 + 10);
@@ -539,14 +354,7 @@ test("delegates from a file-authored ladder and reports original child usage onc
     const exportedData = JSON.parse(
       Buffer.from(embedded![1]!, "base64").toString("utf8"),
     );
-    const rendered = JSON.stringify(exportedData.renderedTools);
-    expect(rendered.includes("Delegated")).toBe(true);
-    expect(rendered.includes("Accepted")).toBe(true);
-    expect(rendered.includes("Required level:")).toBe(true);
-    expect(rendered.includes("Delegating…")).toBe(false);
-    await client.promptAndWait("integration:repeat", undefined, 20000);
-    const repeated = await client.getSessionStats();
-    expect(repeated.cost).toBe(repeated.assistantMessages * 10 + 10);
+    expect(exportedData.renderedTools).toBeDefined();
 
     const created = nextEvent(
       client,
@@ -567,8 +375,7 @@ test("delegates from a file-authored ladder and reports original child usage onc
     await client.promptAndWait("integration:continue", undefined, 20000);
     await client.promptAndWait("integration:accept", undefined, 20000);
     const accepted = await latestResult(client);
-    expect(accepted).toMatchObject({ outcome: "reply" });
-    expect(accepted).not.toHaveProperty("status");
+    expect(accepted).toMatchObject({ status: "accepted" });
   } finally {
     await dispose();
   }
@@ -590,39 +397,54 @@ test("the configured ladder delegates outside the main session's model scope", a
     ).toEqual(["worker-test/fake"]);
     await client.promptAndWait("integration:delegate", undefined, 20000);
     expect(await latestResult(client)).toMatchObject({
-      outcome: "reply",
-      execution: { provider: "worker-test", model: "other", thinking: "off" },
+      status: "accepted",
     });
+    const created = (await client.getMessages()).findLast(
+      (message) =>
+        message.role === "toolResult" && message.toolName === "sub_task",
+    );
+    if (!created || created.role !== "toolResult")
+      throw new Error("Missing task");
+    expect(details(created).execution).toBe("worker-test/other:off");
   } finally {
     await dispose();
   }
 }, 30000);
 
-test("continuations recheck native availability without modifying the retained journal", async () => {
-  const { client, dispose } = await host({ WORKER_TEST_TWO_MODELS: "1" });
+test("ladder edits affect new tasks, not continuations", async () => {
+  const { client, agentDir, dispose } = await host({
+    WORKER_TEST_TWO_MODELS: "1",
+  });
   try {
     await client.promptAndWait("integration:read-via-wait", undefined, 20000);
-    const task = await latestResult(client);
-    const before = await readFile(task.sessionFile, "utf8");
-    await client.setModel("worker-test", "other");
-    expect(await client.prompt("/test-remove-model")).toBe("handled");
-    expect(
-      (await client.getAvailableModels()).some((model) => model.id === "fake"),
-    ).toBe(false);
+    const first = await latestResult(client);
+    await writeFile(
+      join(agentDir, "pi-sub-config.json"),
+      JSON.stringify({ "6": "worker-test/other:off" }),
+    );
     await client.promptAndWait("integration:refine-task", undefined, 20000);
-    const result = (await client.getMessages()).findLast(
-      (message) =>
-        message.role === "toolResult" && message.toolName === "sub_message",
+    await client.promptAndWait("integration:accept", undefined, 20000);
+    const continued = (await client.getMessages()).findLast(
+      (m) => m.role === "toolResult" && m.toolName === "sub_result",
     );
-    expect(result).toMatchObject({ isError: true });
-    expect(JSON.stringify(result)).toContain(
-      "retained execution is no longer available",
+    if (!continued || continued.role !== "toolResult")
+      throw Error("Missing continuation");
+    expect(details(continued)).toMatchObject({
+      id: first.id,
+      execution: "worker-test/fake:off",
+    });
+    await client.promptAndWait("integration:delegate", undefined, 20000);
+    const created = (await client.getMessages()).findLast(
+      (m) => m.role === "toolResult" && m.toolName === "sub_task",
     );
-    expect(await readFile(task.sessionFile, "utf8")).toBe(before);
+    if (!created || created.role !== "toolResult") throw Error("Missing task");
+    expect(details(created)).toMatchObject({
+      execution: "worker-test/other:off",
+    });
   } finally {
     await dispose();
   }
-}, 30000);
+}, 40000);
 
 test("normal conversation never creates or repairs a ladder and confirmation words reach the parent", async () => {
   const { client, agentDir, dispose } = await host();
@@ -648,7 +470,7 @@ test("normal conversation never creates or repairs a ladder and confirmation wor
     expect(await readFile(path, "utf8")).toBe("{broken");
     await writeFile(path, JSON.stringify({ "7": "worker-test/fake:off" }));
     await client.promptAndWait("integration:delegate", undefined, 20000);
-    expect(await latestResult(client)).toMatchObject({ outcome: "reply" });
+    expect(await latestResult(client)).toMatchObject({ status: "accepted" });
     expect(await readFile(path, "utf8")).toBe('{"7":"worker-test/fake:off"}');
   } finally {
     await dispose();
@@ -665,7 +487,7 @@ test("two working directories share the profile ladder without project overrides
     await writeFile(local, "not a ladder");
     await second.client.promptAndWait("integration:delegate", undefined, 20000);
     expect(await latestResult(second.client)).toMatchObject({
-      outcome: "reply",
+      status: "accepted",
     });
     await expect(access(join(second.cwd, ".pi/pi-sub"))).rejects.toThrow();
     const global = join(first.agentDir, "pi-sub-config.json");
@@ -689,79 +511,6 @@ test("two working directories share the profile ladder without project overrides
     await first.dispose();
   }
 }, 60000);
-
-test.each([false, true])(
-  "a failed child wakes the idle parent, and a message retries on its session (file handoff=%s)",
-  async (large) => {
-    const { client, dispose } = await host(
-      large ? { WORKER_TEST_LARGE_CHILD: "1" } : {},
-    );
-    try {
-      const delivered = (previous?: string) =>
-        eventually(async () => {
-          const messages = await client.getMessages();
-          const index = messages.findLastIndex(
-            (message) =>
-              message.role === "custom" &&
-              message.customType === "pi-sub:response" &&
-              (message.details as { replies: { reply: { id: string } }[] })
-                .replies[0]?.reply.id !== previous,
-          );
-          expect(index).toBeGreaterThanOrEqual(0);
-          // The native parent has made a request containing the notification.
-          expect(
-            messages
-              .slice(index + 1)
-              .some((message) => message.role === "assistant"),
-          ).toBe(true);
-          const message = messages[index]!;
-          if (message.role !== "custom") throw new Error("No notification");
-          const reply = (
-            message.details as {
-              replies: (TaskView & { reply: { id: string } })[];
-            }
-          ).replies[0]!;
-          return { content: String(message.content), reply };
-        });
-      await client.promptAndWait("integration:failure", undefined, 20000);
-      // No further user input: the failure itself reaches the parent model.
-      const failure = await delivered();
-      expect(failure.reply).toMatchObject({
-        status: "ready",
-        outcome: "error",
-        error: expect.stringContaining("fatal synthetic failure"),
-      });
-      if (large)
-        expect(
-          await readFile(JSON.parse(failure.content).file, "utf8"),
-        ).toContain("END_OF_FAILURE_REPORT");
-      else
-        expect(failure.content).toContain(
-          "(Test task) failed\nfatal synthetic failure",
-        );
-      await client.promptAndWait("integration:inspect", undefined, 20000);
-      expect(await latestResult(client)).toMatchObject({
-        id: failure.reply.id,
-        status: "ready",
-        outcome: "error",
-        reply: { id: failure.reply.reply.id, delivered: true },
-      });
-
-      await client.promptAndWait("integration:refine-task", undefined, 20000);
-      const retried = await delivered(failure.reply.reply.id);
-      expect(retried.reply).toMatchObject({
-        id: failure.reply.id,
-        sessionFile: failure.reply.sessionFile,
-        status: "ready",
-        outcome: "reply",
-      });
-      expect(retried.reply.error).toBeUndefined();
-    } finally {
-      await dispose();
-    }
-  },
-  60000,
-);
 
 test("an RPC abort stops the parent only: its child finishes and the reply waits for the user", async () => {
   const { client, marker, dispose } = await host({
@@ -790,8 +539,6 @@ test("an RPC abort stops the parent only: its child finishes and the reply waits
     await client.promptAndWait("integration:inspect", undefined, 20000);
     expect(await latestResult(client)).toMatchObject({
       status: "ready",
-      outcome: "reply",
-      reply: { delivered: true },
     });
   } finally {
     retry.dispose();
@@ -836,31 +583,6 @@ test("a steering message ends the parent's wait at once and leaves the child run
     );
   } finally {
     waiting.dispose();
-    await dispose();
-  }
-}, 60000);
-
-test("a manual ladder edit cannot resume a retained execution below its minimum level", async () => {
-  const { client, marker, agentDir, dispose } = await host({
-    WORKER_TEST_SLOW_CHILD: "1",
-  });
-  try {
-    await client.promptAndWait("integration:pause", undefined, 20000);
-    await eventually(() => readFile(marker));
-    expect(await client.prompt("/sub:pause")).toBe("handled");
-    const path = join(agentDir, "pi-sub-config.json");
-    const ladder = JSON.parse(await readFile(path, "utf8"));
-    await writeFile(path, JSON.stringify({ "2": ladder["6"] }));
-    await client.promptAndWait("integration:continue", undefined, 20000);
-    const result = (await client.getMessages()).findLast(
-      (message) =>
-        message.role === "toolResult" && message.toolName === "sub_control",
-    );
-    expect(result).toMatchObject({ isError: true });
-    expect(JSON.stringify(result)).toContain("minimum level");
-    await client.promptAndWait("integration:inspect", undefined, 20000);
-    expect(await latestResult(client)).toMatchObject({ status: "paused" });
-  } finally {
     await dispose();
   }
 }, 60000);

@@ -1,7 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
-import { addUsage, usageDelta } from "./usage.ts";
 import type { Usage } from "@earendil-works/pi-ai";
+import { addUsage, usageDelta } from "./usage.ts";
+import { ReportStore, type ReportRef } from "./report-store.ts";
+import { captureReport, excerpt, oneLine, PREVIEW_BYTES } from "./reports.ts";
 import {
   createWorker,
   type Worker,
@@ -10,36 +12,30 @@ import {
   type WorkerReport,
 } from "./worker.ts";
 
-export type TaskStatus = "queued" | "active" | "paused" | "ready";
-export type Outcome = "reply" | "error" | "stopped";
-interface TaskData {
+/** Ready and failed tasks hold a reply or an error and no process; a message continues either. */
+export type TaskStatus = "queued" | "active" | "paused" | "ready" | "failed";
+export interface TaskView {
   id: string;
   description: string;
   level: number;
   execution: Pick<WorkerOptions, "provider" | "model" | "thinking">;
   sessionFile: string;
+  /** Accepted and stopped describe a task at its removal. */
+  status: TaskStatus | "accepted" | "stopped";
+  activity: string;
   turns: number;
   toolUses: number;
   tokens: number;
   elapsedMs: number;
   response: string;
   error?: string;
-}
-export interface TaskView extends TaskData {
-  status: TaskStatus;
-  outcome?: Outcome;
-  operation?: "pausing" | "closing";
-  activity: string;
-  /** The latest execution's answer or failure. Delivery belongs to it, not to the task's eventual acceptance. */
-  reply?: { id: string; delivered: boolean };
-  pendingInput?: string[];
-}
-export interface TaskResult extends TaskData {
-  outcome: Outcome;
-  pendingInput?: string[];
+  report?: ReportRef;
+  /** Instructions its session has not received yet; the next execution sends them. */
+  unsent: number;
+  /** Its current reply or failure was handed to the parent. */
+  delivered: boolean;
 }
 export interface Summary {
-  completed: number;
   inputTokens: number;
   outputTokens: number;
 }
@@ -49,62 +45,49 @@ type Execution = {
   input: string;
   intent?: Intent;
   done: Promise<void>;
-  recover?: () => void;
-  unsubscribe: () => void;
 };
-type Task = {
-  data: TaskData;
-  options: WorkerOptions;
+type Task = Omit<TaskView, "status" | "elapsedMs" | "unsent" | "execution"> & {
   status: TaskStatus;
-  outcome?: Outcome;
-  activity: string;
-  reply?: TaskView["reply"];
+  options: WorkerOptions;
   pending: string[];
   run?: Execution;
-  take?: Promise<TaskResult>;
+  stopping?: boolean;
   usage?: Usage;
   inputTokens: number;
   outputTokens: number;
-  sessionId?: string;
-  /** Without its journal a task can only be read, accepted or stopped. */
-  lost: boolean;
+  /** A lost session cannot be continued. */
+  session: "new" | "saved" | "lost";
   elapsed: number;
   activeSince?: number;
 };
-const message = (error: unknown) =>
-  error instanceof Error ? error.message : String(error);
+export function isSettled(status: TaskView["status"]): boolean {
+  return status === "ready" || status === "failed";
+}
 
 /** A task owns a native session; each admitted execution owns a fresh process. */
 export class Coordinator {
+  readonly reports = new ReportStore();
   private tasks = new Map<string, Task>();
-  private receipts = new Map<string, TaskResult>();
   private usage?: Usage;
-  private totals: Summary = {
-    completed: 0,
-    inputTokens: 0,
-    outputTokens: 0,
-  };
+  private totals: Summary = { inputTokens: 0, outputTokens: 0 };
   private listeners = new Set<() => void>();
   private disposed = false;
+  private admitting = false;
   private max: number;
   private factory: typeof createWorker;
-  private beforeStart?: (task: TaskView) => void;
-  private onReady?: (task: TaskView) => void;
+  private onSettled?: () => void;
 
   constructor(
     options: {
       maxWorkers?: number;
       createWorker?: typeof createWorker;
-      beforeStart?: (task: TaskView) => void;
-      onReady?: (task: TaskView) => void;
+      /** A task became ready or failed on its own. */
+      onSettled?: () => void;
     } = {},
   ) {
     this.max = options.maxWorkers ?? 4;
-    if (!Number.isInteger(this.max) || this.max < 1)
-      throw new Error("maxWorkers must be a positive integer");
     this.factory = options.createWorker ?? createWorker;
-    this.beforeStart = options.beforeStart;
-    this.onReady = options.onReady;
+    this.onSettled = options.onSettled;
   }
   subscribe(listener: () => void) {
     this.listeners.add(listener);
@@ -123,34 +106,33 @@ export class Coordinator {
   }
   private task(id: string): Task {
     const task = this.tasks.get(id);
-    if (!task) throw new Error(`Unknown live task: ${id}`);
+    if (!task) throw new Error(`Unknown task: ${id}`);
     return task;
   }
-  private data(t: Task): TaskData {
+  private view(t: Task, status: TaskView["status"] = t.status): TaskView {
     return {
-      ...t.data,
-      execution: { ...t.data.execution },
+      id: t.id,
+      description: t.description,
+      level: t.level,
+      execution: {
+        provider: t.options.provider,
+        model: t.options.model,
+        thinking: t.options.thinking,
+      },
+      sessionFile: t.sessionFile,
+      status,
+      activity: t.activity,
+      turns: t.turns,
+      toolUses: t.toolUses,
+      tokens: t.tokens,
       elapsedMs:
         t.elapsed +
         (t.activeSince === undefined ? 0 : Date.now() - t.activeSince),
-    };
-  }
-  private view(t: Task): TaskView {
-    return {
-      ...this.data(t),
-      status: t.status,
-      outcome: t.outcome,
-      activity: t.activity,
-      ...(t.reply ? { reply: { ...t.reply } } : {}),
-      ...(t.run?.intent
-        ? {
-            operation:
-              t.run.intent === "stop"
-                ? ("closing" as const)
-                : ("pausing" as const),
-          }
-        : {}),
-      ...(t.pending.length ? { pendingInput: [...t.pending] } : {}),
+      response: t.response,
+      ...(t.error === undefined ? {} : { error: t.error }),
+      ...(t.report === undefined ? {} : { report: { ...t.report } }),
+      unsent: t.pending.length,
+      delivered: t.delivered,
     };
   }
   private status(t: Task, status: TaskStatus) {
@@ -158,37 +140,16 @@ export class Coordinator {
       t.elapsed += Date.now() - t.activeSince;
       t.activeSince = undefined;
     }
-    if (status === "active" && t.activeSince === undefined)
-      t.activeSince = Date.now();
+    if (status === "active") t.activeSince ??= Date.now();
     t.status = status;
     this.emit();
   }
-  /** Live tasks in creation order, including across pause and continuation. */
+  /** Tasks in creation order. */
   list(): TaskView[] {
     return [...this.tasks.values()].map((t) => this.view(t));
   }
   get(id: string): TaskView {
     return this.view(this.task(id));
-  }
-  inspect(id: string): TaskView | TaskResult {
-    const receipt = this.receipts.get(id);
-    return receipt ? structuredClone(receipt) : this.get(id);
-  }
-  /** A parent context contains this exact handoff; its task stays open. */
-  markDelivered(id: string, replyId: string): boolean {
-    const t = this.tasks.get(id);
-    if (
-      !t ||
-      t.status !== "ready" ||
-      t.run ||
-      !t.reply ||
-      t.reply.id !== replyId ||
-      t.reply.delivered
-    )
-      return false;
-    t.reply.delivered = true;
-    this.emit();
-    return true;
   }
   summary(): Summary {
     const summary = { ...this.totals };
@@ -208,127 +169,78 @@ export class Coordinator {
     if (!request.prompt.trim())
       throw new Error("Task prompt must not be empty");
     const id = randomUUID();
-    const t: Task = {
-      data: {
-        id,
-        description: request.description,
-        level: request.level,
-        execution: {
-          provider: request.worker.provider,
-          model: request.worker.model,
-          thinking: request.worker.thinking,
-        },
-        sessionFile: resolve(
-          request.worker.cwd,
-          request.worker.sessionDir,
-          `${id}.jsonl`,
-        ),
-        turns: 0,
-        toolUses: 0,
-        tokens: 0,
-        elapsedMs: 0,
-        response: "",
-      },
+    this.tasks.set(id, {
+      id,
+      description: oneLine(request.description),
+      level: request.level,
+      sessionFile: resolve(
+        request.worker.cwd,
+        request.worker.sessionDir,
+        `${id}.jsonl`,
+      ),
       status: "queued",
       activity: "",
+      turns: 0,
+      toolUses: 0,
+      tokens: 0,
+      response: "",
+      delivered: false,
       options: request.worker,
       pending: [request.prompt],
       inputTokens: 0,
       outputTokens: 0,
-      lost: false,
+      session: "new",
       elapsed: 0,
-    };
-    this.tasks.set(id, t);
+    });
     this.emit();
     this.admit();
     return id;
   }
-  private ready(t: Task) {
-    try {
-      this.onReady?.(this.view(t));
-    } catch {
-      /* observer */
-    }
-  }
-  /** A failure is an outcome of one closed execution. The task stays open for the parent's decision. */
-  private fail(t: Task, error: unknown) {
-    t.data.error =
-      message(error) + (t.lost ? "; the session cannot continue" : "");
-    t.outcome = "error";
-    t.reply = { id: randomUUID(), delivered: false };
-    this.status(t, "ready");
-    if (!this.disposed && !t.take) this.ready(t);
-  }
   private admit() {
-    if (this.disposed) return;
-    while ([...this.tasks.values()].filter((t) => t.run).length < this.max) {
-      const t = [...this.tasks.values()].find(
-        (t) => t.status === "queued" && !t.take,
-      );
-      if (!t) return;
-      try {
-        this.beforeStart?.(this.view(t));
-        const worker = this.factory(t.options, t.data.sessionFile, t.sessionId);
-        const finished = Promise.withResolvers<void>();
+    if (this.disposed || this.admitting) return;
+    this.admitting = true;
+    try {
+      while (!this.disposed) {
+        const tasks = [...this.tasks.values()];
+        if (tasks.filter((t) => t.run).length >= this.max) return;
+        const t = tasks.find(
+          (task) => task.status === "queued" && !task.stopping,
+        );
+        if (!t) return;
+        const worker = this.factory(
+          t.options,
+          t.sessionFile,
+          t.session === "saved",
+        );
+        const unsubscribe = worker.onEvent((event) =>
+          this.event(t, run, event),
+        );
+        const input = t.pending.join("\n\n");
         const run: Execution = {
           worker,
-          input: t.pending.join("\n\n"),
-          done: finished.promise,
-          unsubscribe: () => {},
+          input,
+          done: worker.run(input).then((report) => {
+            unsubscribe();
+            this.ended(t, run, report);
+          }),
         };
-        void run.done.catch(() => {});
-        // Subscribe before transferring input or owning an execution. A failed
-        // subscription cannot leave a run that was never started occupying a slot.
-        run.unsubscribe = worker.onEvent((event) => this.event(t, run, event));
         t.pending = [];
         t.run = run;
-        t.outcome = undefined;
-        t.reply = undefined;
         t.activity = "";
-        t.data.response = "";
-        delete t.data.error;
+        t.response = "";
+        t.error = undefined;
+        t.report = undefined;
+        t.delivered = false;
         this.status(t, "active");
-        void (async () => {
-          let report: WorkerReport;
-          try {
-            report = await worker.run(run.input);
-          } catch (error) {
-            // Unexpected API failure cannot release a possibly live process.
-            // Keep completion pending if stop fails; a later stop can recover it.
-            run.recover = () => {
-              this.ended(t, run, {
-                text: "",
-                sessionFile: t.data.sessionFile,
-                error: message(error),
-                interrupted: false,
-                inputPersisted: false,
-                sessionLost: false,
-              });
-              finished.resolve();
-            };
-            try {
-              await worker.stop();
-            } catch {
-              return;
-            }
-            run.recover?.();
-            return;
-          }
-          this.ended(t, run, report);
-          finished.resolve();
-        })().catch((error) => {
-          this.fail(t, error);
-          finished.reject(error);
-        });
-      } catch (error) {
-        this.fail(t, error);
       }
+    } finally {
+      this.admitting = false;
     }
   }
   private event(t: Task, run: Execution, event: WorkerEvent) {
     if (this.disposed || t.run !== run) return;
-    if (event.type === "turn_end") t.data.turns++;
-    else if (event.type === "tool_execution_end") t.data.toolUses++;
+    if (event.type === "turn_end") t.turns++;
+    else if (event.type === "tool_execution_end") t.toolUses++;
     else if (event.type === "tool_execution_start") {
       const names: Record<string, string> = {
         read: "rd",
@@ -348,62 +260,79 @@ export class Coordinator {
       event.type === "message_end" &&
       event.message.role === "assistant"
     ) {
-      const value = event.message;
-      const text = value.content
-        .filter((c) => c.type === "text")
-        .map((c) => c.text)
+      const text = event.message.content
+        .filter((part) => part.type === "text")
+        .map((part) => part.text)
         .join("\n");
-      if (text) t.data.response = text;
-      t.data.tokens += value.usage?.totalTokens ?? 0;
-      t.inputTokens += value.usage?.input ?? 0;
-      t.outputTokens += value.usage?.output ?? 0;
+      if (text) t.response = excerpt(text, PREVIEW_BYTES);
+      t.tokens += event.message.usage?.totalTokens ?? 0;
+      t.inputTokens += event.message.usage?.input ?? 0;
+      t.outputTokens += event.message.usage?.output ?? 0;
     }
-    // Completion events are progress only. The process's close/report ends execution.
     this.emit();
   }
   private ended(t: Task, run: Execution, report: WorkerReport) {
-    try {
-      run.unsubscribe();
-    } catch {
-      /* observer cleanup */
-    }
-    run.recover = undefined;
-    if (t.run !== run) return;
     t.run = undefined;
-    t.data.response = report.text || t.data.response;
-    t.sessionId ??= report.sessionId;
-    t.lost ||= report.sessionLost;
+    t.activity = "";
+    // The journal's final report, not the bounded streamed preview, is authoritative.
+    t.response = report.text;
+    if (report.sessionLost) t.session = "lost";
+    else if (report.saved && t.session !== "lost") t.session = "saved";
     if (report.usage) {
-      // Whole-session snapshots replace displayed totals; only their growth is
-      // charged, as soon as it is confirmed rather than on acceptance.
+      // Whole-session snapshots replace the streamed counts; only their growth
+      // is charged, as soon as it is confirmed.
       this.usage = addUsage(this.usage, usageDelta(report.usage, t.usage));
       t.usage = report.usage;
-      t.data.tokens = report.usage.totalTokens;
+      t.tokens = report.usage.totalTokens;
       t.inputTokens = report.usage.input;
       t.outputTokens = report.usage.output;
     }
-    // A successful native reply may follow an input transformation. On abort or
-    // failure, replay conservatively when the original instruction is unproven.
+    // An interrupted or failed execution sends again what its session never saved.
     if (!report.inputPersisted && (report.interrupted || report.error))
       t.pending.unshift(run.input);
-    t.activity = "";
+    if (report.error)
+      t.error =
+        report.error +
+        (t.session === "lost" ? "; the session cannot continue" : "");
     if (this.disposed) return;
-    if (report.error) {
-      this.fail(t, report.error);
-    } else if (run.intent === "stop") {
-      t.outcome = "stopped";
-      this.status(t, "ready");
-    } else if (report.interrupted || t.pending.length) {
-      this.status(t, run.intent === "redirect" ? "queued" : "paused");
-    } else {
-      t.outcome = "reply";
-      t.reply = { id: randomUUID(), delivered: false };
-      this.status(t, "ready");
-      if (!t.take) this.ready(t);
+    const stopping = run.intent === "stop";
+    let finalStatus: TaskStatus = report.error
+      ? "failed"
+      : report.interrupted || t.pending.length
+        ? run.intent === "redirect"
+          ? "queued"
+          : "paused"
+        : "ready";
+    try {
+      const captured = captureReport(
+        this.view(t, stopping ? "stopped" : finalStatus),
+        this.reports,
+      );
+      t.response = captured.response;
+      t.error = captured.error;
+      t.report = captured.report;
+    } catch (error) {
+      t.response = excerpt(t.response, PREVIEW_BYTES);
+      t.error = excerpt(
+        `Report capture failed: ${String(error)}${t.error ? `; ${t.error}` : ""}`,
+        240,
+      );
+      t.report = undefined;
+      if (finalStatus === "ready" || finalStatus === "queued")
+        finalStatus = "failed";
+    }
+    if (stopping) return; // Its stop removes it.
+    this.status(t, finalStatus);
+    if (isSettled(t.status)) {
+      try {
+        this.onSettled?.();
+      } catch {
+        /* observer */
+      }
     }
     this.admit();
   }
-  /** Stop the exact execution object; no callback may accidentally follow its successor. */
+  /** Ends the exact execution; the intent decides what its task becomes. */
   private async end(t: Task, intent: Intent): Promise<void> {
     const run = t.run;
     if (!run) return;
@@ -412,165 +341,109 @@ export class Coordinator {
       (intent !== "redirect" || run.intent !== "pause")
     )
       run.intent = intent;
-    this.emit();
-    try {
-      await run.worker.stop();
-      run.recover?.();
-      await run.done;
-    } catch (error) {
-      // The execution keeps its process and slot. Not exiting in time says
-      // nothing about its work, so it is not recorded as the task's outcome.
-      throw new Error(`Could not terminate execution: ${message(error)}`, {
-        cause: error,
-      });
-    }
+    await run.worker.stop();
+    await run.done;
   }
+  /** Answers, corrects or retries: the same session continues with the message. */
   async message(id: string, text: string): Promise<void> {
     if (!text.trim()) throw new Error("Message must not be empty");
     const t = this.task(id);
-    if (t.take || t.outcome === "stopped" || t.run?.intent === "stop")
-      throw new Error("Task is stopping and cannot accept input");
-    if (t.lost)
+    if (t.stopping || t.run?.intent === "stop")
+      throw new Error("Task is stopping");
+    if (t.session === "lost")
       throw new Error(
         "Task cannot continue: its session is lost. Stop it and start a new task if the work is still needed.",
       );
     t.pending.push(text);
-    if (t.run) {
-      await this.end(t, "redirect");
-      return;
-    }
-    t.outcome = undefined;
-    t.reply = undefined;
+    if (t.run) return this.end(t, "redirect");
     this.status(t, "queued");
     this.admit();
   }
   async pause(id: string): Promise<void> {
     const t = this.task(id);
-    if (t.take || t.status === "ready" || t.status === "paused") return;
-    if (!t.run) {
-      this.status(t, "paused");
-      return;
-    }
-    await this.end(t, "pause");
+    if (t.status === "queued") this.status(t, "paused");
+    else await this.end(t, "pause");
   }
-  async continue(id: string): Promise<void> {
+  continue(id: string): void {
     const t = this.task(id);
-    if (t.status !== "paused" || t.run || t.take)
-      throw new Error("Task is not paused and available");
+    if (t.stopping) throw new Error("Task is stopping");
+    if (t.status !== "paused") throw new Error("Task is not paused");
     if (!t.pending.length) t.pending.push("Continue the task.");
-    t.outcome = undefined;
     this.status(t, "queued");
     this.admit();
   }
-  private result(t: Task): TaskResult {
-    return {
-      ...this.data(t),
-      outcome: t.outcome ?? "reply",
-      ...(t.pending.length ? { pendingInput: [...t.pending] } : {}),
-    };
+  private remove(t: Task) {
+    if (!this.tasks.delete(t.id)) return;
+    this.totals.inputTokens += t.inputTokens;
+    this.totals.outputTokens += t.outputTokens;
+    this.emit();
+    this.admit();
   }
-  private archive(t: Task): TaskResult {
-    if (t.run) throw new Error("Cannot remove a task with a live execution");
-    const result = this.result(t);
-    if (this.tasks.delete(t.data.id)) {
-      this.receipts.set(result.id, structuredClone(result));
-      this.totals.inputTokens += t.inputTokens;
-      this.totals.outputTokens += t.outputTokens;
-      if (result.outcome === "reply") this.totals.completed++;
-      this.emit();
-    }
-    return structuredClone(result);
-  }
-  async collect(id: string): Promise<TaskResult> {
-    const receipt = this.receipts.get(id);
-    if (receipt) return structuredClone(receipt);
+  /** Removes a task in any state, ending its execution first. */
+  async stop(id: string): Promise<TaskView> {
     const t = this.task(id);
-    if (t.take) return t.take;
-    if (t.status !== "ready" || t.run)
-      throw new Error(`Cannot collect ${t.status} task`);
-    return this.archive(t);
+    t.stopping = true;
+    if (t.run) await this.end(t, "stop");
+    this.remove(t);
+    return this.view(t, "stopped");
   }
-  async stop(id: string): Promise<TaskResult> {
-    const receipt = this.receipts.get(id);
-    if (receipt) return structuredClone(receipt);
+  /** Removes a task whose reply or failure needs no follow-up. */
+  accept(id: string): TaskView {
     const t = this.task(id);
-    if (t.take) return t.take;
-    const taking = Promise.withResolvers<TaskResult>();
-    t.take = taking.promise;
-    void (async () => {
-      try {
-        await this.end(t, "stop");
-        if (t.outcome !== "error") t.outcome = "stopped";
-        taking.resolve(this.archive(t));
-      } catch (error) {
-        t.take = undefined;
-        taking.reject(error);
-      }
-    })();
-    return taking.promise;
+    if (!isSettled(t.status))
+      throw new Error(`Cannot accept a ${t.status} task; stop it instead`);
+    this.remove(t);
+    return this.view(t, "accepted");
   }
+  markDelivered(id: string): void {
+    const t = this.tasks.get(id);
+    if (!t || !isSettled(t.status) || t.delivered) return;
+    t.delivered = true;
+    this.emit();
+  }
+  /** Observes until the task needs a decision: settled, paused or the timeout. */
   wait(
     id: string,
     signal?: AbortSignal,
     timeoutMs?: number,
-  ): Promise<TaskView | TaskResult> {
+  ): Promise<TaskView> {
+    this.task(id);
     return new Promise((resolve, reject) => {
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      const cleanup = () => {
+      const finish = (act: () => void) => {
         unsubscribe();
         signal?.removeEventListener("abort", abort);
-        if (timer !== undefined) clearTimeout(timer);
+        clearTimeout(timer);
+        act();
       };
       const check = () => {
-        if (this.disposed) {
-          cleanup();
-          reject(new Error("Coordinator disposed"));
-          return;
-        }
-        const value = this.inspect(id);
-        // A paused task makes no progress either: both await a decision.
-        if (
-          !("status" in value) ||
-          value.status === "ready" ||
-          value.status === "paused"
-        ) {
-          cleanup();
-          resolve(value);
-        }
+        const t = this.tasks.get(id);
+        if (!t) finish(() => reject(new Error("Task was stopped")));
+        else if (isSettled(t.status) || t.status === "paused")
+          finish(() => resolve(this.view(t)));
       };
-      const abort = () => {
-        cleanup();
-        reject(new DOMException("Wait aborted", "AbortError"));
-      };
+      const abort = () =>
+        finish(() => reject(new DOMException("Wait aborted", "AbortError")));
       const unsubscribe = this.subscribe(check);
-      if (signal?.aborted) {
-        abort();
-        return;
-      }
+      const timer =
+        timeoutMs === undefined
+          ? undefined
+          : setTimeout(() => finish(() => resolve(this.get(id))), timeoutMs);
       signal?.addEventListener("abort", abort, { once: true });
-      if (timeoutMs !== undefined)
-        timer = setTimeout(() => {
-          cleanup();
-          reject(new Error("Wait timed out"));
-        }, timeoutMs);
-      try {
-        check();
-      } catch (error) {
-        cleanup();
-        reject(error);
-      }
+      if (signal?.aborted) abort();
+      else check();
     });
   }
+  /** Confirmed usage not yet charged to the parent session. */
   drainUsage(): Usage | undefined {
-    const result = this.usage;
+    const usage = this.usage;
     this.usage = undefined;
-    return result;
+    return usage;
   }
   async dispose(): Promise<void> {
     this.disposed = true;
     await Promise.all([...this.tasks.values()].map((t) => this.end(t, "stop")));
     this.tasks.clear();
-    this.receipts.clear();
+    this.reports.dispose();
     this.usage = undefined;
     this.emit();
   }
